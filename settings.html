@@ -60,10 +60,36 @@
             <span class="text-sm text-gray-300">
                 Detection tuning (advanced)
                 <span class="block text-[11px] text-gray-500 leading-relaxed mt-1">
-                    Off by default. Turns on the developer surfaces: <strong>Reference Recording</strong> capture, <strong>Diagnostic JSON</strong> export + Reset, and the miss-category breakdown on the end-of-session summary. Pair with the headless harness (<code>plugins/note_detect/tools/harness.js</code>) for offline parameter sweeps.
+                    Off by default. Turns on the developer surfaces: <strong>Reference Recording</strong> capture, <strong>Arm (training)</strong> upload, <strong>Diagnostic JSON</strong> export + Reset, and the miss-category breakdown on the end-of-session summary. Pair with the headless harness (<code>plugins/note_detect/tools/harness.js</code>) for offline parameter sweeps.
                 </span>
             </span>
         </label>
+
+        <!-- Training upload destination. Lives in this same block as
+             the tuning toggle since the training-arm flow is gated
+             behind the same advanced switch. The default is the
+             curated dataset's pCloud public upload link; paste a
+             different pCloud share URL to point uploads at your own
+             folder. Server parses the `code=…` parameter out of
+             whatever's pasted (full share URL, API URL, or bare
+             code). The default literal MUST stay in sync with
+             `_PCLOUD_DEFAULT_URL` in routes.py — if you change one,
+             change the other. -->
+        <div class="mt-4 pt-3 border-t border-gray-800">
+            <label for="nd-upload-url" class="block text-xs text-gray-300 mb-1">Training upload destination</label>
+            <input id="nd-upload-url" type="text" spellcheck="false" autocomplete="off"
+                   class="w-full bg-dark-700 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 font-mono"
+                   placeholder="https://e.pcloud.com/#/puplink?code=…">
+            <p class="text-[11px] text-gray-500 mt-1 leading-relaxed">
+                pCloud public upload link for training takes. Paste a different
+                share URL (or bare upload code) to route your uploads elsewhere.
+                Leave empty to use the curated dataset default.
+            </p>
+            <button id="nd-upload-url-reset" type="button"
+                    class="mt-2 text-[10px] text-gray-500 hover:text-gray-300 underline">
+                Restore default
+            </button>
+        </div>
     </div>
 
     <div id="nd-tuning-panels" class="space-y-6 hidden">
@@ -799,6 +825,46 @@
             const nd = window.noteDetect;
             if (nd && typeof nd.setTuningMode === 'function') nd.setTuningMode(tuneCb.checked);
             render();
+        };
+    }
+
+    // Training upload destination — text input that pre-fills with
+    // either the user's previously-saved value OR the hardcoded
+    // default URL. Persisted under 'nd_training_upload_url'. The
+    // default literal MUST stay in sync with `_PCLOUD_DEFAULT_URL`
+    // in routes.py — if you change one, change the other. Empty
+    // string means "use the server default", which keeps the
+    // server-side hardcoded code as the source of truth when the
+    // user clears the field.
+    const _UPLOAD_URL_KEY = 'nd_training_upload_url';
+    const _UPLOAD_URL_DEFAULT = 'https://e.pcloud.com/#/puplink?code=itd7ZwmOK8S2D6XSAE1Q9cUPaF5c9WFfk';
+    const urlInput = _q('nd-upload-url');
+    const urlReset = _q('nd-upload-url-reset');
+    if (urlInput) {
+        // Pre-fill with the saved value if any, otherwise show the
+        // current default so the user can see what gets used and
+        // edit from there.
+        let saved = '';
+        try { saved = localStorage.getItem(_UPLOAD_URL_KEY) || ''; } catch (_) {}
+        urlInput.value = saved || _UPLOAD_URL_DEFAULT;
+        urlInput.onchange = () => {
+            try {
+                const v = urlInput.value.trim();
+                if (v && v !== _UPLOAD_URL_DEFAULT) {
+                    localStorage.setItem(_UPLOAD_URL_KEY, v);
+                } else {
+                    // Default or empty — drop the override so the
+                    // server uses its own hardcoded default. Keeps
+                    // the storage clean across plugin upgrades.
+                    localStorage.removeItem(_UPLOAD_URL_KEY);
+                }
+            } catch (_) { /* quota / privacy mode */ }
+        };
+    }
+    if (urlReset && urlInput) {
+        urlReset.onclick = () => {
+            urlInput.value = _UPLOAD_URL_DEFAULT;
+            try { localStorage.removeItem(_UPLOAD_URL_KEY); } catch (_) {}
         };
     }
 

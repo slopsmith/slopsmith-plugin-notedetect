@@ -5486,10 +5486,23 @@ function createNoteDetector(options = {}) {
                 notes: formData.notes || null,
             };
 
+            // Read the user-configurable upload URL from the
+            // settings.html field's localStorage key. Empty / missing
+            // leaves it null so the server falls back to its own
+            // hardcoded default. Mirrors the storage key + semantics
+            // in settings.html.
+            let uploadUrl = null;
+            try { uploadUrl = localStorage.getItem('nd_training_upload_url') || null; } catch (_) {}
+
             const resp = await fetch('/api/plugins/note_detect/training-bundle', {
                 method:  'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body:    JSON.stringify({ slug, session: sessionId || 'default', manifest }),
+                body:    JSON.stringify({
+                    slug,
+                    session: sessionId || 'default',
+                    manifest,
+                    upload_url: uploadUrl,
+                }),
             });
             let data = null;
             try { data = await resp.json(); } catch (_) { /* leave null; surfaced below */ }

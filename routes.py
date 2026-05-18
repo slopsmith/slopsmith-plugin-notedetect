@@ -57,10 +57,24 @@ from fastapi import HTTPException, Request
 
 # pCloud public upload link ("puplink") for the curated note_detect
 # training set. Anyone with this code can upload to the destination
-# folder; they cannot list or read it. Hardcoded so every install routes
-# its training takes to the same dataset.
+# folder; they cannot list or read it. Hardcoded as the fallback when
+# the client doesn't supply an `upload_url` in the /training-bundle
+# POST. The default share URL below MUST stay in sync with
+# `_UPLOAD_URL_DEFAULT` in settings.html — if you change one, change
+# the other (the settings page pre-fills its field with that literal).
 _PCLOUD_UPLOAD_CODE = "itd7ZwmOK8S2D6XSAE1Q9cUPaF5c9WFfk"
+_PCLOUD_DEFAULT_URL = "https://e.pcloud.com/#/puplink?code=" + _PCLOUD_UPLOAD_CODE
 _PCLOUD_UPLOAD_URL = "https://eapi.pcloud.com/uploadtolink"
+# Regex used to pull a pCloud upload code out of whatever the user
+# pastes in the settings field. Anchored on `code=` so a share URL
+# (`…/#/puplink?code=ABC`), an API URL
+# (`…/uploadtolink?code=ABC`), or any other URL form work. The
+# bare-code path is handled separately in `_parse_pcloud_code`.
+_PCLOUD_CODE_RE = re.compile(r"code=([A-Za-z0-9_-]+)")
+# Bare-code shape: pCloud upload codes are alphanumeric + `_`/`-`
+# only, so anything matching the full string is treated as already-
+# extracted.
+_PCLOUD_BARE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # Cap on the bundle size we'll attempt to upload. WAV+JSONL+manifest for
 # a 3-minute take is ~15 MB; 64 MB lets longer takes and higher sample
 # rates through while still refusing to upload pathological blobs.
@@ -95,6 +109,30 @@ _LIVE_JUDGMENT_MAX_BYTES = 8 * 1024
 # accumulation per session. A 2-minute song produces ~60 KB; this gives
 # 100× headroom while still bounding pathological cases.
 _LIVE_FILE_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _parse_pcloud_code(upload_url: str | None) -> str:
+    """Extract the pCloud upload-link code from a user-supplied string.
+
+    Accepts:
+      - a full share URL: ``https://e.pcloud.com/#/puplink?code=ABC``
+      - the API URL form: ``https://eapi.pcloud.com/uploadtolink?code=ABC``
+      - any other URL containing ``code=ABC`` somewhere
+      - a bare code (no URL syntax at all): ``ABC``
+
+    Falls back to the hardcoded default code when the input is empty
+    or doesn't match anything parseable, so a typo in the settings
+    field can't break uploads — it routes to the curated dataset.
+    """
+    if not upload_url:
+        return _PCLOUD_UPLOAD_CODE
+    s = upload_url.strip()
+    m = _PCLOUD_CODE_RE.search(s)
+    if m:
+        return m.group(1)
+    if _PCLOUD_BARE_RE.fullmatch(s):
+        return s
+    return _PCLOUD_UPLOAD_CODE
 
 
 def _sanitize_slug(s: str, default: str = "recording") -> str:
@@ -300,6 +338,15 @@ def setup(app, context):
         manifest = body.get("manifest") or {}
         if not isinstance(manifest, dict):
             raise HTTPException(400, "'manifest' must be a JSON object")
+        # Per-request override for the pCloud destination — the user
+        # sets this on the settings page; null/missing falls back to
+        # the hardcoded default. Garbage strings also fall back (see
+        # _parse_pcloud_code) rather than 4xx — a typo in the field
+        # shouldn't lose the user's take.
+        upload_url_override = body.get("upload_url")
+        if upload_url_override is not None and not isinstance(upload_url_override, str):
+            raise HTTPException(400, "'upload_url' must be a string or null")
+        pcloud_code = _parse_pcloud_code(upload_url_override)
 
         base = _ensure_out_dir()
 
@@ -380,7 +427,7 @@ def setup(app, context):
             bundle_name, bundle_size,
         )
         try:
-            pcloud_result = await _upload_to_pcloud(bundle_path, bundle_name)
+            pcloud_result = await _upload_to_pcloud(bundle_path, bundle_name, pcloud_code)
         except Exception as e:
             # Local bundle is retained so the user can retry. Don't 500
             # — the upload-failed-but-bundle-exists state is a valid
@@ -411,7 +458,7 @@ def setup(app, context):
             "pcloud_result": pcloud_result,
         }
 
-    async def _upload_to_pcloud(file_path: Path, filename: str) -> dict:
+    async def _upload_to_pcloud(file_path: Path, filename: str, code: str) -> dict:
         # `requests` is sync; FastAPI is async. Wrap the PUT in a thread
         # so a slow upload (15 MB over a residential up-link) doesn't
         # stall the event loop and starve other plugins' routes.
@@ -428,7 +475,7 @@ def setup(app, context):
                 resp = requests.put(
                     _PCLOUD_UPLOAD_URL,
                     params={
-                        "code": _PCLOUD_UPLOAD_CODE,
+                        "code": code,
                         "filename": filename,
                         "nopartial": "1",
                     },
