@@ -18,12 +18,16 @@ POST /api/plugins/note_detect/live-judgment
     safe to tail / read partially / replay.
 
 POST /api/plugins/note_detect/training-bundle
-    Body: JSON { slug, session, manifest, arrangement, upload_url }.
-        slug    — locates the WAV file written by /recording (the most
-                  recent matching ``note_detect_<slug>_*.wav``).
+    Body: JSON { slug, wav_filename, session, manifest, arrangement, upload_url }.
+        slug    — used to name the bundle, and to locate the WAV when
+                  ``wav_filename`` is absent (newest matching
+                  ``note_detect_<slug>_*.wav``).
+        wav_filename — exact WAV filename from the /recording response;
+                  preferred over the slug glob so concurrent same-slug
+                  takes can't be paired with the wrong WAV. Optional.
         session — locates the live-judgment JSONL written by
                   /live-judgment (``live_<session>.jsonl``). Optional —
-                  bundle proceeds without it if absent.
+                  bundle proceeds without it if absent or empty.
         manifest — JSON object recorded as-is into ``manifest.json``
                    inside the bundle. The server adds schema, created_at,
                    and resolved filename/bytes fields before writing.
@@ -150,7 +154,7 @@ _LIVE_JUDGMENT_MAX_BYTES = 8 * 1024
 _LIVE_FILE_MAX_BYTES = 8 * 1024 * 1024
 
 
-def _parse_pcloud_code(upload_url: str | None) -> str:
+def _parse_pcloud_code(upload_url: str | None) -> str | None:
     """Extract the pCloud upload-link code from a user-supplied string.
 
     Accepts:
@@ -159,19 +163,24 @@ def _parse_pcloud_code(upload_url: str | None) -> str:
       - any other URL containing ``code=ABC`` somewhere
       - a bare code (no URL syntax at all): ``ABC``
 
-    Falls back to the hardcoded default code when the input is empty
-    or doesn't match anything parseable, so a typo in the settings
-    field can't break uploads — it routes to the curated dataset.
+    An empty / missing input returns the curated-default code (the
+    user wants the default). A *non-empty* input that contains no
+    parseable code returns ``None`` so the caller can reject it with a
+    4xx — silently falling back to the default would route a
+    contributor's recording to the public curated dataset when they
+    meant to send it to their own folder.
     """
     if not upload_url:
         return _PCLOUD_UPLOAD_CODE
     s = upload_url.strip()
+    if not s:
+        return _PCLOUD_UPLOAD_CODE
     m = _PCLOUD_CODE_RE.search(s)
     if m:
         return m.group(1)
     if _PCLOUD_BARE_RE.fullmatch(s):
         return s
-    return _PCLOUD_UPLOAD_CODE
+    return None
 
 
 def _sanitize_slug(s: str, default: str = "recording") -> str:
@@ -359,7 +368,7 @@ def setup(app, context):
 
     @app.post("/api/plugins/note_detect/training-bundle")
     async def upload_training_bundle(request: Request):
-        # Body: { slug, session, manifest, arrangement, upload_url }.
+        # Body: { slug, wav_filename, session, manifest, arrangement, upload_url }.
         # Slug locates the WAV previously written by /recording; session
         # locates the JSONL written by /live-judgment (optional);
         # arrangement is the client-pinned ground-truth note chart
@@ -386,43 +395,73 @@ def setup(app, context):
         slug = _sanitize_slug(body.get("slug", ""), default="")
         if not slug:
             raise HTTPException(400, "missing or empty 'slug'")
-        session = _sanitize_slug(body.get("session", "default"), default="default")
+        # session is optional. Do NOT coerce a missing one to a literal
+        # "default" — that could attach a stale live_default.jsonl from
+        # an unrelated take. An empty session simply means "no JSONL".
+        session_raw = body.get("session")
+        session = _sanitize_slug(session_raw, default="") if session_raw else ""
         manifest = body.get("manifest") or {}
         if not isinstance(manifest, dict):
             raise HTTPException(400, "'manifest' must be a JSON object")
         # Per-request override for the pCloud destination — the user
-        # sets this on the settings page; null/missing falls back to
-        # the hardcoded default. Garbage strings also fall back (see
-        # _parse_pcloud_code) rather than 4xx — a typo in the field
-        # shouldn't lose the user's take.
+        # sets this on the settings page. Null/missing falls back to the
+        # curated default. A non-empty value that parses to no code is a
+        # 400, NOT a silent fallback — otherwise a typo'd custom link
+        # would route the contributor's take to the public dataset.
         upload_url_override = body.get("upload_url")
         if upload_url_override is not None and not isinstance(upload_url_override, str):
             raise HTTPException(400, "'upload_url' must be a string or null")
         pcloud_code = _parse_pcloud_code(upload_url_override)
+        if pcloud_code is None:
+            raise HTTPException(
+                400,
+                "'upload_url' contains no recognisable pCloud upload code "
+                "(expected a puplink share URL, an uploadtolink URL, or a "
+                "bare code) — clear the field to use the curated default",
+            )
 
         base = _ensure_out_dir()
 
-        # Locate the most recent WAV for this slug. /recording's filename
-        # convention is note_detect_<slug>_<ts>_<ms>_<suffix>.wav, so
-        # newest mtime wins when two takes with the same slug exist.
-        wav_candidates = sorted(
-            base.glob(f"note_detect_{slug}_*.wav"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if not wav_candidates:
-            raise HTTPException(
-                404,
-                f"no recording found for slug={slug!r} under {base} — "
-                "POST /recording first, then /training-bundle.",
+        # Locate the WAV. Prefer the exact filename the client got back
+        # from its /recording save — globbing newest-for-slug can pair
+        # this take's manifest/JSONL/arrangement with another panel's
+        # WAV when two takes share a slug (splitscreen / rapid takes).
+        wav_filename = body.get("wav_filename")
+        if wav_filename is not None and not isinstance(wav_filename, str):
+            raise HTTPException(400, "'wav_filename' must be a string or null")
+        wav_path = None
+        if wav_filename:
+            cand = (base / wav_filename).resolve()
+            try:
+                cand.relative_to(base.resolve())
+            except ValueError:
+                raise HTTPException(400, "'wav_filename' is outside the recordings directory")
+            if not re.fullmatch(r"note_detect_.+\.wav", cand.name):
+                raise HTTPException(400, "'wav_filename' is not a note_detect recording")
+            if not cand.is_file():
+                raise HTTPException(404, f"recording not found: {cand.name}")
+            wav_path = cand
+        if wav_path is None:
+            # Fallback for callers that didn't pass wav_filename: newest
+            # WAV matching the slug.
+            wav_candidates = sorted(
+                base.glob(f"note_detect_{slug}_*.wav"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
             )
-        wav_path = wav_candidates[0]
+            if not wav_candidates:
+                raise HTTPException(
+                    404,
+                    f"no recording found for slug={slug!r} under {base} — "
+                    "POST /recording first, then /training-bundle.",
+                )
+            wav_path = wav_candidates[0]
 
         # JSONL is optional — the client may have armed for training
         # without tuningMode on, or no judgments may have been streamed
-        # yet. Missing file is a soft-skip, not an error.
-        jsonl_path = base / f"live_{session}.jsonl"
-        has_jsonl = jsonl_path.exists() and jsonl_path.is_file()
+        # yet. A missing session or missing file is a soft-skip.
+        jsonl_path = (base / f"live_{session}.jsonl") if session else None
+        has_jsonl = bool(jsonl_path) and jsonl_path.exists() and jsonl_path.is_file()
 
         # Compose server-authoritative manifest fields. The client's
         # manifest is preserved as-is — we only add (never overwrite) the
@@ -580,6 +619,12 @@ def setup(app, context):
         if upload_url_override is not None and not isinstance(upload_url_override, str):
             raise HTTPException(400, "'upload_url' must be a string or null")
         pcloud_code = _parse_pcloud_code(upload_url_override)
+        if pcloud_code is None:
+            raise HTTPException(
+                400,
+                "'upload_url' contains no recognisable pCloud upload code "
+                "— clear the field to use the curated default",
+            )
 
         base = _ensure_out_dir()
         # Security: the client hands us a path, so confine it to the

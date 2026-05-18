@@ -3647,9 +3647,21 @@ function createNoteDetector(options = {}) {
                     infoEl.textContent = info;
                     infoEl.className = 'nd-rec-info text-[11px] leading-snug mb-2 ' + (r.lastError ? 'text-red-400' : 'text-gray-400');
                 }
+                // Build the "<label> <code>filename</code>" line with
+                // textContent, never innerHTML — the path / bundle name
+                // can contain server-side filesystem strings (the retry
+                // endpoint accepts any training_*.zip), so interpolating
+                // them into innerHTML would be an injection surface.
+                const _setCodeLine = (el, label, codeText) => {
+                    el.textContent = label;
+                    const c = document.createElement('code');
+                    c.className = 'text-gray-300';
+                    c.textContent = codeText;
+                    el.appendChild(c);
+                };
                 if (savedEl) {
                     if (r.lastSavePath && !r.armed && !r.lastError) {
-                        savedEl.innerHTML = 'Saved: <code class="text-gray-300">' + r.lastSavePath + '</code>';
+                        _setCodeLine(savedEl, 'Saved: ', r.lastSavePath);
                     } else {
                         savedEl.textContent = '';
                     }
@@ -3658,7 +3670,7 @@ function createNoteDetector(options = {}) {
                     const tr = r.trainingUploadResult;
                     if (tr && tr.ok) {
                         uploadEl.className = 'nd-rec-upload text-[10px] text-green-400 mt-1 break-all';
-                        uploadEl.innerHTML = 'Uploaded to training dataset: <code class="text-gray-300">' + (tr.bundle_filename || '(unknown)') + '</code>';
+                        _setCodeLine(uploadEl, 'Uploaded to training dataset: ', tr.bundle_filename || '(unknown)');
                     } else if (tr && !tr.ok) {
                         uploadEl.className = 'nd-rec-upload text-[10px] text-red-400 mt-1 break-all';
                         uploadEl.textContent = 'Upload failed: ' + (tr.error || 'unknown error') + (tr.local_bundle ? ' (bundle retained at ' + tr.local_bundle + ')' : '');
@@ -5077,6 +5089,15 @@ function createNoteDetector(options = {}) {
         } catch (e) {
             throw new Error('mic permission denied or device unavailable: ' + (e && e.message || e));
         }
+        // The getUserMedia await above can take seconds (permission
+        // prompt, device open). If the take was disarmed or the song
+        // ended meanwhile, bail and release the mic now — otherwise we'd
+        // attach a live capture graph to a cancelled take and leave the
+        // device open until some later teardown.
+        if (!_recArmed || !_recArmedForTraining) {
+            try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+            return;
+        }
         const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
         const source = ctx.createMediaStreamSource(stream);
         // ScriptProcessor is deprecated but matches the rest of the
@@ -5182,10 +5203,19 @@ function createNoteDetector(options = {}) {
         // alone; its song:play will drive both effects when it resumes.
         const _t1 = (hw && hw.getTime) ? hw.getTime() : 0;
         await new Promise((r) => setTimeout(r, 150));
+        // The await above is a yield point — if the user disarmed during
+        // it, bail rather than minting a session / flipping capture
+        // state for a take that no longer exists.
+        if (!_recArmed || !_recArmedForTraining) return;
         const _t2 = (hw && hw.getTime) ? hw.getTime() : 0;
         if (_t2 > _t1 + 0.02) {
             _recSongPlaying = true;
-            if (!_liveSessionId) _startLiveSession();
+            // Mint a FRESH session unconditionally — even if tuning mode
+            // already had one running. That older session started at
+            // song:play and holds pre-arm judgments; reusing it would
+            // misalign the detect-stream with a WAV that starts at arm
+            // time. A fresh session begins here, aligned with the take.
+            _startLiveSession();
         }
         // When the desktop bridge is active, the JS-side processFrame()
         // never runs (native engine owns the device), so its
@@ -5375,12 +5405,21 @@ function createNoteDetector(options = {}) {
         return new Promise((resolve) => {
             const modal = document.createElement('div');
             modal.className = 'nd-train-modal fixed inset-0 z-[99999] flex items-center justify-center bg-black/70 p-4 overflow-y-auto';
+            // Dialog semantics so screen readers announce the modal and
+            // treat background content as inert. aria-labelledby points
+            // at the <h3> title id set below.
+            modal.setAttribute('role', 'dialog');
+            modal.setAttribute('aria-modal', 'true');
+            modal.setAttribute('aria-labelledby', 'nd-tr-title');
+            // Restore focus to whatever was focused before the modal
+            // opened, once it closes.
+            const _prevFocus = document.activeElement;
             // Plain-text inputs only — no HTML interpolation of user-
             // controllable strings to avoid an XSS surface from
             // chart-provided song info or localStorage tampering.
             modal.innerHTML = `
                 <div class="bg-dark-700 border border-gray-600 rounded-lg max-w-md w-full p-5 shadow-2xl my-4">
-                    <h3 class="nd-tr-title text-base font-semibold text-gray-100 mb-1">Submit Training Take</h3>
+                    <h3 id="nd-tr-title" class="nd-tr-title text-base font-semibold text-gray-100 mb-1">Submit Training Take</h3>
                     <p class="nd-tr-intro text-[11px] text-gray-400 mb-4 leading-snug">
                         Review the details below, then check the consent box to upload your take
                         (audio + detection events + this form) to the training dataset. All fields
@@ -5445,6 +5484,9 @@ function createNoteDetector(options = {}) {
             $('.nd-tr-name').value    = prefill.name || '';
             $('.nd-tr-discord').value = prefill.discord || '';
             $('.nd-tr-notes').value   = prefill.notes || '';
+            // Move focus into the dialog so keyboard / screen-reader
+            // users land inside it rather than on background content.
+            try { $('.nd-tr-song').focus(); } catch (_) {}
 
             const submitBtn  = $('.nd-tr-submit');
             const retryBtn   = $('.nd-tr-retry');
@@ -5466,6 +5508,8 @@ function createNoteDetector(options = {}) {
             const cleanup = () => {
                 modal.remove();
                 _trainingModalActive = false;
+                // Return focus to wherever it was before the modal opened.
+                try { if (_prevFocus && _prevFocus.focus) _prevFocus.focus(); } catch (_) {}
                 if (_activeUpload) {
                     _activeUpload.finally(() => resolve(finalResult));
                 } else {
@@ -5728,7 +5772,15 @@ function createNoteDetector(options = {}) {
                         headers: { 'Content-Type': 'application/json' },
                         body:    JSON.stringify({
                             slug,
-                            session: sessionId || 'default',
+                            // Exact WAV filename from the /recording save —
+                            // lets the server bundle THIS take's WAV rather
+                            // than glob the newest for the slug (wrong WAV
+                            // under concurrent same-slug takes).
+                            wav_filename: filename || null,
+                            // Null (not 'default') when this take minted no
+                            // live session — the server soft-skips the JSONL
+                            // instead of attaching a stale live_default.jsonl.
+                            session: sessionId || null,
                             manifest,
                             // Ground-truth note chart (hw.getNotes/getChords
                             // pinned at song:ended) — the server writes it
@@ -5804,12 +5856,12 @@ function createNoteDetector(options = {}) {
             // _showTrainingConsentModal defers its resolution until any
             // in-flight upload settles (see _activeUpload), so this
             // finally never runs mid-upload.
+            //
+            // Training-arm teardown (_recArmedForTraining / live-stream
+            // unbind) is NOT done here — _recOnEnded's own finally owns
+            // it, so the teardown also runs when a failed WAV save means
+            // this function was never called.
             _recTrainingUploadInFlight = false;
-            // One take per arm. The next training take must re-arm.
-            _recArmedForTraining = false;
-            // Drop the live stream subscription if it was only being kept
-            // alive by the training arm. Mirrors disarmRecording.
-            if (!tuningMode) _liveUnbindEvents();
         }
     }
 
@@ -5882,6 +5934,15 @@ function createNoteDetector(options = {}) {
                         return _uploadTrainingBundle(data, sessionAtEnd, songInfoAtEnd, chartAtEnd, audioStatsAtEnd, cdlcFilenameAtEnd);
                     }
                 }).catch(() => { _stopParallelTrainingCapture(); }).finally(() => {
+                    // The training take is over — drop training-arm state
+                    // and the training-only live-stream subscription HERE,
+                    // on every path. A failed WAV save skips
+                    // _uploadTrainingBundle entirely, so relying on its
+                    // finally would leave the instance stuck in training
+                    // mode (deferred summaries, live listeners still bound)
+                    // until some later explicit disarm.
+                    _recArmedForTraining = false;
+                    if (!tuningMode) _liveUnbindEvents();
                     // Surface the score summary that _endOfSongOnEnded
                     // deferred — now that the consent modal (if any) has
                     // closed. No-op when nothing was deferred.
