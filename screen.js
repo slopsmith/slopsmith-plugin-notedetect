@@ -5064,6 +5064,9 @@ function createNoteDetector(options = {}) {
             echoCancellation: false,
             noiseSuppression: false,
             autoGainControl: false,
+            // Request stereo so the channel-select below can pick the
+            // user's instrument channel — same as the main capture path.
+            channelCount: 2,
         }};
         if (selectedDeviceId) {
             constraints.audio.deviceId = { exact: selectedDeviceId };
@@ -5103,6 +5106,26 @@ function createNoteDetector(options = {}) {
             _recChunks.push(copy);
             _recTotalSamples += copy.length;
         };
+        // Mirror the main capture graph (see ~line 1942): channel-select
+        // + input gain ahead of the processor, so the training WAV is
+        // the SAME signal the detector judged and matches the `channel`
+        // / `input_gain` recorded in the manifest. Reading channel 0 of
+        // the raw source instead would upload the wrong channel for a
+        // right-channel-DI user and skip the user's input gain.
+        const gain = ctx.createGain();
+        gain.gain.value = inputGain;
+        let splitter = null, merger = null;
+        if (source.channelCount >= 2 && selectedChannel !== 'mono') {
+            splitter = ctx.createChannelSplitter(2);
+            merger = ctx.createChannelMerger(1);
+            const chIdx = selectedChannel === 'left' ? 0 : 1;
+            source.connect(splitter);
+            splitter.connect(merger, chIdx, 0);
+            merger.connect(gain);
+        } else {
+            source.connect(gain);
+        }
+        gain.connect(processor);
         // A ScriptProcessor only fires its onaudioprocess callback if
         // it's connected to the destination graph. Route through a
         // muted GainNode so the captured audio doesn't loop back to
@@ -5110,16 +5133,18 @@ function createNoteDetector(options = {}) {
         // also driving output).
         const mute = ctx.createGain();
         mute.gain.value = 0;
-        source.connect(processor);
         processor.connect(mute);
         mute.connect(ctx.destination);
-        _trainingCapture = { stream, ctx, source, processor, mute };
+        _trainingCapture = { stream, ctx, source, splitter, merger, gain, processor, mute };
     }
     function _stopParallelTrainingCapture() {
         if (!_trainingCapture) return;
         const cap = _trainingCapture;
         _trainingCapture = null;
         try { cap.source.disconnect(); } catch (_) {}
+        try { if (cap.splitter) cap.splitter.disconnect(); } catch (_) {}
+        try { if (cap.merger) cap.merger.disconnect(); } catch (_) {}
+        try { if (cap.gain) cap.gain.disconnect(); } catch (_) {}
         try { cap.processor.disconnect(); } catch (_) {}
         try { cap.mute.disconnect(); } catch (_) {}
         try { cap.stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
@@ -5137,6 +5162,12 @@ function createNoteDetector(options = {}) {
         _recLastSaveError = null;
         _recCappedAt = null;
         _recTrainingUploadResult = null;
+        // Clear the carried-over session id so _recOnEnded's
+        // `_liveSessionId || _liveLastSessionId` fallback can only ever
+        // resolve to a session minted DURING this take — never a stale
+        // one from a previous take. If this take mints no session at
+        // all, the bundle simply ships without a JSONL (soft-skip).
+        _liveLastSessionId = null;
         _recBindEvents();
         _liveBindEvents();
         // If the user armed AFTER pressing Play, song:play has already
@@ -5144,10 +5175,15 @@ function createNoteDetector(options = {}) {
         // (so the capture gate at processFrame / _startParallelTraining-
         // Capture would stay idle) and _liveOnPlay never minted a live
         // session (so the JSONL take would carry no session_start
-        // header). Detect a song already underway via the renderer clock
-        // and replay both effects here.
-        const _songUnderway = !!(hw && hw.getTime && hw.getTime() > 0);
-        if (_songUnderway) {
+        // header). Detect *active playback* here and replay both effects.
+        // A nonzero playhead alone is not enough — a paused or seeked
+        // song also has one — so sample the renderer clock twice: only
+        // real playback advances it. A genuinely paused song is left
+        // alone; its song:play will drive both effects when it resumes.
+        const _t1 = (hw && hw.getTime) ? hw.getTime() : 0;
+        await new Promise((r) => setTimeout(r, 150));
+        const _t2 = (hw && hw.getTime) ? hw.getTime() : 0;
+        if (_t2 > _t1 + 0.02) {
             _recSongPlaying = true;
             if (!_liveSessionId) _startLiveSession();
         }
@@ -5547,8 +5583,19 @@ function createNoteDetector(options = {}) {
             });
         });
     }
-    async function _uploadTrainingBundle(savedData, sessionId, songInfoSnapshot, chartSnapshot) {
+    async function _uploadTrainingBundle(savedData, sessionId, songInfoSnapshot, chartSnapshot, audioStats, cdlcFilenameSnapshot) {
+        // audioStats pins sample-rate / sample-count / cap at song:ended
+        // because saveRecordingNow() zeroes the live counters before this
+        // runs. Fall back to the (now-reset) live values defensively.
+        audioStats = audioStats || {
+            sampleRate: _recSampleRate, totalSamples: _recTotalSamples, cappedAtS: _recCappedAt,
+        };
         if (_recTrainingUploadInFlight) return null;
+        // Owned by this function: set once here, cleared in the finally
+        // on every exit path. _showTrainingConsentModal won't resolve
+        // until any in-flight upload settles, so the finally is reached
+        // only after the real upload work is done.
+        _recTrainingUploadInFlight = true;
         try {
             // Recover the slug from the server-returned filename. The
             // /recording endpoint stamps `note_detect_<slug>_<ts>_<ms>_<suf>.wav`,
@@ -5572,10 +5619,13 @@ function createNoteDetector(options = {}) {
             // where no snapshot was provided.
             const info = songInfoSnapshot
                 || ((hw && hw.getSongInfo) ? hw.getSongInfo() : {});
-            // CDLC filename: hw.getSongInfo() doesn't include it, so
-            // fall back to whatever the playSong wrapper captured last
-            // (see _ndShared.currentFilename in _ndInstallPlaySongHook).
-            const cdlcFilename = info.filename || _ndShared.currentFilename || '';
+            // CDLC filename: prefer the value pinned at song:ended by
+            // the caller (cdlcFilenameSnapshot) — _ndShared.currentFilename
+            // is a process-global another splitscreen panel can overwrite
+            // before this async upload runs. The direct reads are only a
+            // fallback for callers that pinned nothing.
+            const cdlcFilename = cdlcFilenameSnapshot
+                || info.filename || _ndShared.currentFilename || '';
             const tuningArr = Array.isArray(info.tuning) ? info.tuning.slice() : null;
             // Guess instrument from the arrangement label — covers
             // "Bass", "Lead", "Rhythm", "Combo", etc. The user can
@@ -5613,7 +5663,6 @@ function createNoteDetector(options = {}) {
                     notes:      formData.notes,
                 });
 
-                _recTrainingUploadInFlight = true;
                 _recTrainingUploadResult = null;
 
                 const manifest = {
@@ -5642,11 +5691,13 @@ function createNoteDetector(options = {}) {
                         pitch_tolerance_cents:   pitchTolerance,
                     },
                     audio: {
-                        sample_rate: _recSampleRate,
+                        // Pinned at song:ended — saveRecordingNow() has
+                        // since reset the live _rec* counters to 0.
+                        sample_rate: audioStats.sampleRate,
                         channels:    1,
                         bit_depth:   16,
-                        duration_s:  _recTotalSamples / Math.max(1, _recSampleRate),
-                        capped_at_s: _recCappedAt,
+                        duration_s:  audioStats.totalSamples / Math.max(1, audioStats.sampleRate),
+                        capped_at_s: audioStats.cappedAtS,
                     },
                     client: {
                         user_agent: navigator.userAgent,
@@ -5702,15 +5753,6 @@ function createNoteDetector(options = {}) {
                     _recTrainingUploadResult = out;
                     console.warn('[note_detect] training-bundle upload failed:', e);
                     return out;
-                } finally {
-                    // Clear the in-flight flag HERE — when the network
-                    // request actually settles — not in _uploadTraining-
-                    // Bundle's finally. That finally fires as soon as the
-                    // consent modal closes, which can be while this fetch
-                    // is still running (user clicked Upload then Hide);
-                    // clearing it there would tell the UI the upload is
-                    // done and let the user re-arm/discard mid-upload.
-                    _recTrainingUploadInFlight = false;
                 }
             }, async (localBundle) => {
                 // Retry path: re-upload the zip already on disk (no
@@ -5719,7 +5761,6 @@ function createNoteDetector(options = {}) {
                 // safe. Honours the same per-user upload-URL override.
                 let uploadUrl = null;
                 try { uploadUrl = localStorage.getItem('nd_training_upload_url') || null; } catch (_) {}
-                _recTrainingUploadInFlight = true;
                 try {
                     const resp = await fetch('/api/plugins/note_detect/training-bundle/retry', {
                         method:  'POST',
@@ -5741,10 +5782,6 @@ function createNoteDetector(options = {}) {
                     _recTrainingUploadResult = out;
                     console.warn('[note_detect] training-bundle retry failed:', e);
                     return out;
-                } finally {
-                    // Same as doUpload: clear when the request settles,
-                    // not when the modal closes.
-                    _recTrainingUploadInFlight = false;
                 }
             });
             if (!result) {
@@ -5761,10 +5798,13 @@ function createNoteDetector(options = {}) {
             console.warn('[note_detect] training-bundle flow failed:', e);
             return null;
         } finally {
-            // NOTE: _recTrainingUploadInFlight is intentionally NOT
-            // cleared here — doUpload / doRetry own it and clear it when
-            // their network request settles. This finally runs as soon
-            // as the consent modal closes, which may be mid-upload.
+            // Clear the in-flight flag on EVERY exit path — including
+            // the early returns above (e.g. slug-parse failure) that
+            // never opened the modal. Safe to clear here because
+            // _showTrainingConsentModal defers its resolution until any
+            // in-flight upload settles (see _activeUpload), so this
+            // finally never runs mid-upload.
+            _recTrainingUploadInFlight = false;
             // One take per arm. The next training take must re-arm.
             _recArmedForTraining = false;
             // Drop the live stream subscription if it was only being kept
@@ -5805,12 +5845,31 @@ function createNoteDetector(options = {}) {
                 // locating this take's live_<id>.jsonl detect-stream.
                 const sessionAtEnd = _liveSessionId || _liveLastSessionId;
                 const songInfoAtEnd = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+                // Pin the CDLC filename HERE too. _ndShared.currentFilename
+                // is a process-global the playSong wrapper overwrites, so
+                // a splitscreen panel starting another song before this
+                // take's async upload runs would otherwise leak the wrong
+                // filename into this manifest. songInfo wins; the global
+                // is only the fallback, and must be read now, not later.
+                const cdlcFilenameAtEnd =
+                    (songInfoAtEnd && songInfoAtEnd.filename)
+                    || _ndShared.currentFilename || '';
                 // Pin the ground-truth note chart too — the arrangement
                 // the highway rendered. hw.getNotes()/getChords() return
                 // {} once the user navigates away, same as getSongInfo().
                 const chartAtEnd = {
                     notes:  (hw && hw.getNotes)  ? hw.getNotes()  : null,
                     chords: (hw && hw.getChords) ? hw.getChords() : null,
+                };
+                // Pin the audio counters too — saveRecordingNow() resets
+                // _recTotalSamples / _recCappedAt once the WAV POST
+                // succeeds, and that runs before _uploadTrainingBundle
+                // builds the manifest, so reading them later yields
+                // duration_s 0 and a lost cap marker.
+                const audioStatsAtEnd = {
+                    sampleRate:    _recSampleRate,
+                    totalSamples:  _recTotalSamples,
+                    cappedAtS:     _recCappedAt,
                 };
                 // Fire-and-forget — the UI polls getRecordingState() so
                 // it'll surface the lastSavePath / lastError when it lands.
@@ -5820,7 +5879,7 @@ function createNoteDetector(options = {}) {
                     // already in _recChunks / on disk).
                     _stopParallelTrainingCapture();
                     if (data && shouldUpload) {
-                        return _uploadTrainingBundle(data, sessionAtEnd, songInfoAtEnd, chartAtEnd);
+                        return _uploadTrainingBundle(data, sessionAtEnd, songInfoAtEnd, chartAtEnd, audioStatsAtEnd, cdlcFilenameAtEnd);
                     }
                 }).catch(() => { _stopParallelTrainingCapture(); }).finally(() => {
                     // Surface the score summary that _endOfSongOnEnded

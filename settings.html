@@ -849,6 +849,12 @@
         // edit from there.
         let saved = '';
         try { saved = localStorage.getItem(_UPLOAD_URL_KEY) || ''; } catch (_) {}
+        // Whether the user has a saved override at page-load time. Used
+        // by the /config fetch below so it never overwrites a saved
+        // value — not even one that happens to equal the fallback
+        // literal (which the value-equality check alone can't tell apart
+        // from "no override").
+        const hasSavedOverride = !!saved;
         urlInput.value = saved || _uploadUrlDefault;
         urlInput.onchange = () => {
             try {
@@ -863,17 +869,27 @@
                 }
             } catch (_) { /* quota / privacy mode */ }
         };
-        // Fetch the authoritative default from the server. If the field
-        // is still showing the fallback (no user override saved), swap
-        // it for the real default once it arrives.
+        // Fetch the authoritative default from the server. Adopt it into
+        // the field ONLY when the user has no saved override — otherwise
+        // we'd silently redirect their configured destination (including
+        // the case where a saved override coincidentally equals the
+        // fallback literal).
         fetch('/api/plugins/note_detect/config')
             .then((r) => (r.ok ? r.json() : null))
             .then((cfg) => {
                 const fromServer = cfg && cfg.pcloud_default_url;
                 if (!fromServer) return;
-                const wasShowingFallback = urlInput.value === _UPLOAD_URL_FALLBACK;
                 _uploadUrlDefault = fromServer;
-                if (wasShowingFallback) urlInput.value = _uploadUrlDefault;
+                // Adopt the server default into the field only when the
+                // user has no saved override AND hasn't started editing
+                // — the field must still show the fallback verbatim and
+                // not be focused, or a slow fetch would clobber input
+                // the user is typing right now.
+                if (!hasSavedOverride
+                    && urlInput.value === _UPLOAD_URL_FALLBACK
+                    && document.activeElement !== urlInput) {
+                    urlInput.value = _uploadUrlDefault;
+                }
             })
             .catch(() => { /* offline — keep the fallback literal */ });
     }

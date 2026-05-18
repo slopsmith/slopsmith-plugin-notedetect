@@ -18,7 +18,7 @@ POST /api/plugins/note_detect/live-judgment
     safe to tail / read partially / replay.
 
 POST /api/plugins/note_detect/training-bundle
-    Body: JSON { slug, session, manifest }.
+    Body: JSON { slug, session, manifest, arrangement, upload_url }.
         slug    — locates the WAV file written by /recording (the most
                   recent matching ``note_detect_<slug>_*.wav``).
         session — locates the live-judgment JSONL written by
@@ -27,12 +27,15 @@ POST /api/plugins/note_detect/training-bundle
         manifest — JSON object recorded as-is into ``manifest.json``
                    inside the bundle. The server adds schema, created_at,
                    and resolved filename/bytes fields before writing.
+        arrangement — optional ground-truth note chart, written as
+                   ``arrangement.json`` inside the bundle.
+        upload_url — optional pCloud destination override.
     Bundles the located files + manifest into
     ``training_<slug>_<ts>.zip`` under the recordings directory, then
-    PUTs the bundle to the curated pCloud public upload link
-    (``_PCLOUD_UPLOAD_CODE`` below). On upload failure the local zip is
-    retained so the user can retry manually. Returns JSON with ``ok``
-    and either ``pcloud_result`` (success) or ``error`` (failure).
+    POSTs the bundle (multipart/form-data) to the curated pCloud public
+    upload link (``_PCLOUD_UPLOAD_CODE`` below). On upload failure the
+    local zip is retained so the user can retry manually. Returns JSON
+    with ``ok`` and either ``pcloud_result`` (success) or ``error``.
 
 All three endpoints write under ``<base>/note_detect_recordings/``, where
 ``<base>`` is the first writable directory among ``$STATIC_DIR``,
@@ -109,6 +112,12 @@ def _sanitize_pcloud_filename(name: str) -> str:
 # a 3-minute take is ~15 MB; 64 MB lets longer takes and higher sample
 # rates through while still refusing to upload pathological blobs.
 _BUNDLE_MAX_BYTES = 64 * 1024 * 1024
+# Cap on the JSON request body for /training-bundle and its /retry.
+# The body is manifest + (optionally) the full note chart — a dense
+# song's arrangement.json is well under 1 MB, so 16 MB is generous
+# while refusing a blob that would balloon memory before the post-zip
+# size check can run.
+_TRAINING_BODY_MAX_BYTES = 16 * 1024 * 1024
 # pCloud HTTP timeout for the upload POST. Slow links can take a while
 # for a 15 MB body; 5 minutes is generous without pinning the request
 # slot indefinitely.
@@ -356,8 +365,19 @@ def setup(app, context):
         # arrangement is the client-pinned ground-truth note chart
         # (optional). Bundles the WAV + JSONL + arrangement.json with the
         # supplied manifest into a zip and POSTs it to pCloud.
+        # Cap the body before parsing — unlike Starlette's streaming
+        # form parser, request.json() buffers the whole body into
+        # memory, so an oversized manifest/arrangement must be refused
+        # up front rather than after it has already been allocated.
+        raw = await request.body()
+        if len(raw) > _TRAINING_BODY_MAX_BYTES:
+            raise HTTPException(
+                413,
+                f"request body too large ({len(raw)} bytes > "
+                f"{_TRAINING_BODY_MAX_BYTES})",
+            )
         try:
-            body = await request.json()
+            body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise HTTPException(400, f"body is not valid JSON: {e}")
         if not isinstance(body, dict):
@@ -535,8 +555,19 @@ def setup(app, context):
         # { local_bundle, upload_url }. No re-bundling — the existing zip
         # is sent verbatim, so a retry is cheap and the user keeps the
         # exact take they recorded.
+        # Cap the body before parsing — unlike Starlette's streaming
+        # form parser, request.json() buffers the whole body into
+        # memory, so an oversized manifest/arrangement must be refused
+        # up front rather than after it has already been allocated.
+        raw = await request.body()
+        if len(raw) > _TRAINING_BODY_MAX_BYTES:
+            raise HTTPException(
+                413,
+                f"request body too large ({len(raw)} bytes > "
+                f"{_TRAINING_BODY_MAX_BYTES})",
+            )
         try:
-            body = await request.json()
+            body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             raise HTTPException(400, f"body is not valid JSON: {e}")
         if not isinstance(body, dict):
@@ -613,7 +644,7 @@ def setup(app, context):
         }
 
     async def _upload_to_pcloud(file_path: Path, filename: str, code: str) -> dict:
-        # `requests` is sync; FastAPI is async. Wrap the PUT in a thread
+        # `requests` is sync; FastAPI is async. Wrap the POST in a thread
         # so a slow upload (15 MB over a residential up-link) doesn't
         # stall the event loop and starve other plugins' routes.
         try:
