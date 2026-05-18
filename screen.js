@@ -1373,6 +1373,10 @@ function createNoteDetector(options = {}) {
     // sticks to filesystem-safe characters. Off (null) until the first
     // song:play fires with tuning mode on.
     let _liveSessionId = null;
+    // Last minted session id, kept after song:ended (unlike
+    // _liveSessionId which _liveOnEnded clears) so the training-bundle
+    // upload can still locate the take's live_<id>.jsonl detect-stream.
+    let _liveLastSessionId = null;
     function _buildSessionHeader() {
         // Snapshot the user's live settings + song context at song:play
         // time. Lands as the first JSONL line of the session file so
@@ -1457,6 +1461,11 @@ function createNoteDetector(options = {}) {
     // user knows whether the bundle made it to the curated dataset.
     let _recTrainingUploadInFlight = false;
     let _recTrainingUploadResult = null; // { ok, bundle_filename, pcloud_result } | { ok:false, error, local_bundle }
+    // When a training take is armed, the consent modal opens on
+    // song:ended — the same event that fires the score summary. Defer
+    // the summary so the two modals don't stack; _runDeferredSummary()
+    // shows it once the consent flow closes.
+    let _summaryDeferred = false;
     // Parallel getUserMedia capture for training takes when the desktop
     // bridge is active. The bridge intentionally does NOT open a JS-side
     // audio chain (the native JUCE engine owns the device), so the
@@ -4547,11 +4556,30 @@ function createNoteDetector(options = {}) {
         if (!enabled) return;
         // showSummary() has its own `total < 5` guard, so a song that
         // ended before the user played anything meaningful is silently
-        // skipped. Calling it here is otherwise unconditional.
-        try { showSummary(); } catch (e) {
-            console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
+        // skipped. When a training take is armed, _recOnEnded opens the
+        // consent modal on this same event — defer the summary so the
+        // modals don't stack (disable() doesn't clear hits/misses, so a
+        // later showSummary() still has the stats).
+        if (_recArmedForTraining) {
+            _summaryDeferred = true;
+        } else {
+            try { showSummary(); } catch (e) {
+                console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
+            }
         }
         try { disable({ silent: true }); } catch (e) {}
+    }
+
+    // Show a summary that was deferred because a training consent modal
+    // was occupying the screen. Idempotent — clears the flag so it runs
+    // at most once per deferral.
+    function _runDeferredSummary() {
+        if (!_summaryDeferred) return;
+        _summaryDeferred = false;
+        if (!isDefault) return;
+        try { showSummary(); } catch (e) {
+            console.warn('[note_detect] deferred end-of-song summary failed:', e && e.message ? e.message : e);
+        }
     }
 
     function _endOfSongBindEvents() {
@@ -5111,6 +5139,18 @@ function createNoteDetector(options = {}) {
         _recTrainingUploadResult = null;
         _recBindEvents();
         _liveBindEvents();
+        // If the user armed AFTER pressing Play, song:play has already
+        // fired and won't fire again: _recSongPlaying never flipped true
+        // (so the capture gate at processFrame / _startParallelTraining-
+        // Capture would stay idle) and _liveOnPlay never minted a live
+        // session (so the JSONL take would carry no session_start
+        // header). Detect a song already underway via the renderer clock
+        // and replay both effects here.
+        const _songUnderway = !!(hw && hw.getTime && hw.getTime() > 0);
+        if (_songUnderway) {
+            _recSongPlaying = true;
+            if (!_liveSessionId) _startLiveSession();
+        }
         // When the desktop bridge is active, the JS-side processFrame()
         // never runs (native engine owns the device), so its
         // _recChunks.push() at line ~2316 never fires and the WAV
@@ -5290,7 +5330,10 @@ function createNoteDetector(options = {}) {
     // once the user dismisses the modal. Single-shot: no second
     // instance can mount concurrently.
     let _trainingModalActive = false;
-    function _showTrainingConsentModal(prefill, doUpload) {
+    // doUpload(formData) bundles + uploads a fresh take; doRetry(localBundle)
+    // re-uploads an already-bundled zip (shown as a Retry button when the
+    // first upload fails). doRetry is optional — omit it to disable retry.
+    function _showTrainingConsentModal(prefill, doUpload, doRetry) {
         if (_trainingModalActive) return Promise.resolve(null);
         _trainingModalActive = true;
         return new Promise((resolve) => {
@@ -5349,6 +5392,7 @@ function createNoteDetector(options = {}) {
 
                     <div class="flex gap-2">
                         <button class="nd-tr-cancel flex-1 px-3 py-2 bg-dark-500 hover:bg-dark-400 rounded text-xs text-gray-300">Cancel</button>
+                        <button class="nd-tr-retry flex-1 px-3 py-2 bg-purple-600 hover:bg-purple-500 disabled:bg-dark-600 disabled:text-gray-600 disabled:cursor-not-allowed rounded text-xs font-semibold text-white" style="display:none">Retry upload</button>
                         <button class="nd-tr-submit flex-1 px-3 py-2 bg-purple-600 hover:bg-purple-500 disabled:bg-dark-600 disabled:text-gray-600 disabled:cursor-not-allowed rounded text-xs font-semibold text-white" disabled>Upload</button>
                     </div>
                 </div>
@@ -5367,6 +5411,7 @@ function createNoteDetector(options = {}) {
             $('.nd-tr-notes').value   = prefill.notes || '';
 
             const submitBtn  = $('.nd-tr-submit');
+            const retryBtn   = $('.nd-tr-retry');
             const cancelBtn  = $('.nd-tr-cancel');
             const consentCb  = $('.nd-tr-consent');
             const statusEl   = $('.nd-tr-status');
@@ -5374,10 +5419,22 @@ function createNoteDetector(options = {}) {
             consentCb.addEventListener('change', () => { submitBtn.disabled = !consentCb.checked; });
 
             let finalResult = null;
+            // Promise of the upload currently in flight (doUpload or
+            // doRetry), or null. Closing the modal removes it from view
+            // immediately, but the modal Promise MUST NOT resolve until
+            // this settles — _uploadTrainingBundle's finally (disarm +
+            // live-stream unbind) runs on that resolution, and running
+            // it mid-upload stops judgment streaming and lets the take
+            // be re-armed while its request is still going.
+            let _activeUpload = null;
             const cleanup = () => {
                 modal.remove();
                 _trainingModalActive = false;
-                resolve(finalResult);
+                if (_activeUpload) {
+                    _activeUpload.finally(() => resolve(finalResult));
+                } else {
+                    resolve(finalResult);
+                }
             };
             const setStatus = (kind, text) => {
                 statusEl.classList.remove('hidden');
@@ -5389,7 +5446,63 @@ function createNoteDetector(options = {}) {
                 statusEl.textContent = text;
             };
 
-            cancelBtn.onclick = () => { finalResult = null; cleanup(); };
+            // Render an upload outcome (from the initial Upload or a
+            // Retry) into the modal. Success collapses the actions
+            // behind a green Close; failure shows a red Close and — when
+            // the server retained a local bundle and a retry path was
+            // supplied — a Retry button so the user can re-ship without
+            // recording the song again.
+            const applyResult = (result) => {
+                finalResult = result;
+                _recTrainingUploadResult = result;
+                if (result && result.ok) {
+                    setStatus('ok', '✓ Uploaded to the training dataset: ' + (result.bundle_filename || '(file)') + '. Thanks for contributing!');
+                    submitBtn.style.display = 'none';
+                    retryBtn.style.display = 'none';
+                    cancelBtn.textContent = 'Close';
+                    cancelBtn.className = 'flex-1 px-3 py-2 bg-green-700 hover:bg-green-600 rounded text-xs font-semibold text-white';
+                } else {
+                    const errMsg = (result && result.error) ? result.error : 'unknown error';
+                    const canRetry = !!(doRetry && result && result.local_bundle);
+                    const retained = (result && result.local_bundle)
+                        ? ('\nThe local bundle was retained at ' + result.local_bundle
+                           + (canRetry ? ' — use Retry below.' : ' — you can retry from there.'))
+                        : '';
+                    setStatus('err', '✗ Upload failed: ' + errMsg + retained);
+                    submitBtn.style.display = 'none';
+                    cancelBtn.textContent = 'Close';
+                    cancelBtn.className = 'flex-1 px-3 py-2 bg-red-700 hover:bg-red-600 rounded text-xs font-semibold text-white';
+                    if (canRetry) {
+                        retryBtn.style.display = '';
+                        retryBtn.disabled = false;
+                        retryBtn._localBundle = result.local_bundle;
+                    }
+                }
+            };
+
+            // Close resolves with whatever the last attempt produced —
+            // null before any upload (a genuine cancel), or the success/
+            // failure result afterwards so the caller records it.
+            cancelBtn.onclick = () => { cleanup(); };
+            retryBtn.onclick = async () => {
+                const localBundle = retryBtn._localBundle;
+                if (!localBundle || !doRetry) return;
+                retryBtn.disabled = true;
+                retryBtn.textContent = 'Retrying…';
+                setStatus('info', 'Re-uploading the saved bundle to pCloud — no re-recording needed. Don’t close Slopsmith yet.');
+                let result = null;
+                const p = doRetry(localBundle);
+                _activeUpload = p;
+                try {
+                    result = await p;
+                } catch (e) {
+                    result = { ok: false, error: String(e && e.message || e), local_bundle: localBundle };
+                } finally {
+                    if (_activeUpload === p) _activeUpload = null;
+                }
+                retryBtn.textContent = 'Retry upload';
+                applyResult(result);
+            };
             submitBtn.onclick = async () => {
                 if (!consentCb.checked) return; // belt-and-braces
                 const formData = {
@@ -5415,25 +5528,16 @@ function createNoteDetector(options = {}) {
                 setStatus('info', 'Bundling the WAV, detect-stream, and manifest, then shipping to pCloud. Don’t close Slopsmith yet — this can take a few seconds on a slow uplink.');
 
                 let result = null;
+                const p = doUpload(formData);
+                _activeUpload = p;
                 try {
-                    result = await doUpload(formData);
+                    result = await p;
                 } catch (e) {
                     result = { ok: false, error: String(e && e.message || e) };
+                } finally {
+                    if (_activeUpload === p) _activeUpload = null;
                 }
-                finalResult = result;
-                if (result && result.ok) {
-                    setStatus('ok', '✓ Uploaded to the training dataset: ' + (result.bundle_filename || '(file)') + '. Thanks for contributing!');
-                    submitBtn.style.display = 'none';
-                    cancelBtn.textContent = 'Close';
-                    cancelBtn.className = 'flex-1 px-3 py-2 bg-green-700 hover:bg-green-600 rounded text-xs font-semibold text-white';
-                } else {
-                    const errMsg = (result && result.error) ? result.error : 'unknown error';
-                    const retained = (result && result.local_bundle) ? '\nThe local bundle was retained at ' + result.local_bundle + ' — you can retry from there.' : '';
-                    setStatus('err', '✗ Upload failed: ' + errMsg + retained);
-                    submitBtn.style.display = 'none';
-                    cancelBtn.textContent = 'Close';
-                    cancelBtn.className = 'flex-1 px-3 py-2 bg-red-700 hover:bg-red-600 rounded text-xs font-semibold text-white';
-                }
+                applyResult(result);
             };
             // Esc closes the modal. While uploading, Esc still works (the
             // upload promise resolves into _recTrainingUploadResult, so
@@ -5443,7 +5547,7 @@ function createNoteDetector(options = {}) {
             });
         });
     }
-    async function _uploadTrainingBundle(savedData, sessionId, songInfoSnapshot) {
+    async function _uploadTrainingBundle(savedData, sessionId, songInfoSnapshot, chartSnapshot) {
         if (_recTrainingUploadInFlight) return null;
         try {
             // Recover the slug from the server-returned filename. The
@@ -5575,6 +5679,11 @@ function createNoteDetector(options = {}) {
                             slug,
                             session: sessionId || 'default',
                             manifest,
+                            // Ground-truth note chart (hw.getNotes/getChords
+                            // pinned at song:ended) — the server writes it
+                            // into the bundle as arrangement.json. null when
+                            // the host exposed no chart.
+                            arrangement: chartSnapshot || null,
                             upload_url: uploadUrl,
                         }),
                     });
@@ -5593,6 +5702,49 @@ function createNoteDetector(options = {}) {
                     _recTrainingUploadResult = out;
                     console.warn('[note_detect] training-bundle upload failed:', e);
                     return out;
+                } finally {
+                    // Clear the in-flight flag HERE — when the network
+                    // request actually settles — not in _uploadTraining-
+                    // Bundle's finally. That finally fires as soon as the
+                    // consent modal closes, which can be while this fetch
+                    // is still running (user clicked Upload then Hide);
+                    // clearing it there would tell the UI the upload is
+                    // done and let the user re-arm/discard mid-upload.
+                    _recTrainingUploadInFlight = false;
+                }
+            }, async (localBundle) => {
+                // Retry path: re-upload the zip already on disk (no
+                // re-bundling). The server confines `local_bundle` to
+                // the recordings directory, so passing the path back is
+                // safe. Honours the same per-user upload-URL override.
+                let uploadUrl = null;
+                try { uploadUrl = localStorage.getItem('nd_training_upload_url') || null; } catch (_) {}
+                _recTrainingUploadInFlight = true;
+                try {
+                    const resp = await fetch('/api/plugins/note_detect/training-bundle/retry', {
+                        method:  'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body:    JSON.stringify({ local_bundle: localBundle, upload_url: uploadUrl }),
+                    });
+                    let data = null;
+                    try { data = await resp.json(); } catch (_) { /* leave null; surfaced below */ }
+                    if (!resp.ok) {
+                        const errStr = (data && (data.detail || data.error)) || resp.statusText;
+                        const out = { ok: false, error: `HTTP ${resp.status}: ${errStr}`, local_bundle: (data && data.local_bundle) || localBundle };
+                        _recTrainingUploadResult = out;
+                        return out;
+                    }
+                    _recTrainingUploadResult = data;
+                    return data;
+                } catch (e) {
+                    const out = { ok: false, error: String(e && e.message || e), local_bundle: localBundle };
+                    _recTrainingUploadResult = out;
+                    console.warn('[note_detect] training-bundle retry failed:', e);
+                    return out;
+                } finally {
+                    // Same as doUpload: clear when the request settles,
+                    // not when the modal closes.
+                    _recTrainingUploadInFlight = false;
                 }
             });
             if (!result) {
@@ -5609,7 +5761,10 @@ function createNoteDetector(options = {}) {
             console.warn('[note_detect] training-bundle flow failed:', e);
             return null;
         } finally {
-            _recTrainingUploadInFlight = false;
+            // NOTE: _recTrainingUploadInFlight is intentionally NOT
+            // cleared here — doUpload / doRetry own it and clear it when
+            // their network request settles. This finally runs as soon
+            // as the consent modal closes, which may be mid-upload.
             // One take per arm. The next training take must re-arm.
             _recArmedForTraining = false;
             // Drop the live stream subscription if it was only being kept
@@ -5643,8 +5798,20 @@ function createNoteDetector(options = {}) {
                 // would show empty Song Name / CDLC filename / Tuning.
                 // Pin all of it here.
                 const shouldUpload = _recArmedForTraining;
-                const sessionAtEnd = _liveSessionId;
+                // _liveSessionId may already be null here: _liveOnEnded
+                // (bound by tuning mode, often BEFORE _recBindEvents ran)
+                // clears it on this same song:ended. _liveLastSessionId
+                // survives song:ended, so it's the reliable handle for
+                // locating this take's live_<id>.jsonl detect-stream.
+                const sessionAtEnd = _liveSessionId || _liveLastSessionId;
                 const songInfoAtEnd = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+                // Pin the ground-truth note chart too — the arrangement
+                // the highway rendered. hw.getNotes()/getChords() return
+                // {} once the user navigates away, same as getSongInfo().
+                const chartAtEnd = {
+                    notes:  (hw && hw.getNotes)  ? hw.getNotes()  : null,
+                    chords: (hw && hw.getChords) ? hw.getChords() : null,
+                };
                 // Fire-and-forget — the UI polls getRecordingState() so
                 // it'll surface the lastSavePath / lastError when it lands.
                 saveRecordingNow().then((data) => {
@@ -5653,9 +5820,14 @@ function createNoteDetector(options = {}) {
                     // already in _recChunks / on disk).
                     _stopParallelTrainingCapture();
                     if (data && shouldUpload) {
-                        return _uploadTrainingBundle(data, sessionAtEnd, songInfoAtEnd);
+                        return _uploadTrainingBundle(data, sessionAtEnd, songInfoAtEnd, chartAtEnd);
                     }
-                }).catch(() => { _stopParallelTrainingCapture(); });
+                }).catch(() => { _stopParallelTrainingCapture(); }).finally(() => {
+                    // Surface the score summary that _endOfSongOnEnded
+                    // deferred — now that the consent modal (if any) has
+                    // closed. No-op when nothing was deferred.
+                    _runDeferredSummary();
+                });
             } else if (_recArmed) {
                 // Armed but never captured anything (Detect was off, or
                 // song:play never fired). Disarm + release the bus
@@ -5666,6 +5838,9 @@ function createNoteDetector(options = {}) {
                 _recLastSaveError = 'no audio captured before song:ended';
                 _recUnbindEvents();
                 _stopParallelTrainingCapture();
+                // No upload modal will open — release any deferred
+                // summary immediately.
+                _runDeferredSummary();
             }
         };
         try {
@@ -5701,37 +5876,49 @@ function createNoteDetector(options = {}) {
     // streaming even without arming a WAV capture.
     let _liveOnPlay = null, _liveOnEnded = null;
     let _liveSubscribed = false;
+
+    // Mint a fresh live session id and stream the session-header record
+    // as line 1 of the JSONL. Normally driven by song:play, but also
+    // called from armRecordingForTraining() when the user arms AFTER
+    // pressing Play — in that case song:play has already fired and won't
+    // fire again, so without this the take would carry no header.
+    function _startLiveSession() {
+        // Match the recording route's filename convention so live
+        // JSONL and recorded WAV pair up cleanly under
+        // static/note_detect_recordings/.
+        const now = new Date();
+        const pad = (n) => String(n).padStart(2, '0');
+        const ts = now.getFullYear()
+            + pad(now.getMonth() + 1) + pad(now.getDate()) + '_'
+            + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
+        // Short random suffix avoids collisions when two panels
+        // emit a song:play in the same second (splitscreen).
+        const rand = Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
+        _liveSessionId = `${ts}_${rand}`;
+        // Mirror into a handle that is NOT cleared on song:ended, so the
+        // training-bundle upload can still locate this take's JSONL even
+        // though _liveOnEnded nulls _liveSessionId.
+        _liveLastSessionId = _liveSessionId;
+        // Stream a session-header record as line 1 of the JSONL so
+        // an offline reader knows under which settings the
+        // subsequent judgments were produced. Important for two
+        // reasons: (1) any analysis that infers "what cr was the
+        // user on?" from judgment data alone is fragile, (2) we
+        // want to mine these for sensible-default suggestions
+        // across users without each contributor having to attach
+        // their settings every time. Distinct shape (type:
+        // "session_start") so consumers can split header from
+        // judgments. Includes song / arrangement context too —
+        // useful for bucketing v1/v2/bass benchmark runs.
+        _streamLiveJudgment(_buildSessionHeader());
+    }
+
     function _liveBindEvents() {
         if (_liveSubscribed) return;
         if (!window.slopsmith
             || typeof window.slopsmith.on !== 'function'
             || typeof window.slopsmith.off !== 'function') return;
-        _liveOnPlay = () => {
-            // Match the recording route's filename convention so live
-            // JSONL and recorded WAV pair up cleanly under
-            // static/note_detect_recordings/.
-            const now = new Date();
-            const pad = (n) => String(n).padStart(2, '0');
-            const ts = now.getFullYear()
-                + pad(now.getMonth() + 1) + pad(now.getDate()) + '_'
-                + pad(now.getHours()) + pad(now.getMinutes()) + pad(now.getSeconds());
-            // Short random suffix avoids collisions when two panels
-            // emit a song:play in the same second (splitscreen).
-            const rand = Math.floor(Math.random() * 0xffffff).toString(16).padStart(6, '0');
-            _liveSessionId = `${ts}_${rand}`;
-            // Stream a session-header record as line 1 of the JSONL so
-            // an offline reader knows under which settings the
-            // subsequent judgments were produced. Important for two
-            // reasons: (1) any analysis that infers "what cr was the
-            // user on?" from judgment data alone is fragile, (2) we
-            // want to mine these for sensible-default suggestions
-            // across users without each contributor having to attach
-            // their settings every time. Distinct shape (type:
-            // "session_start") so consumers can split header from
-            // judgments. Includes song / arrangement context too —
-            // useful for bucketing v1/v2/bass benchmark runs.
-            _streamLiveJudgment(_buildSessionHeader());
-        };
+        _liveOnPlay = () => { _startLiveSession(); };
         _liveOnEnded = () => {
             _liveSessionId = null;
         };

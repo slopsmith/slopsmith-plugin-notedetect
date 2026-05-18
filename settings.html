@@ -72,9 +72,9 @@
              different pCloud share URL to point uploads at your own
              folder. Server parses the `code=…` parameter out of
              whatever's pasted (full share URL, API URL, or bare
-             code). The default literal MUST stay in sync with
-             `_PCLOUD_DEFAULT_URL` in routes.py — if you change one,
-             change the other. -->
+             code). The default is fetched from
+             GET /api/plugins/note_detect/config so routes.py is the
+             single source of truth. -->
         <div class="mt-4 pt-3 border-t border-gray-800">
             <label for="nd-upload-url" class="block text-xs text-gray-300 mb-1">Training upload destination</label>
             <input id="nd-upload-url" type="text" spellcheck="false" autocomplete="off"
@@ -829,15 +829,18 @@
     }
 
     // Training upload destination — text input that pre-fills with
-    // either the user's previously-saved value OR the hardcoded
-    // default URL. Persisted under 'nd_training_upload_url'. The
-    // default literal MUST stay in sync with `_PCLOUD_DEFAULT_URL`
-    // in routes.py — if you change one, change the other. Empty
-    // string means "use the server default", which keeps the
-    // server-side hardcoded code as the source of truth when the
-    // user clears the field.
+    // either the user's previously-saved value OR the curated default
+    // URL. Persisted under 'nd_training_upload_url'. Empty string means
+    // "use the server default", which keeps the server-side code as the
+    // source of truth when the user clears the field.
+    //
+    // The default URL is fetched from GET /api/plugins/note_detect/config
+    // so routes.py is the single source of truth. The literal below is
+    // only an offline fallback for when that fetch fails — it does NOT
+    // need to be kept in sync and may be stale.
     const _UPLOAD_URL_KEY = 'nd_training_upload_url';
-    const _UPLOAD_URL_DEFAULT = 'https://e.pcloud.com/#/puplink?code=itd7ZwmOK8S2D6XSAE1Q9cUPaF5c9WFfk';
+    const _UPLOAD_URL_FALLBACK = 'https://e.pcloud.com/#/puplink?code=itd7ZwmOK8S2D6XSAE1Q9cUPaF5c9WFfk';
+    let _uploadUrlDefault = _UPLOAD_URL_FALLBACK;
     const urlInput = _q('nd-upload-url');
     const urlReset = _q('nd-upload-url-reset');
     if (urlInput) {
@@ -846,24 +849,37 @@
         // edit from there.
         let saved = '';
         try { saved = localStorage.getItem(_UPLOAD_URL_KEY) || ''; } catch (_) {}
-        urlInput.value = saved || _UPLOAD_URL_DEFAULT;
+        urlInput.value = saved || _uploadUrlDefault;
         urlInput.onchange = () => {
             try {
                 const v = urlInput.value.trim();
-                if (v && v !== _UPLOAD_URL_DEFAULT) {
+                if (v && v !== _uploadUrlDefault) {
                     localStorage.setItem(_UPLOAD_URL_KEY, v);
                 } else {
                     // Default or empty — drop the override so the
-                    // server uses its own hardcoded default. Keeps
-                    // the storage clean across plugin upgrades.
+                    // server uses its own default. Keeps the storage
+                    // clean across plugin upgrades.
                     localStorage.removeItem(_UPLOAD_URL_KEY);
                 }
             } catch (_) { /* quota / privacy mode */ }
         };
+        // Fetch the authoritative default from the server. If the field
+        // is still showing the fallback (no user override saved), swap
+        // it for the real default once it arrives.
+        fetch('/api/plugins/note_detect/config')
+            .then((r) => (r.ok ? r.json() : null))
+            .then((cfg) => {
+                const fromServer = cfg && cfg.pcloud_default_url;
+                if (!fromServer) return;
+                const wasShowingFallback = urlInput.value === _UPLOAD_URL_FALLBACK;
+                _uploadUrlDefault = fromServer;
+                if (wasShowingFallback) urlInput.value = _uploadUrlDefault;
+            })
+            .catch(() => { /* offline — keep the fallback literal */ });
     }
     if (urlReset && urlInput) {
         urlReset.onclick = () => {
-            urlInput.value = _UPLOAD_URL_DEFAULT;
+            urlInput.value = _uploadUrlDefault;
             try { localStorage.removeItem(_UPLOAD_URL_KEY); } catch (_) {}
         };
     }

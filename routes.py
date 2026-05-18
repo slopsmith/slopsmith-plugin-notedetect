@@ -59,9 +59,9 @@ from fastapi import HTTPException, Request
 # training set. Anyone with this code can upload to the destination
 # folder; they cannot list or read it. Hardcoded as the fallback when
 # the client doesn't supply an `upload_url` in the /training-bundle
-# POST. The default share URL below MUST stay in sync with
-# `_UPLOAD_URL_DEFAULT` in settings.html — if you change one, change
-# the other (the settings page pre-fills its field with that literal).
+# POST. This is the single source of truth for the default — the
+# settings page fetches it via GET /api/plugins/note_detect/config
+# rather than hardcoding its own copy.
 _PCLOUD_UPLOAD_CODE = "itd7ZwmOK8S2D6XSAE1Q9cUPaF5c9WFfk"
 _PCLOUD_DEFAULT_URL = "https://e.pcloud.com/#/puplink?code=" + _PCLOUD_UPLOAD_CODE
 _PCLOUD_UPLOAD_URL = "https://eapi.pcloud.com/uploadtolink"
@@ -75,16 +75,16 @@ _PCLOUD_CODE_RE = re.compile(r"code=([A-Za-z0-9_-]+)")
 # only, so anything matching the full string is treated as already-
 # extracted.
 _PCLOUD_BARE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-# pCloud's `uploadtolink` endpoint rejects some filenames with
-# result=2001 "Invalid file/folder name" — empirically this trips
-# on names with mixed case + underscores in certain combinations
-# (e.g. `training_Note_Detect_Benchmark_v2_20260518_102500_022_de4349.zip`
-# was rejected in testing). Sanitize to a conservative pCloud-safe
-# form before sending: lowercase, ASCII alphanumeric + single dashes
-# only, stem capped at 80 chars, extension preserved (but
-# lowercased). Applied ONLY to the name we send pCloud — the local
-# zip on disk keeps its original (readable) name so retries / forensics
-# stay easy.
+# Conservative pCloud-safe filename normaliser applied to the name
+# sent to pCloud as the `names` parameter: lowercase, ASCII
+# alphanumeric + single dashes only, stem capped at 80 chars,
+# extension preserved (but lowercased). The `result=2001 "Invalid
+# file/folder name"` failures were caused by omitting the `names`
+# parameter entirely (see `_upload_to_pcloud`), not by the name's
+# contents; this normaliser is kept as defence-in-depth against
+# genuinely odd names. Applied ONLY to the name we send pCloud — the
+# local zip on disk keeps its original (readable) name so retries /
+# forensics stay easy.
 _PCLOUD_NAME_STEM_RE = re.compile(r"[^a-z0-9]+")
 _PCLOUD_NAME_DASH_COLLAPSE_RE = re.compile(r"-+")
 
@@ -109,7 +109,7 @@ def _sanitize_pcloud_filename(name: str) -> str:
 # a 3-minute take is ~15 MB; 64 MB lets longer takes and higher sample
 # rates through while still refusing to upload pathological blobs.
 _BUNDLE_MAX_BYTES = 64 * 1024 * 1024
-# pCloud HTTP timeout for the upload PUT. Slow links can take a while
+# pCloud HTTP timeout for the upload POST. Slow links can take a while
 # for a 15 MB body; 5 minutes is generous without pinning the request
 # slot indefinitely.
 _PCLOUD_TIMEOUT_S = 300
@@ -350,10 +350,12 @@ def setup(app, context):
 
     @app.post("/api/plugins/note_detect/training-bundle")
     async def upload_training_bundle(request: Request):
-        # Body: { slug, session, manifest }. Slug locates the WAV
-        # previously written by /recording; session locates the JSONL
-        # written by /live-judgment (optional). Bundles both with the
-        # supplied manifest into a zip and PUTs it to pCloud.
+        # Body: { slug, session, manifest, arrangement, upload_url }.
+        # Slug locates the WAV previously written by /recording; session
+        # locates the JSONL written by /live-judgment (optional);
+        # arrangement is the client-pinned ground-truth note chart
+        # (optional). Bundles the WAV + JSONL + arrangement.json with the
+        # supplied manifest into a zip and POSTs it to pCloud.
         try:
             body = await request.json()
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -420,6 +422,24 @@ def setup(app, context):
                 "bytes": jsonl_path.stat().st_size,
             }
 
+        # Ground-truth note chart supplied by the client (hw.getNotes /
+        # getChords pinned at song:ended) — the training labels for the
+        # recorded audio. Written into the bundle as arrangement.json.
+        # Optional: a host that exposes no chart sends null.
+        arrangement = body.get("arrangement")
+        if arrangement is not None and not isinstance(arrangement, dict):
+            raise HTTPException(400, "'arrangement' must be a JSON object or null")
+        arrangement_json = None
+        if arrangement:
+            arrangement_json = json.dumps(arrangement, indent=2, sort_keys=True)
+            notes = arrangement.get("notes")
+            chords = arrangement.get("chords")
+            manifest["arrangement_chart"] = {
+                "filename": "arrangement.json",
+                "note_count": len(notes) if isinstance(notes, list) else None,
+                "chord_count": len(chords) if isinstance(chords, list) else None,
+            }
+
         # Write the bundle zip. Filename mirrors the WAV's timestamp tail
         # so a take and its bundle sort adjacently in the recordings dir.
         bundle_name = "training_" + wav_path.stem.removeprefix("note_detect_") + ".zip"
@@ -430,6 +450,8 @@ def setup(app, context):
                 zf.write(wav_path, arcname=wav_path.name)
                 if has_jsonl:
                     zf.write(jsonl_path, arcname=jsonl_path.name)
+                if arrangement_json is not None:
+                    zf.writestr("arrangement.json", arrangement_json)
                 zf.writestr(
                     "manifest.json",
                     json.dumps(manifest, indent=2, sort_keys=True),
@@ -498,6 +520,98 @@ def setup(app, context):
             "pcloud_result": pcloud_result,
         }
 
+    @app.get("/api/plugins/note_detect/config")
+    async def get_config():
+        # Single source of truth for the default pCloud upload
+        # destination. settings.html fetches this on load so the default
+        # code lives in exactly one place (here) instead of being
+        # duplicated — and kept in sync by hand — in the renderer.
+        return {"pcloud_default_url": _PCLOUD_DEFAULT_URL}
+
+    @app.post("/api/plugins/note_detect/training-bundle/retry")
+    async def retry_training_bundle(request: Request):
+        # Re-upload a bundle zip that a previous /training-bundle call
+        # wrote to disk but failed to push to pCloud. Body:
+        # { local_bundle, upload_url }. No re-bundling — the existing zip
+        # is sent verbatim, so a retry is cheap and the user keeps the
+        # exact take they recorded.
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise HTTPException(400, f"body is not valid JSON: {e}")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be a JSON object")
+
+        local_bundle = body.get("local_bundle")
+        if not local_bundle or not isinstance(local_bundle, str):
+            raise HTTPException(400, "missing or invalid 'local_bundle'")
+        upload_url_override = body.get("upload_url")
+        if upload_url_override is not None and not isinstance(upload_url_override, str):
+            raise HTTPException(400, "'upload_url' must be a string or null")
+        pcloud_code = _parse_pcloud_code(upload_url_override)
+
+        base = _ensure_out_dir()
+        # Security: the client hands us a path, so confine it to the
+        # recordings directory and require the training-bundle naming
+        # shape. Anything else — a traversal, an arbitrary file — is
+        # rejected; this endpoint must never upload a file the bundle
+        # flow itself didn't create.
+        try:
+            bundle_path = Path(local_bundle).resolve()
+            bundle_path.relative_to(base.resolve())
+        except (ValueError, OSError):
+            raise HTTPException(400, "'local_bundle' is outside the recordings directory")
+        if not (bundle_path.name.startswith("training_")
+                and bundle_path.suffix == ".zip"):
+            raise HTTPException(400, "'local_bundle' is not a training bundle zip")
+        if not bundle_path.is_file():
+            raise HTTPException(404, f"bundle not found: {bundle_path}")
+
+        bundle_size = bundle_path.stat().st_size
+        # Same size guard as /training-bundle — a retry must not become a
+        # way to push an arbitrarily large zip past the cap.
+        if bundle_size > _BUNDLE_MAX_BYTES:
+            raise HTTPException(
+                413,
+                f"bundle too large ({bundle_size} bytes > {_BUNDLE_MAX_BYTES}); "
+                f"retained at {bundle_path}",
+            )
+        rel = f"static/{_RECORDINGS_REL}/{bundle_path.name}"
+        pcloud_filename = _sanitize_pcloud_filename(bundle_path.name)
+        log.info(
+            "retrying pCloud upload for %s (pcloud_filename: %s)",
+            bundle_path.name, pcloud_filename,
+        )
+        try:
+            pcloud_result = await _upload_to_pcloud(bundle_path, pcloud_filename, pcloud_code)
+        except Exception as e:
+            log.warning(
+                "pCloud retry upload failed (%s); bundle retained at %s",
+                e, bundle_path,
+            )
+            return {
+                "ok": False,
+                "error": str(e),
+                "local_bundle": str(bundle_path),
+                "relative_path": rel,
+                "bundle_filename": bundle_path.name,
+                "pcloud_filename": pcloud_filename,
+                "bytes": bundle_size,
+            }
+
+        log.info(
+            "retry uploaded training bundle %s (%d bytes) to pCloud: %s",
+            bundle_path.name, bundle_size, pcloud_result,
+        )
+        return {
+            "ok": True,
+            "local_bundle": str(bundle_path),
+            "relative_path": rel,
+            "bundle_filename": bundle_path.name,
+            "bytes": bundle_size,
+            "pcloud_result": pcloud_result,
+        }
+
     async def _upload_to_pcloud(file_path: Path, filename: str, code: str) -> dict:
         # `requests` is sync; FastAPI is async. Wrap the PUT in a thread
         # so a slow upload (15 MB over a residential up-link) doesn't
@@ -510,16 +624,20 @@ def setup(app, context):
             ) from e
         import anyio
 
-        def _put() -> dict:
+        def _post() -> dict:
+            # pCloud's `uploadtolink` expects a POST with multipart/form-data
+            # AND the stored filename supplied as the `names` query
+            # parameter. It does NOT read the filename from the multipart
+            # part — without `names` it rejects every upload with
+            # `result=2001 "Invalid file/folder name"` (verified: the same
+            # 2001 fires even for a request with no file at all, so it is
+            # the missing `names`, not the file's name, that trips it).
+            # The multipart file part must be field name `file`.
             with open(file_path, "rb") as fh:
-                resp = requests.put(
+                resp = requests.post(
                     _PCLOUD_UPLOAD_URL,
-                    params={
-                        "code": code,
-                        "filename": filename,
-                        "nopartial": "1",
-                    },
-                    data=fh,
+                    params={"code": code, "nopartial": "1", "names": filename},
+                    files={"file": (filename, fh, "application/zip")},
                     timeout=_PCLOUD_TIMEOUT_S,
                 )
             resp.raise_for_status()
@@ -539,4 +657,4 @@ def setup(app, context):
                 )
             return data
 
-        return await anyio.to_thread.run_sync(_put)
+        return await anyio.to_thread.run_sync(_post)
