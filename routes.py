@@ -457,11 +457,10 @@ def setup(app, context):
             bundle_name, bundle_size,
         )
         pcloud_filename = _sanitize_pcloud_filename(bundle_name)
-        if pcloud_filename != bundle_name:
-            log.info(
-                "uploading as sanitized filename %s (local: %s)",
-                pcloud_filename, bundle_name,
-            )
+        log.info(
+            "uploading bundle to pCloud (local: %s, pcloud_filename: %s)",
+            bundle_name, pcloud_filename,
+        )
         try:
             pcloud_result = await _upload_to_pcloud(bundle_path, pcloud_filename, pcloud_code)
         except Exception as e:
@@ -469,8 +468,8 @@ def setup(app, context):
             # — the upload-failed-but-bundle-exists state is a valid
             # outcome the UI surfaces differently from "no bundle".
             log.warning(
-                "pCloud upload failed (%s); bundle retained at %s",
-                e, bundle_path,
+                "pCloud upload failed (%s); bundle retained at %s, pcloud_filename=%s",
+                e, bundle_path, pcloud_filename,
             )
             return {
                 "ok": False,
@@ -478,6 +477,11 @@ def setup(app, context):
                 "local_bundle": str(bundle_path),
                 "relative_path": rel,
                 "bundle_filename": bundle_name,
+                # The name we ACTUALLY sent to pCloud (sanitized). Surfaced
+                # so the UI can tell us "did the new sanitization even run"
+                # — a tail of underscores here would mean the Python server
+                # is still on stale code.
+                "pcloud_filename": pcloud_filename,
                 "bytes": bundle_size,
             }
 
