@@ -5127,10 +5127,144 @@ function createNoteDetector(options = {}) {
             trainingUploadResult:   _recTrainingUploadResult,
         };
     }
+    // Contributor + per-instrument prefs persisted in localStorage so
+    // the upload dialog auto-fills on subsequent takes. Song-specific
+    // fields (title, cdlc filename, tuning) always come from songInfo,
+    // so they're NOT persisted — last song's title would be wrong for
+    // the next.
+    const _TRAINING_PREFS_KEY = 'nd_training_prefs_v1';
+    function _loadTrainingPrefs() {
+        try {
+            const raw = localStorage.getItem(_TRAINING_PREFS_KEY);
+            if (!raw) return { name: '', discord: '', instrument: '', notes: '' };
+            const p = JSON.parse(raw) || {};
+            return {
+                name:       typeof p.name       === 'string' ? p.name       : '',
+                discord:    typeof p.discord    === 'string' ? p.discord    : '',
+                instrument: typeof p.instrument === 'string' ? p.instrument : '',
+                notes:      typeof p.notes      === 'string' ? p.notes      : '',
+            };
+        } catch (_) {
+            return { name: '', discord: '', instrument: '', notes: '' };
+        }
+    }
+    function _saveTrainingPrefs(prefs) {
+        try {
+            localStorage.setItem(_TRAINING_PREFS_KEY, JSON.stringify({
+                name:       prefs.name       || '',
+                discord:    prefs.discord    || '',
+                instrument: prefs.instrument || '',
+                notes:      prefs.notes      || '',
+            }));
+        } catch (_) { /* ignore quota / privacy mode */ }
+    }
+    // Modal that gates the upload — surfaces auto-detected song fields
+    // for review/edit, captures contributor metadata, and requires an
+    // explicit consent checkbox. Resolves with a form-data object on
+    // submit, null on cancel. Single-shot: no second instance is
+    // allowed to mount concurrently (would race on document.body).
+    let _trainingModalActive = false;
+    function _showTrainingConsentModal(prefill) {
+        if (_trainingModalActive) return Promise.resolve(null);
+        _trainingModalActive = true;
+        return new Promise((resolve) => {
+            const modal = document.createElement('div');
+            modal.className = 'nd-train-modal fixed inset-0 z-[99999] flex items-center justify-center bg-black/70 p-4 overflow-y-auto';
+            // Plain-text inputs only — no HTML interpolation of user-
+            // controllable strings to avoid an XSS surface from
+            // chart-provided song info or localStorage tampering.
+            modal.innerHTML = `
+                <div class="bg-dark-700 border border-gray-600 rounded-lg max-w-md w-full p-5 shadow-2xl my-4">
+                    <h3 class="text-base font-semibold text-gray-100 mb-1">Submit Training Take</h3>
+                    <p class="text-[11px] text-gray-400 mb-4 leading-snug">
+                        Review the details below, then check the consent box to upload your take
+                        (audio + detection events + this form) to the training dataset. All fields
+                        marked optional can be left blank.
+                    </p>
+
+                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Song Name</label>
+                    <input class="nd-tr-song w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+
+                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">CDLC File Name</label>
+                    <input class="nd-tr-cdlc w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+
+                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Instrument</label>
+                    <select class="nd-tr-instr w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+                        <option value="guitar">Guitar</option>
+                        <option value="bass">Bass</option>
+                    </select>
+
+                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Tuning</label>
+                    <input class="nd-tr-tuning w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+
+                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Your Name <span class="text-gray-500 normal-case">(optional)</span></label>
+                    <input class="nd-tr-name w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+
+                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Discord Handle <span class="text-gray-500 normal-case">(optional)</span></label>
+                    <input class="nd-tr-discord w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+
+                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Extra Notes <span class="text-gray-500 normal-case">(optional)</span></label>
+                    <textarea class="nd-tr-notes w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3" rows="3"></textarea>
+
+                    <label class="flex items-start gap-2 mb-4 cursor-pointer">
+                        <input type="checkbox" class="nd-tr-consent mt-0.5">
+                        <span class="text-xs text-gray-300 leading-snug">
+                            I give permission for this recording to be used for training purposes
+                            of the note detection system.
+                        </span>
+                    </label>
+
+                    <div class="flex gap-2">
+                        <button class="nd-tr-cancel flex-1 px-3 py-2 bg-dark-500 hover:bg-dark-400 rounded text-xs text-gray-300">Cancel</button>
+                        <button class="nd-tr-submit flex-1 px-3 py-2 bg-purple-600 hover:bg-purple-500 disabled:bg-dark-600 disabled:text-gray-600 disabled:cursor-not-allowed rounded text-xs font-semibold text-white" disabled>Upload</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+
+            const $ = (sel) => modal.querySelector(sel);
+            // Set values via .value rather than innerHTML so user-
+            // controllable strings can't break out into HTML.
+            $('.nd-tr-song').value    = prefill.songName || '';
+            $('.nd-tr-cdlc').value    = prefill.cdlcFilename || '';
+            $('.nd-tr-instr').value   = (prefill.instrument === 'bass') ? 'bass' : 'guitar';
+            $('.nd-tr-tuning').value  = prefill.tuning || '';
+            $('.nd-tr-name').value    = prefill.name || '';
+            $('.nd-tr-discord').value = prefill.discord || '';
+            $('.nd-tr-notes').value   = prefill.notes || '';
+
+            const submitBtn  = $('.nd-tr-submit');
+            const consentCb  = $('.nd-tr-consent');
+            consentCb.addEventListener('change', () => { submitBtn.disabled = !consentCb.checked; });
+
+            const cleanup = (result) => {
+                modal.remove();
+                _trainingModalActive = false;
+                resolve(result);
+            };
+            $('.nd-tr-cancel').onclick = () => cleanup(null);
+            submitBtn.onclick = () => {
+                if (!consentCb.checked) return; // belt-and-braces
+                cleanup({
+                    songName:     $('.nd-tr-song').value.trim(),
+                    cdlcFilename: $('.nd-tr-cdlc').value.trim(),
+                    instrument:   $('.nd-tr-instr').value,
+                    tuning:       $('.nd-tr-tuning').value.trim(),
+                    name:         $('.nd-tr-name').value.trim(),
+                    discord:      $('.nd-tr-discord').value.trim(),
+                    notes:        $('.nd-tr-notes').value.trim(),
+                    consent:      true,
+                });
+            };
+            // Esc closes; Enter inside any text input doesn't submit
+            // (consent must be checked explicitly via the checkbox).
+            modal.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') { e.stopPropagation(); cleanup(null); }
+            });
+        });
+    }
     async function _uploadTrainingBundle(savedData, sessionId) {
         if (_recTrainingUploadInFlight) return null;
-        _recTrainingUploadInFlight = true;
-        _recTrainingUploadResult = null;
         try {
             // Recover the slug from the server-returned filename. The
             // /recording endpoint stamps `note_detect_<slug>_<ts>_<ms>_<suf>.wav`,
@@ -5140,26 +5274,74 @@ function createNoteDetector(options = {}) {
             const filename = (savedData && savedData.filename) || '';
             const m = /^note_detect_(.+?)_\d{8}_\d{6}_\d{3}_[0-9a-f]+\.wav$/.exec(filename);
             if (!m) {
-                throw new Error('could not parse slug from saved filename: ' + filename);
+                _recTrainingUploadResult = {
+                    ok: false,
+                    error: 'could not parse slug from saved filename: ' + filename,
+                };
+                return null;
             }
             const slug = m[1];
 
             const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+            const tuningArr = Array.isArray(info.tuning) ? info.tuning.slice() : null;
+            // Guess instrument from the arrangement label — covers
+            // "Bass", "Lead", "Rhythm", "Combo", etc. The user can
+            // override in the modal if the guess is wrong.
+            const arrLower = String(info.arrangement || '').toLowerCase();
+            const guessedInstrument = arrLower.includes('bass') ? 'bass' : 'guitar';
+            const persisted = _loadTrainingPrefs();
+
+            const formData = await _showTrainingConsentModal({
+                songName:     info.title || '',
+                cdlcFilename: info.filename || '',
+                tuning:       tuningArr ? tuningArr.join(', ') : '',
+                // Persisted instrument wins over the arrangement guess
+                // only if the user has actually set one before — that
+                // way a fresh user gets the helpful guess, but a known
+                // bassist isn't re-confronted with "Guitar" every time.
+                instrument:   persisted.instrument || guessedInstrument,
+                name:         persisted.name,
+                discord:      persisted.discord,
+                notes:        persisted.notes,
+            });
+            if (!formData) {
+                _recTrainingUploadResult = {
+                    ok: false,
+                    error: 'cancelled — bundle not uploaded',
+                    local_bundle: null,
+                };
+                return null;
+            }
+            // Persist the contributor-level fields for next time. Song
+            // fields are intentionally excluded — next song will repopulate
+            // them from songInfo.
+            _saveTrainingPrefs({
+                name:       formData.name,
+                discord:    formData.discord,
+                instrument: formData.instrument,
+                notes:      formData.notes,
+            });
+
+            _recTrainingUploadInFlight = true;
+            _recTrainingUploadResult = null;
+
             const manifest = {
                 // schema, created_at, and resolved audio/detect_stream
                 // refs are filled server-side. Everything below is the
                 // client's contribution.
                 plugin: { id: 'note_detect' },
                 song: {
-                    filename: info.filename || null,
-                    title:    info.title    || null,
-                    artist:   info.artist   || null,
+                    filename:    formData.cdlcFilename || info.filename || null,
+                    title:       formData.songName || info.title || null,
+                    artist:      info.artist || null,
                     arrangement: info.arrangement || null,
                     arrangement_index: (info.arrangement_index != null) ? info.arrangement_index : null,
-                    tuning:   Array.isArray(info.tuning) ? info.tuning.slice() : null,
-                    capo:     (info.capo != null) ? info.capo : null,
-                    format:   info.format || null,
-                    duration_s: (info.duration != null) ? info.duration : null,
+                    tuning:       tuningArr,                                // original machine-readable
+                    tuning_label: formData.tuning || null,                  // user-editable string
+                    instrument:   formData.instrument || guessedInstrument, // 'guitar' | 'bass'
+                    capo:         (info.capo != null) ? info.capo : null,
+                    format:       info.format || null,
+                    duration_s:   (info.duration != null) ? info.duration : null,
                 },
                 settings: {
                     detection_method:        detectionMethod,
@@ -5180,6 +5362,14 @@ function createNoteDetector(options = {}) {
                     platform:   navigator.platform || null,
                     timestamp_local: new Date().toISOString(),
                 },
+                contributor: {
+                    name:    formData.name    || null,
+                    discord: formData.discord || null,
+                    consent: true,
+                    consent_text: 'I give permission for this recording to be used for training purposes of the note detection system.',
+                    consent_at:   new Date().toISOString(),
+                },
+                notes: formData.notes || null,
             };
 
             const resp = await fetch('/api/plugins/note_detect/training-bundle', {
