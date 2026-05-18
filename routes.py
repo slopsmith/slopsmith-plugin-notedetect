@@ -75,6 +75,36 @@ _PCLOUD_CODE_RE = re.compile(r"code=([A-Za-z0-9_-]+)")
 # only, so anything matching the full string is treated as already-
 # extracted.
 _PCLOUD_BARE_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# pCloud's `uploadtolink` endpoint rejects some filenames with
+# result=2001 "Invalid file/folder name" — empirically this trips
+# on names with mixed case + underscores in certain combinations
+# (e.g. `training_Note_Detect_Benchmark_v2_20260518_102500_022_de4349.zip`
+# was rejected in testing). Sanitize to a conservative pCloud-safe
+# form before sending: lowercase, ASCII alphanumeric + single dashes
+# only, stem capped at 80 chars, extension preserved (but
+# lowercased). Applied ONLY to the name we send pCloud — the local
+# zip on disk keeps its original (readable) name so retries / forensics
+# stay easy.
+_PCLOUD_NAME_STEM_RE = re.compile(r"[^a-z0-9]+")
+_PCLOUD_NAME_DASH_COLLAPSE_RE = re.compile(r"-+")
+
+
+def _sanitize_pcloud_filename(name: str) -> str:
+    p = Path(name)
+    stem = (p.stem or "training").lower()
+    ext = (p.suffix or ".zip").lower()
+    stem = _PCLOUD_NAME_STEM_RE.sub("-", stem)
+    stem = _PCLOUD_NAME_DASH_COLLAPSE_RE.sub("-", stem).strip("-")
+    if not stem:
+        stem = "training"
+    if len(stem) > 80:
+        stem = stem[:80].rstrip("-")
+    # Defensive: extension should look like .zip / .ogg / etc. If
+    # something exotic slipped through, fall back to .bin so pCloud's
+    # validator doesn't choke on it.
+    if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext):
+        ext = ".bin"
+    return stem + ext
 # Cap on the bundle size we'll attempt to upload. WAV+JSONL+manifest for
 # a 3-minute take is ~15 MB; 64 MB lets longer takes and higher sample
 # rates through while still refusing to upload pathological blobs.
@@ -426,8 +456,14 @@ def setup(app, context):
             "wrote training bundle %s (%d bytes); uploading to pCloud",
             bundle_name, bundle_size,
         )
+        pcloud_filename = _sanitize_pcloud_filename(bundle_name)
+        if pcloud_filename != bundle_name:
+            log.info(
+                "uploading as sanitized filename %s (local: %s)",
+                pcloud_filename, bundle_name,
+            )
         try:
-            pcloud_result = await _upload_to_pcloud(bundle_path, bundle_name, pcloud_code)
+            pcloud_result = await _upload_to_pcloud(bundle_path, pcloud_filename, pcloud_code)
         except Exception as e:
             # Local bundle is retained so the user can retry. Don't 500
             # — the upload-failed-but-bundle-exists state is a valid

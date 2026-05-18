@@ -176,6 +176,12 @@ const _ndShared = (window.__ndShared = window.__ndShared || {
     modelLoading: false,
     instances: new Set(), // live detector APIs — iterated by playSong hook
     playSongRetries: 0,   // bounded-retry counter for _ndInstallPlaySongHook
+    // Most-recent filename passed to playSong(). hw.getSongInfo() doesn't
+    // expose a `filename` field (per the WS song_info contract), but
+    // playSong's first arg IS the CDLC filename — capture it in the
+    // wrapper so the training-bundle manifest can populate the CDLC
+    // File Name field that getSongInfo can't supply on its own.
+    currentFilename: null,
 });
 // Local aliases — kept for readability of the rest of the file, but
 // they're the same objects as `window.__ndShared.*`.
@@ -5462,6 +5468,10 @@ function createNoteDetector(options = {}) {
             // where no snapshot was provided.
             const info = songInfoSnapshot
                 || ((hw && hw.getSongInfo) ? hw.getSongInfo() : {});
+            // CDLC filename: hw.getSongInfo() doesn't include it, so
+            // fall back to whatever the playSong wrapper captured last
+            // (see _ndShared.currentFilename in _ndInstallPlaySongHook).
+            const cdlcFilename = info.filename || _ndShared.currentFilename || '';
             const tuningArr = Array.isArray(info.tuning) ? info.tuning.slice() : null;
             // Guess instrument from the arrangement label — covers
             // "Bass", "Lead", "Rhythm", "Combo", etc. The user can
@@ -5478,7 +5488,7 @@ function createNoteDetector(options = {}) {
             // the modal renders into its status line.
             const result = await _showTrainingConsentModal({
                 songName:     info.title || '',
-                cdlcFilename: info.filename || '',
+                cdlcFilename: cdlcFilename,
                 tuning:       tuningArr ? tuningArr.join(', ') : '',
                 // Persisted instrument wins over the arrangement guess
                 // only if the user has actually set one before — that
@@ -5508,7 +5518,7 @@ function createNoteDetector(options = {}) {
                     // the client's contribution.
                     plugin: { id: 'note_detect' },
                     song: {
-                        filename:    formData.cdlcFilename || info.filename || null,
+                        filename:    formData.cdlcFilename || cdlcFilename || null,
                         title:       formData.songName || info.title || null,
                         artist:      info.artist || null,
                         arrangement: info.arrangement || null,
@@ -6284,6 +6294,16 @@ function _ndInstallPlaySongHook() {
     // points at our wrapper. Bail rather than wrap it again.
     if (origPlaySong._ndWrapped) return;
     const wrapper = async function (...args) {
+        // Pin the CDLC filename — args[0] is the playSong filename
+        // arg; the WS song_info payload that hw.getSongInfo() returns
+        // doesn't carry this field, so this is our only reliable
+        // signal for the training-bundle manifest's CDLC File Name.
+        // Decode URI-encoded forms like 'sloppak%2Fbadramer.sloppak'.
+        if (typeof args[0] === 'string') {
+            let f = args[0];
+            try { f = decodeURIComponent(f); } catch (_) { /* leave raw */ }
+            _ndShared.currentFilename = f;
+        }
         // For each live instance: silent-disable if currently enabled
         // (stop audio + timers without popping a summary modal), then
         // reset scoring unconditionally. Enabled-only disable misses
