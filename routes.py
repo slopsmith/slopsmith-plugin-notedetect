@@ -420,9 +420,16 @@ def setup(app, context):
         # "default" — that could attach a stale live_default.jsonl from
         # an unrelated take. An empty session simply means "no JSONL".
         session_raw = body.get("session")
+        if session_raw is not None and not isinstance(session_raw, str):
+            raise HTTPException(400, "'session' must be a string or null")
         session = _sanitize_slug(session_raw, default="") if session_raw else ""
-        manifest = body.get("manifest") or {}
-        if not isinstance(manifest, dict):
+        # `is None` → default to {}; any other non-dict (a list, "", 0)
+        # is malformed input and rejected — `or {}` would have silently
+        # swallowed those falsy non-dicts past the type check.
+        manifest = body.get("manifest")
+        if manifest is None:
+            manifest = {}
+        elif not isinstance(manifest, dict):
             raise HTTPException(400, "'manifest' must be a JSON object")
         # Per-request override for the pCloud destination — the user
         # sets this on the settings page. Null/missing falls back to the
@@ -484,30 +491,36 @@ def setup(app, context):
         jsonl_path = (base / f"live_{session}.jsonl") if session else None
         has_jsonl = bool(jsonl_path) and jsonl_path.exists() and jsonl_path.is_file()
 
-        # Compose server-authoritative manifest fields. The client's
-        # manifest is preserved as-is — we only add (never overwrite) the
-        # schema tag, the created_at stamp, and the resolved file refs.
-        # The nested sections we merge into must be objects: a client
-        # sending e.g. "audio": "x" would otherwise make the `**` spread
-        # raise TypeError and 500 instead of a clean 400.
+        # Compose server-authoritative manifest fields. The nested
+        # sections we merge into must be objects: a client sending e.g.
+        # "audio": "x" would otherwise make the `**` spread raise
+        # TypeError and 500 instead of a clean 400.
         manifest = dict(manifest)
         for _sect in ("audio", "detect_stream"):
             if _sect in manifest and not isinstance(manifest[_sect], dict):
                 raise HTTPException(
                     400, f"manifest '{_sect}' must be a JSON object if present")
-        manifest.setdefault("schema", "note_detect.training_bundle.v1")
-        manifest.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        # schema / created_at identify THIS bundle format and build time
+        # — assign unconditionally so a stale/malformed client value
+        # can't mislabel the bundle.
+        manifest["schema"] = "note_detect.training_bundle.v1"
+        manifest["created_at"] = datetime.now(timezone.utc).isoformat()
         manifest["audio"] = {
             **(manifest.get("audio") or {}),
             "filename": wav_path.name,
             "bytes": wav_path.stat().st_size,
         }
+        # detect_stream must reflect what's actually in the zip — set it
+        # when a JSONL is bundled, drop any client-supplied section when
+        # one isn't (else the manifest references a missing file).
         if has_jsonl:
             manifest["detect_stream"] = {
                 **(manifest.get("detect_stream") or {}),
                 "filename": jsonl_path.name,
                 "bytes": jsonl_path.stat().st_size,
             }
+        else:
+            manifest.pop("detect_stream", None)
 
         # Ground-truth note chart supplied by the client (hw.getNotes /
         # getChords pinned at song:ended) — the training labels for the
@@ -530,6 +543,11 @@ def setup(app, context):
                 "note_count": len(notes) if isinstance(notes, list) else None,
                 "chord_count": len(chords) if isinstance(chords, list) else None,
             }
+        else:
+            # No arrangement.json in the zip — drop any client-supplied
+            # arrangement_chart so the manifest can't claim a chart the
+            # bundle doesn't contain.
+            manifest.pop("arrangement_chart", None)
 
         # Write the bundle zip. Filename mirrors the WAV's timestamp tail
         # so a take and its bundle sort adjacently in the recordings dir.
@@ -713,15 +731,13 @@ def setup(app, context):
         }
 
     async def _upload_to_pcloud(file_path: Path, filename: str, code: str) -> dict:
-        # `requests` is sync; FastAPI is async. Wrap the POST in a thread
-        # so a slow upload (15 MB over a residential up-link) doesn't
-        # stall the event loop and starve other plugins' routes.
-        try:
-            import requests  # lazy: only loaded for the upload path
-        except ImportError as e:
-            raise RuntimeError(
-                "requests is not installed; cannot upload to pCloud"
-            ) from e
+        # Stdlib-only (urllib) — the plugin must not hard-depend on a
+        # third-party HTTP client (`requests` etc.) that isn't in
+        # slopsmith's requirements. The urlopen call is sync, so wrap it
+        # in a thread: a slow upload (15 MB over a residential up-link)
+        # must not stall the event loop and starve other plugins.
+        import urllib.parse
+        import urllib.request
         import anyio
 
         def _post() -> dict:
@@ -733,20 +749,39 @@ def setup(app, context):
             # 2001 fires even for a request with no file at all, so it is
             # the missing `names`, not the file's name, that trips it).
             # The multipart file part must be field name `file`.
-            with open(file_path, "rb") as fh:
-                resp = requests.post(
-                    _PCLOUD_UPLOAD_URL,
-                    params={"code": code, "nopartial": "1", "names": filename},
-                    files={"file": (filename, fh, "application/zip")},
-                    timeout=_PCLOUD_TIMEOUT_S,
-                )
-            resp.raise_for_status()
+            query = urllib.parse.urlencode(
+                {"code": code, "nopartial": "1", "names": filename})
+            url = f"{_PCLOUD_UPLOAD_URL}?{query}"
+            file_bytes = file_path.read_bytes()
+            # Hand-built multipart/form-data body. The boundary is random
+            # so it can't collide with the zip's bytes.
+            boundary = "----slopsmithND" + secrets.token_hex(16)
+            preamble = (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; '
+                f'filename="{filename}"\r\n'
+                f"Content-Type: application/zip\r\n\r\n"
+            ).encode("utf-8")
+            epilogue = f"\r\n--{boundary}--\r\n".encode("utf-8")
+            body = preamble + file_bytes + epilogue
+            req = urllib.request.Request(
+                url,
+                data=body,
+                method="POST",
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            with urllib.request.urlopen(req, timeout=_PCLOUD_TIMEOUT_S) as resp:
+                status = resp.status
+                raw = resp.read()
             try:
-                data = resp.json()
-            except ValueError as e:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 raise RuntimeError(
-                    f"pCloud returned non-JSON response (HTTP {resp.status_code}): "
-                    f"{resp.text[:200]!r}"
+                    f"pCloud returned non-JSON response (HTTP {status}): "
+                    f"{raw[:200]!r}"
                 ) from e
             # pCloud encodes errors as a JSON 200 with `result != 0` —
             # don't rely on HTTP status alone.

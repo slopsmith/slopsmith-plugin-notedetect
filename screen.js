@@ -3697,7 +3697,11 @@ function createNoteDetector(options = {}) {
                 // leave _recArmedForTraining ambiguous.
                 if (armBtn)  { armBtn.textContent = (r.armed && !r.armedForTraining) ? 'Disarm' : 'Arm'; armBtn.disabled = r.saveInFlight || r.trainingUploadInFlight || (r.armed && r.armedForTraining); }
                 if (armTrnBtn) { armTrnBtn.textContent = (r.armed && r.armedForTraining) ? 'Disarm' : 'Arm (training)'; armTrnBtn.disabled = r.saveInFlight || r.trainingUploadInFlight || (r.armed && !r.armedForTraining); }
-                if (saveBtn) saveBtn.disabled = !hasBuffer || r.saveInFlight || r.trainingUploadInFlight;
+                // Save is disabled during a training arm — a training
+                // take auto-saves + uploads on song:ended; a manual
+                // mid-take save would only orphan _recArmedForTraining /
+                // the live stream / the parallel capture.
+                if (saveBtn) saveBtn.disabled = !hasBuffer || r.saveInFlight || r.trainingUploadInFlight || r.armedForTraining;
                 if (discBtn) discBtn.disabled = !(r.armed || hasBuffer) || r.saveInFlight || r.trainingUploadInFlight;
             }
             if (armBtn) armBtn.onclick = () => {
@@ -5969,13 +5973,15 @@ function createNoteDetector(options = {}) {
                         return _uploadTrainingBundle(data, sessionAtEnd, songInfoAtEnd, chartAtEnd, audioStatsAtEnd, cdlcFilenameAtEnd);
                     }
                 }).catch(() => { _stopParallelTrainingCapture(); }).finally(() => {
-                    // The training take is over — drop training-arm state
-                    // and the training-only live-stream subscription HERE,
-                    // on every path. A failed WAV save skips
+                    // The training take is over — drop ALL arm state
+                    // HERE, on every path. saveRecordingNow() unbinds the
+                    // song listeners in its own finally regardless of
+                    // success, so leaving _recArmed true on a failed save
+                    // would strand the UI "armed" with no song:play/ended
+                    // handlers. A failed WAV save also skips
                     // _uploadTrainingBundle entirely, so relying on its
-                    // finally would leave the instance stuck in training
-                    // mode (deferred summaries, live listeners still bound)
-                    // until some later explicit disarm.
+                    // finally would leave training mode stuck on.
+                    _recArmed = false;
                     _recArmedForTraining = false;
                     if (!tuningMode) _liveUnbindEvents();
                     // Surface the score summary that _endOfSongOnEnded
@@ -5992,6 +5998,11 @@ function createNoteDetector(options = {}) {
                 _recArmedForTraining = false;
                 _recLastSaveError = 'no audio captured before song:ended';
                 _recUnbindEvents();
+                // Also drop the training-only live-stream subscription
+                // armRecordingForTraining() force-bound — otherwise, with
+                // tuning mode off, later songs keep minting/posting live
+                // sessions for a take that no longer exists.
+                if (!tuningMode) _liveUnbindEvents();
                 _stopParallelTrainingCapture();
                 // No upload modal will open — release any deferred
                 // summary immediately.
