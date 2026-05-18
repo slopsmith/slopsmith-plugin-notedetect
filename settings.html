@@ -60,10 +60,36 @@
             <span class="text-sm text-gray-300">
                 Detection tuning (advanced)
                 <span class="block text-[11px] text-gray-500 leading-relaxed mt-1">
-                    Off by default. Turns on the developer surfaces: <strong>Reference Recording</strong> capture, <strong>Diagnostic JSON</strong> export + Reset, and the miss-category breakdown on the end-of-session summary. Pair with the headless harness (<code>plugins/note_detect/tools/harness.js</code>) for offline parameter sweeps.
+                    Off by default. Turns on the developer surfaces: <strong>Reference Recording</strong> capture, <strong>Arm (training)</strong> upload, <strong>Diagnostic JSON</strong> export + Reset, and the miss-category breakdown on the end-of-session summary. Pair with the headless harness (<code>plugins/note_detect/tools/harness.js</code>) for offline parameter sweeps.
                 </span>
             </span>
         </label>
+
+        <!-- Training upload destination. Lives in this same block as
+             the tuning toggle since the training-arm flow is gated
+             behind the same advanced switch. The default is the
+             curated dataset's pCloud public upload link; paste a
+             different pCloud share URL to point uploads at your own
+             folder. Server parses the `code=…` parameter out of
+             whatever's pasted (full share URL, API URL, or bare
+             code). The default is fetched from
+             GET /api/plugins/note_detect/config so routes.py is the
+             single source of truth. -->
+        <div class="mt-4 pt-3 border-t border-gray-800">
+            <label for="nd-upload-url" class="block text-xs text-gray-300 mb-1">Training upload destination</label>
+            <input id="nd-upload-url" type="text" spellcheck="false" autocomplete="off"
+                   class="w-full bg-dark-700 border border-gray-700 rounded px-2 py-1.5 text-xs text-gray-200 font-mono"
+                   placeholder="https://e.pcloud.com/#/puplink?code=…">
+            <p class="text-[11px] text-gray-500 mt-1 leading-relaxed">
+                pCloud public upload link for training takes. Paste a different
+                share URL (or bare upload code) to route your uploads elsewhere.
+                Leave empty to use the curated dataset default.
+            </p>
+            <button id="nd-upload-url-reset" type="button"
+                    class="mt-2 text-[10px] text-gray-500 hover:text-gray-300 underline">
+                Restore default
+            </button>
+        </div>
     </div>
 
     <div id="nd-tuning-panels" class="space-y-6 hidden">
@@ -799,6 +825,78 @@
             const nd = window.noteDetect;
             if (nd && typeof nd.setTuningMode === 'function') nd.setTuningMode(tuneCb.checked);
             render();
+        };
+    }
+
+    // Training upload destination — text input that pre-fills with
+    // either the user's previously-saved value OR the curated default
+    // URL. Persisted under 'nd_training_upload_url'. Empty string means
+    // "use the server default", which keeps the server-side code as the
+    // source of truth when the user clears the field.
+    //
+    // The default URL is fetched from GET /api/plugins/note_detect/config
+    // so routes.py is the single source of truth. The literal below is
+    // only an offline fallback for when that fetch fails — it does NOT
+    // need to be kept in sync and may be stale.
+    const _UPLOAD_URL_KEY = 'nd_training_upload_url';
+    const _UPLOAD_URL_FALLBACK = 'https://e.pcloud.com/#/puplink?code=itd7ZwmOK8S2D6XSAE1Q9cUPaF5c9WFfk';
+    let _uploadUrlDefault = _UPLOAD_URL_FALLBACK;
+    const urlInput = _q('nd-upload-url');
+    const urlReset = _q('nd-upload-url-reset');
+    if (urlInput) {
+        // Pre-fill with the saved value if any, otherwise show the
+        // current default so the user can see what gets used and
+        // edit from there.
+        let saved = '';
+        try { saved = localStorage.getItem(_UPLOAD_URL_KEY) || ''; } catch (_) {}
+        // Whether the user has a saved override at page-load time. Used
+        // by the /config fetch below so it never overwrites a saved
+        // value — not even one that happens to equal the fallback
+        // literal (which the value-equality check alone can't tell apart
+        // from "no override").
+        const hasSavedOverride = !!saved;
+        urlInput.value = saved || _uploadUrlDefault;
+        urlInput.onchange = () => {
+            try {
+                const v = urlInput.value.trim();
+                if (v && v !== _uploadUrlDefault) {
+                    localStorage.setItem(_UPLOAD_URL_KEY, v);
+                } else {
+                    // Default or empty — drop the override so the
+                    // server uses its own default. Keeps the storage
+                    // clean across plugin upgrades.
+                    localStorage.removeItem(_UPLOAD_URL_KEY);
+                }
+            } catch (_) { /* quota / privacy mode */ }
+        };
+        // Fetch the authoritative default from the server. Adopt it into
+        // the field ONLY when the user has no saved override — otherwise
+        // we'd silently redirect their configured destination (including
+        // the case where a saved override coincidentally equals the
+        // fallback literal).
+        fetch('/api/plugins/note_detect/config')
+            .then((r) => (r.ok ? r.json() : null))
+            .then((cfg) => {
+                const fromServer = cfg && cfg.pcloud_default_url;
+                if (!fromServer) return;
+                _uploadUrlDefault = fromServer;
+                // Adopt the server default into the field only when the
+                // user has no saved override AND hasn't started editing
+                // — the field must still show the fallback verbatim and
+                // not be focused, or a slow fetch would clobber input
+                // the user is typing right now.
+                if (!hasSavedOverride
+                    && urlInput.value === _UPLOAD_URL_FALLBACK
+                    && document.activeElement !== urlInput) {
+                    urlInput.value = _uploadUrlDefault;
+                }
+            })
+            .catch(() => { /* offline — keep the fallback literal */ });
+    }
+    if (urlReset && urlInput) {
+        urlReset.onclick = () => {
+            urlInput.value = _uploadUrlDefault;
+            try { localStorage.removeItem(_UPLOAD_URL_KEY); } catch (_) {}
         };
     }
 
