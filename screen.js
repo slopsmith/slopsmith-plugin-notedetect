@@ -5274,11 +5274,17 @@ function createNoteDetector(options = {}) {
     }
     // Modal that gates the upload — surfaces auto-detected song fields
     // for review/edit, captures contributor metadata, and requires an
-    // explicit consent checkbox. Resolves with a form-data object on
-    // submit, null on cancel. Single-shot: no second instance is
-    // allowed to mount concurrently (would race on document.body).
+    // explicit consent checkbox before enabling Upload. Stays open
+    // during the upload itself so the user sees an inline progress +
+    // success / failure status instead of guessing whether the bundle
+    // made it. The `doUpload(formData) → Promise<result>` callback is
+    // invoked on submit; the modal flips into "uploading" mode while
+    // the promise is pending and then shows a result panel with a
+    // Close button. Resolves with the final result (or null on cancel)
+    // once the user dismisses the modal. Single-shot: no second
+    // instance can mount concurrently.
     let _trainingModalActive = false;
-    function _showTrainingConsentModal(prefill) {
+    function _showTrainingConsentModal(prefill, doUpload) {
         if (_trainingModalActive) return Promise.resolve(null);
         _trainingModalActive = true;
         return new Promise((resolve) => {
@@ -5289,44 +5295,51 @@ function createNoteDetector(options = {}) {
             // chart-provided song info or localStorage tampering.
             modal.innerHTML = `
                 <div class="bg-dark-700 border border-gray-600 rounded-lg max-w-md w-full p-5 shadow-2xl my-4">
-                    <h3 class="text-base font-semibold text-gray-100 mb-1">Submit Training Take</h3>
-                    <p class="text-[11px] text-gray-400 mb-4 leading-snug">
+                    <h3 class="nd-tr-title text-base font-semibold text-gray-100 mb-1">Submit Training Take</h3>
+                    <p class="nd-tr-intro text-[11px] text-gray-400 mb-4 leading-snug">
                         Review the details below, then check the consent box to upload your take
                         (audio + detection events + this form) to the training dataset. All fields
                         marked optional can be left blank.
                     </p>
 
-                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Song Name</label>
-                    <input class="nd-tr-song w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+                    <div class="nd-tr-form">
+                        <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Song Name</label>
+                        <input class="nd-tr-song w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
 
-                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">CDLC File Name</label>
-                    <input class="nd-tr-cdlc w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+                        <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">CDLC File Name</label>
+                        <input class="nd-tr-cdlc w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
 
-                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Instrument</label>
-                    <select class="nd-tr-instr w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
-                        <option value="guitar">Guitar</option>
-                        <option value="bass">Bass</option>
-                    </select>
+                        <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Instrument</label>
+                        <select class="nd-tr-instr w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+                            <option value="guitar">Guitar</option>
+                            <option value="bass">Bass</option>
+                        </select>
 
-                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Tuning</label>
-                    <input class="nd-tr-tuning w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+                        <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Tuning</label>
+                        <input class="nd-tr-tuning w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
 
-                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Your Name <span class="text-gray-500 normal-case">(optional)</span></label>
-                    <input class="nd-tr-name w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+                        <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Your Name <span class="text-gray-500 normal-case">(optional)</span></label>
+                        <input class="nd-tr-name w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
 
-                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Discord Handle <span class="text-gray-500 normal-case">(optional)</span></label>
-                    <input class="nd-tr-discord w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
+                        <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Discord Handle <span class="text-gray-500 normal-case">(optional)</span></label>
+                        <input class="nd-tr-discord w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3">
 
-                    <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Extra Notes <span class="text-gray-500 normal-case">(optional)</span></label>
-                    <textarea class="nd-tr-notes w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3" rows="3"></textarea>
+                        <label class="block text-[10px] text-gray-400 uppercase tracking-wider mb-1">Extra Notes <span class="text-gray-500 normal-case">(optional)</span></label>
+                        <textarea class="nd-tr-notes w-full bg-dark-600 border border-gray-600 rounded px-2 py-1.5 text-xs text-gray-200 mb-3" rows="3"></textarea>
 
-                    <label class="flex items-start gap-2 mb-4 cursor-pointer">
-                        <input type="checkbox" class="nd-tr-consent mt-0.5">
-                        <span class="text-xs text-gray-300 leading-snug">
-                            I give permission for this recording to be used for training purposes
-                            of the note detection system.
-                        </span>
-                    </label>
+                        <label class="flex items-start gap-2 mb-4 cursor-pointer">
+                            <input type="checkbox" class="nd-tr-consent mt-0.5">
+                            <span class="text-xs text-gray-300 leading-snug">
+                                I give permission for this recording to be used for training purposes
+                                of the note detection system.
+                            </span>
+                        </label>
+                    </div>
+
+                    <!-- Status line: hidden until the user clicks Upload.
+                         Tailwind classes get swapped between info/ok/err
+                         palettes by the submit handler below. -->
+                    <div class="nd-tr-status hidden text-xs leading-snug mb-4 px-3 py-2 rounded border"></div>
 
                     <div class="flex gap-2">
                         <button class="nd-tr-cancel flex-1 px-3 py-2 bg-dark-500 hover:bg-dark-400 rounded text-xs text-gray-300">Cancel</button>
@@ -5348,18 +5361,32 @@ function createNoteDetector(options = {}) {
             $('.nd-tr-notes').value   = prefill.notes || '';
 
             const submitBtn  = $('.nd-tr-submit');
+            const cancelBtn  = $('.nd-tr-cancel');
             const consentCb  = $('.nd-tr-consent');
+            const statusEl   = $('.nd-tr-status');
+            const formEl     = $('.nd-tr-form');
             consentCb.addEventListener('change', () => { submitBtn.disabled = !consentCb.checked; });
 
-            const cleanup = (result) => {
+            let finalResult = null;
+            const cleanup = () => {
                 modal.remove();
                 _trainingModalActive = false;
-                resolve(result);
+                resolve(finalResult);
             };
-            $('.nd-tr-cancel').onclick = () => cleanup(null);
-            submitBtn.onclick = () => {
+            const setStatus = (kind, text) => {
+                statusEl.classList.remove('hidden');
+                statusEl.className = 'nd-tr-status text-xs leading-snug mb-4 px-3 py-2 rounded border ' + ({
+                    info: 'bg-blue-900/30 border-blue-700/50 text-blue-200',
+                    ok:   'bg-green-900/30 border-green-700/50 text-green-200',
+                    err:  'bg-red-900/30 border-red-700/50 text-red-200',
+                }[kind] || '');
+                statusEl.textContent = text;
+            };
+
+            cancelBtn.onclick = () => { finalResult = null; cleanup(); };
+            submitBtn.onclick = async () => {
                 if (!consentCb.checked) return; // belt-and-braces
-                cleanup({
+                const formData = {
                     songName:     $('.nd-tr-song').value.trim(),
                     cdlcFilename: $('.nd-tr-cdlc').value.trim(),
                     instrument:   $('.nd-tr-instr').value,
@@ -5368,16 +5395,49 @@ function createNoteDetector(options = {}) {
                     discord:      $('.nd-tr-discord').value.trim(),
                     notes:        $('.nd-tr-notes').value.trim(),
                     consent:      true,
-                });
+                };
+                // Lock the form, swap into uploading mode. The form stays
+                // visually present (faded) so the user can still see
+                // their entries while the network round-trip is in
+                // flight; cancelling at this point doesn't abort the
+                // upload but does dismiss the modal.
+                formEl.querySelectorAll('input, select, textarea').forEach((el) => { el.disabled = true; });
+                formEl.classList.add('opacity-50', 'pointer-events-none');
+                submitBtn.disabled = true;
+                submitBtn.textContent = 'Uploading…';
+                cancelBtn.textContent = 'Hide';
+                setStatus('info', 'Bundling the WAV, detect-stream, and manifest, then shipping to pCloud. Don’t close Slopsmith yet — this can take a few seconds on a slow uplink.');
+
+                let result = null;
+                try {
+                    result = await doUpload(formData);
+                } catch (e) {
+                    result = { ok: false, error: String(e && e.message || e) };
+                }
+                finalResult = result;
+                if (result && result.ok) {
+                    setStatus('ok', '✓ Uploaded to the training dataset: ' + (result.bundle_filename || '(file)') + '. Thanks for contributing!');
+                    submitBtn.style.display = 'none';
+                    cancelBtn.textContent = 'Close';
+                    cancelBtn.className = 'flex-1 px-3 py-2 bg-green-700 hover:bg-green-600 rounded text-xs font-semibold text-white';
+                } else {
+                    const errMsg = (result && result.error) ? result.error : 'unknown error';
+                    const retained = (result && result.local_bundle) ? '\nThe local bundle was retained at ' + result.local_bundle + ' — you can retry from there.' : '';
+                    setStatus('err', '✗ Upload failed: ' + errMsg + retained);
+                    submitBtn.style.display = 'none';
+                    cancelBtn.textContent = 'Close';
+                    cancelBtn.className = 'flex-1 px-3 py-2 bg-red-700 hover:bg-red-600 rounded text-xs font-semibold text-white';
+                }
             };
-            // Esc closes; Enter inside any text input doesn't submit
-            // (consent must be checked explicitly via the checkbox).
+            // Esc closes the modal. While uploading, Esc still works (the
+            // upload promise resolves into _recTrainingUploadResult, so
+            // the result is preserved even if the user dismisses).
             modal.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape') { e.stopPropagation(); cleanup(null); }
+                if (e.key === 'Escape') { e.stopPropagation(); cleanup(); }
             });
         });
     }
-    async function _uploadTrainingBundle(savedData, sessionId) {
+    async function _uploadTrainingBundle(savedData, sessionId, songInfoSnapshot) {
         if (_recTrainingUploadInFlight) return null;
         try {
             // Recover the slug from the server-returned filename. The
@@ -5396,7 +5456,12 @@ function createNoteDetector(options = {}) {
             }
             const slug = m[1];
 
-            const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+            // Prefer the snapshot pinned at song:ended (the caller in
+            // _recOnEnded captures it synchronously). Fall back to a
+            // fresh read for any other caller / a direct API invocation
+            // where no snapshot was provided.
+            const info = songInfoSnapshot
+                || ((hw && hw.getSongInfo) ? hw.getSongInfo() : {});
             const tuningArr = Array.isArray(info.tuning) ? info.tuning.slice() : null;
             // Guess instrument from the arrangement label — covers
             // "Bass", "Lead", "Rhythm", "Combo", etc. The user can
@@ -5405,7 +5470,13 @@ function createNoteDetector(options = {}) {
             const guessedInstrument = arrLower.includes('bass') ? 'bass' : 'guitar';
             const persisted = _loadTrainingPrefs();
 
-            const formData = await _showTrainingConsentModal({
+            // The modal stays open during the network round-trip so the
+            // user sees an inline progress + result panel. doUpload is
+            // invoked once the consent box is checked and Upload is
+            // clicked; it returns the parsed server response (or an
+            // {ok:false, error, local_bundle} object on failure) which
+            // the modal renders into its status line.
+            const result = await _showTrainingConsentModal({
                 songName:     info.title || '',
                 cdlcFilename: info.filename || '',
                 tuning:       tuningArr ? tuningArr.join(', ') : '',
@@ -5417,106 +5488,115 @@ function createNoteDetector(options = {}) {
                 name:         persisted.name,
                 discord:      persisted.discord,
                 notes:        persisted.notes,
+            }, async (formData) => {
+                // Persist the contributor-level fields for next time.
+                // Song fields are intentionally excluded — next song
+                // will repopulate them from songInfo.
+                _saveTrainingPrefs({
+                    name:       formData.name,
+                    discord:    formData.discord,
+                    instrument: formData.instrument,
+                    notes:      formData.notes,
+                });
+
+                _recTrainingUploadInFlight = true;
+                _recTrainingUploadResult = null;
+
+                const manifest = {
+                    // schema, created_at, and resolved audio/detect_stream
+                    // refs are filled server-side. Everything below is
+                    // the client's contribution.
+                    plugin: { id: 'note_detect' },
+                    song: {
+                        filename:    formData.cdlcFilename || info.filename || null,
+                        title:       formData.songName || info.title || null,
+                        artist:      info.artist || null,
+                        arrangement: info.arrangement || null,
+                        arrangement_index: (info.arrangement_index != null) ? info.arrangement_index : null,
+                        tuning:       tuningArr,                                // original machine-readable
+                        tuning_label: formData.tuning || null,                  // user-editable string
+                        instrument:   formData.instrument || guessedInstrument, // 'guitar' | 'bass'
+                        capo:         (info.capo != null) ? info.capo : null,
+                        format:       info.format || null,
+                        duration_s:   (info.duration != null) ? info.duration : null,
+                    },
+                    settings: {
+                        detection_method:        detectionMethod,
+                        av_offset_ms:            Math.round(latencyOffset * 1000),
+                        timing_tolerance_ms:     Math.round(timingTolerance * 1000),
+                        timing_hit_threshold_ms: Math.round(timingHitThreshold * 1000),
+                        pitch_tolerance_cents:   pitchTolerance,
+                    },
+                    audio: {
+                        sample_rate: _recSampleRate,
+                        channels:    1,
+                        bit_depth:   16,
+                        duration_s:  _recTotalSamples / Math.max(1, _recSampleRate),
+                        capped_at_s: _recCappedAt,
+                    },
+                    client: {
+                        user_agent: navigator.userAgent,
+                        platform:   navigator.platform || null,
+                        timestamp_local: new Date().toISOString(),
+                    },
+                    contributor: {
+                        name:    formData.name    || null,
+                        discord: formData.discord || null,
+                        consent: true,
+                        consent_text: 'I give permission for this recording to be used for training purposes of the note detection system.',
+                        consent_at:   new Date().toISOString(),
+                    },
+                    notes: formData.notes || null,
+                };
+
+                // Read the user-configurable upload URL from the
+                // settings.html field's localStorage key. Empty / missing
+                // leaves it null so the server falls back to its own
+                // hardcoded default. Mirrors the storage key + semantics
+                // in settings.html.
+                let uploadUrl = null;
+                try { uploadUrl = localStorage.getItem('nd_training_upload_url') || null; } catch (_) {}
+
+                try {
+                    const resp = await fetch('/api/plugins/note_detect/training-bundle', {
+                        method:  'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body:    JSON.stringify({
+                            slug,
+                            session: sessionId || 'default',
+                            manifest,
+                            upload_url: uploadUrl,
+                        }),
+                    });
+                    let data = null;
+                    try { data = await resp.json(); } catch (_) { /* leave null; surfaced below */ }
+                    if (!resp.ok) {
+                        const errStr = (data && (data.detail || data.error)) || resp.statusText;
+                        const out = { ok: false, error: `HTTP ${resp.status}: ${errStr}`, local_bundle: data && data.local_bundle || null };
+                        _recTrainingUploadResult = out;
+                        return out;
+                    }
+                    _recTrainingUploadResult = data;
+                    return data;
+                } catch (e) {
+                    const out = { ok: false, error: String(e && e.message || e) };
+                    _recTrainingUploadResult = out;
+                    console.warn('[note_detect] training-bundle upload failed:', e);
+                    return out;
+                }
             });
-            if (!formData) {
+            if (!result) {
+                // User cancelled before submitting — no upload attempted.
                 _recTrainingUploadResult = {
                     ok: false,
                     error: 'cancelled — bundle not uploaded',
                     local_bundle: null,
                 };
-                return null;
             }
-            // Persist the contributor-level fields for next time. Song
-            // fields are intentionally excluded — next song will repopulate
-            // them from songInfo.
-            _saveTrainingPrefs({
-                name:       formData.name,
-                discord:    formData.discord,
-                instrument: formData.instrument,
-                notes:      formData.notes,
-            });
-
-            _recTrainingUploadInFlight = true;
-            _recTrainingUploadResult = null;
-
-            const manifest = {
-                // schema, created_at, and resolved audio/detect_stream
-                // refs are filled server-side. Everything below is the
-                // client's contribution.
-                plugin: { id: 'note_detect' },
-                song: {
-                    filename:    formData.cdlcFilename || info.filename || null,
-                    title:       formData.songName || info.title || null,
-                    artist:      info.artist || null,
-                    arrangement: info.arrangement || null,
-                    arrangement_index: (info.arrangement_index != null) ? info.arrangement_index : null,
-                    tuning:       tuningArr,                                // original machine-readable
-                    tuning_label: formData.tuning || null,                  // user-editable string
-                    instrument:   formData.instrument || guessedInstrument, // 'guitar' | 'bass'
-                    capo:         (info.capo != null) ? info.capo : null,
-                    format:       info.format || null,
-                    duration_s:   (info.duration != null) ? info.duration : null,
-                },
-                settings: {
-                    detection_method:        detectionMethod,
-                    av_offset_ms:            Math.round(latencyOffset * 1000),
-                    timing_tolerance_ms:     Math.round(timingTolerance * 1000),
-                    timing_hit_threshold_ms: Math.round(timingHitThreshold * 1000),
-                    pitch_tolerance_cents:   pitchTolerance,
-                },
-                audio: {
-                    sample_rate: _recSampleRate,
-                    channels:    1,
-                    bit_depth:   16,
-                    duration_s:  _recTotalSamples / Math.max(1, _recSampleRate),
-                    capped_at_s: _recCappedAt,
-                },
-                client: {
-                    user_agent: navigator.userAgent,
-                    platform:   navigator.platform || null,
-                    timestamp_local: new Date().toISOString(),
-                },
-                contributor: {
-                    name:    formData.name    || null,
-                    discord: formData.discord || null,
-                    consent: true,
-                    consent_text: 'I give permission for this recording to be used for training purposes of the note detection system.',
-                    consent_at:   new Date().toISOString(),
-                },
-                notes: formData.notes || null,
-            };
-
-            // Read the user-configurable upload URL from the
-            // settings.html field's localStorage key. Empty / missing
-            // leaves it null so the server falls back to its own
-            // hardcoded default. Mirrors the storage key + semantics
-            // in settings.html.
-            let uploadUrl = null;
-            try { uploadUrl = localStorage.getItem('nd_training_upload_url') || null; } catch (_) {}
-
-            const resp = await fetch('/api/plugins/note_detect/training-bundle', {
-                method:  'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body:    JSON.stringify({
-                    slug,
-                    session: sessionId || 'default',
-                    manifest,
-                    upload_url: uploadUrl,
-                }),
-            });
-            let data = null;
-            try { data = await resp.json(); } catch (_) { /* leave null; surfaced below */ }
-            if (!resp.ok) {
-                throw new Error(
-                    `HTTP ${resp.status}: `
-                    + ((data && (data.detail || data.error)) || resp.statusText)
-                );
-            }
-            _recTrainingUploadResult = data;
-            return data;
+            return _recTrainingUploadResult;
         } catch (e) {
             _recTrainingUploadResult = { ok: false, error: String(e && e.message || e) };
-            console.warn('[note_detect] training-bundle upload failed:', e);
+            console.warn('[note_detect] training-bundle flow failed:', e);
             return null;
         } finally {
             _recTrainingUploadInFlight = false;
@@ -5544,13 +5624,17 @@ function createNoteDetector(options = {}) {
         _recOnEnded = () => {
             _recSongPlaying = false;
             if (_recArmed && _recChunks.length > 0) {
-                // Capture training intent + session id SYNCHRONOUSLY —
-                // _liveOnEnded (registered separately) nulls _liveSessionId
-                // on the same event, and the event-bus doesn't promise
-                // listener order, so the bundle call needs the value
-                // pinned here rather than read later in the async chain.
+                // Capture training intent + session id + songInfo
+                // SYNCHRONOUSLY. _liveOnEnded (registered separately)
+                // nulls _liveSessionId on the same event, and by the
+                // time the async save+upload chain runs the user may
+                // have navigated back to the library — at which point
+                // hw.getSongInfo() returns {} and the upload modal
+                // would show empty Song Name / CDLC filename / Tuning.
+                // Pin all of it here.
                 const shouldUpload = _recArmedForTraining;
                 const sessionAtEnd = _liveSessionId;
+                const songInfoAtEnd = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
                 // Fire-and-forget — the UI polls getRecordingState() so
                 // it'll surface the lastSavePath / lastError when it lands.
                 saveRecordingNow().then((data) => {
@@ -5559,7 +5643,7 @@ function createNoteDetector(options = {}) {
                     // already in _recChunks / on disk).
                     _stopParallelTrainingCapture();
                     if (data && shouldUpload) {
-                        return _uploadTrainingBundle(data, sessionAtEnd);
+                        return _uploadTrainingBundle(data, sessionAtEnd, songInfoAtEnd);
                     }
                 }).catch(() => { _stopParallelTrainingCapture(); });
             } else if (_recArmed) {
