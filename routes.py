@@ -195,6 +195,35 @@ def _sanitize_slug(s: str, default: str = "recording") -> str:
     return s or default
 
 
+async def _read_capped_body(request: Request, max_bytes: int) -> bytes:
+    """Read the request body, refusing it the moment it exceeds
+    ``max_bytes``.
+
+    ``request.json()`` / ``request.body()`` buffer the WHOLE body into
+    memory before any size check can run, so a cap applied afterwards
+    doesn't protect the process. This checks ``Content-Length`` up
+    front, then streams the body with a running byte count — a lying or
+    absent header can't sneak an oversized payload past the cap.
+    """
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            if int(cl) > max_bytes:
+                raise HTTPException(
+                    413, f"request body too large ({cl} bytes > {max_bytes})")
+        except ValueError:
+            pass  # unparseable header — fall through to the streamed count
+    chunks: list = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > max_bytes:
+            raise HTTPException(
+                413, f"request body too large (> {max_bytes} bytes)")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def setup(app, context):
     log = context["log"]
     # Resolve the slopsmith static tree from $STATIC_DIR (set by native
@@ -374,17 +403,9 @@ def setup(app, context):
         # arrangement is the client-pinned ground-truth note chart
         # (optional). Bundles the WAV + JSONL + arrangement.json with the
         # supplied manifest into a zip and POSTs it to pCloud.
-        # Cap the body before parsing — unlike Starlette's streaming
-        # form parser, request.json() buffers the whole body into
-        # memory, so an oversized manifest/arrangement must be refused
-        # up front rather than after it has already been allocated.
-        raw = await request.body()
-        if len(raw) > _TRAINING_BODY_MAX_BYTES:
-            raise HTTPException(
-                413,
-                f"request body too large ({len(raw)} bytes > "
-                f"{_TRAINING_BODY_MAX_BYTES})",
-            )
+        # Cap the body as it streams in — refused before an oversized
+        # manifest/arrangement is ever fully buffered into memory.
+        raw = await _read_capped_body(request, _TRAINING_BODY_MAX_BYTES)
         try:
             body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -466,7 +487,14 @@ def setup(app, context):
         # Compose server-authoritative manifest fields. The client's
         # manifest is preserved as-is — we only add (never overwrite) the
         # schema tag, the created_at stamp, and the resolved file refs.
+        # The nested sections we merge into must be objects: a client
+        # sending e.g. "audio": "x" would otherwise make the `**` spread
+        # raise TypeError and 500 instead of a clean 400.
         manifest = dict(manifest)
+        for _sect in ("audio", "detect_stream"):
+            if _sect in manifest and not isinstance(manifest[_sect], dict):
+                raise HTTPException(
+                    400, f"manifest '{_sect}' must be a JSON object if present")
         manifest.setdefault("schema", "note_detect.training_bundle.v1")
         manifest.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         manifest["audio"] = {
@@ -489,7 +517,11 @@ def setup(app, context):
         if arrangement is not None and not isinstance(arrangement, dict):
             raise HTTPException(400, "'arrangement' must be a JSON object or null")
         arrangement_json = None
-        if arrangement:
+        # `is not None`, not truthiness — a provided-but-empty object
+        # ({}) is a valid chart submission and must still be written, to
+        # match the documented contract (any arrangement object gets an
+        # arrangement.json). Only a missing/null arrangement is omitted.
+        if arrangement is not None:
             arrangement_json = json.dumps(arrangement, indent=2, sort_keys=True)
             notes = arrangement.get("notes")
             chords = arrangement.get("chords")
@@ -594,17 +626,9 @@ def setup(app, context):
         # { local_bundle, upload_url }. No re-bundling — the existing zip
         # is sent verbatim, so a retry is cheap and the user keeps the
         # exact take they recorded.
-        # Cap the body before parsing — unlike Starlette's streaming
-        # form parser, request.json() buffers the whole body into
-        # memory, so an oversized manifest/arrangement must be refused
-        # up front rather than after it has already been allocated.
-        raw = await request.body()
-        if len(raw) > _TRAINING_BODY_MAX_BYTES:
-            raise HTTPException(
-                413,
-                f"request body too large ({len(raw)} bytes > "
-                f"{_TRAINING_BODY_MAX_BYTES})",
-            )
+        # Cap the body as it streams in — refused before an oversized
+        # manifest/arrangement is ever fully buffered into memory.
+        raw = await _read_capped_body(request, _TRAINING_BODY_MAX_BYTES)
         try:
             body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:

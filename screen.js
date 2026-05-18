@@ -1419,12 +1419,15 @@ function createNoteDetector(options = {}) {
     }
     function _streamLiveJudgment(eventObj) {
         // Fire-and-forget — the network round-trip MUST NOT block the
-        // detection hot path. We don't even await the promise: any
-        // failure (server down, file capped, etc.) is silently
-        // swallowed so the in-memory diagnostic remains the source of
-        // truth and detection keeps running.
+        // detection hot path. We don't await it here: any failure
+        // (server down, file capped, etc.) is silently swallowed so the
+        // in-memory diagnostic stays the source of truth and detection
+        // keeps running. The promise IS tracked in _livePending, though,
+        // so _flushLiveJudgments() can drain it before a training bundle
+        // is zipped server-side (otherwise the last judgments / the
+        // session header could miss the JSONL).
         try {
-            fetch(
+            const p = fetch(
                 '/api/plugins/note_detect/live-judgment?session='
                     + encodeURIComponent(_liveSessionId),
                 {
@@ -1434,7 +1437,18 @@ function createNoteDetector(options = {}) {
                     keepalive: true,   // survives page nav / song-end teardown
                 },
             ).catch(() => {});
+            _livePending.add(p);
+            p.finally(() => _livePending.delete(p));
         } catch (e) { /* swallow — see comment above */ }
+    }
+
+    // In-flight /live-judgment POSTs. Drained by _flushLiveJudgments()
+    // before a training bundle is requested.
+    const _livePending = new Set();
+    async function _flushLiveJudgments() {
+        // Snapshot: only the POSTs already issued belong to the take
+        // that just ended.
+        try { await Promise.allSettled([..._livePending]); } catch (_) {}
     }
 
     // ── Reference-recording capture (#254 follow-up) ──────────────────
@@ -4569,29 +4583,32 @@ function createNoteDetector(options = {}) {
         // showSummary() has its own `total < 5` guard, so a song that
         // ended before the user played anything meaningful is silently
         // skipped. When a training take is armed, _recOnEnded opens the
-        // consent modal on this same event — defer the summary so the
-        // modals don't stack (disable() doesn't clear hits/misses, so a
-        // later showSummary() still has the stats).
-        if (_recArmedForTraining) {
-            _summaryDeferred = true;
-        } else {
-            try { showSummary(); } catch (e) {
-                console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
-            }
+        // consent modal on this same event — so BUILD the summary now
+        // (capturing this song's stats into the overlay DOM) but start
+        // it hidden, and reveal it once the consent flow closes. Build-
+        // now matters: a new song's playSong hook resets hits/misses, so
+        // a deferred *re-render* would describe the wrong song.
+        try {
+            const built = showSummary(_recArmedForTraining ? { startHidden: true } : undefined);
+            // Only mark deferred when an overlay was actually built and
+            // hidden — a <5-judgment take builds nothing, so there'd be
+            // nothing for _runDeferredSummary() to reveal.
+            if (_recArmedForTraining && built) _summaryDeferred = true;
+        } catch (e) {
+            console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
         }
         try { disable({ silent: true }); } catch (e) {}
     }
 
-    // Show a summary that was deferred because a training consent modal
-    // was occupying the screen. Idempotent — clears the flag so it runs
-    // at most once per deferral.
+    // Reveal a summary overlay that was built hidden because a training
+    // consent modal was occupying the screen. Idempotent — clears the
+    // flag so it runs at most once per deferral.
     function _runDeferredSummary() {
         if (!_summaryDeferred) return;
         _summaryDeferred = false;
         if (!isDefault) return;
-        try { showSummary(); } catch (e) {
-            console.warn('[note_detect] deferred end-of-song summary failed:', e && e.message ? e.message : e);
-        }
+        const overlay = instanceRoot.querySelector('.nd-summary-overlay');
+        if (overlay) overlay.style.display = '';
     }
 
     function _endOfSongBindEvents() {
@@ -5098,65 +5115,77 @@ function createNoteDetector(options = {}) {
             try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
             return;
         }
-        const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
-        const source = ctx.createMediaStreamSource(stream);
-        // ScriptProcessor is deprecated but matches the rest of the
-        // plugin's audio paths (AudioWorklet would need a separate
-        // worklet file shipped with the plugin). Power-of-two buffer
-        // size in {256, 512, 1024, 2048, 4096, 8192, 16384}; 4096 is a
-        // ~93ms cadence at 44.1kHz, plenty for capture (we're not doing
-        // any latency-sensitive analysis in this path — that's the
-        // engine's job).
-        const processor = ctx.createScriptProcessor(4096, 1, 1);
-        // Push to the same _recChunks as the legacy processFrame path
-        // so saveRecordingNow() doesn't need to know which capture path
-        // produced the buffer. Gating mirrors the legacy push at
-        // line 2316: only push while armed AND the song is playing,
-        // so we don't fill the buffer with silence pre-Play.
-        processor.onaudioprocess = (e) => {
-            if (!_recArmed || !_recSongPlaying) return;
-            const input = e.inputBuffer.getChannelData(0);
-            const maxSamples = Math.floor((32 * 1024 * 1024) / 4);
-            if (_recTotalSamples >= maxSamples) {
-                if (!_recCappedAt) _recCappedAt = _recTotalSamples / (ctx.sampleRate || 44100);
-                return;
+        // Build the context + graph inside a try: getUserMedia already
+        // handed us a live stream, so if any node creation throws we
+        // must stop that stream (and close a half-built context) here —
+        // _trainingCapture isn't assigned yet, so _stopParallelTraining-
+        // Capture() couldn't otherwise reach the open mic.
+        let ctx = null;
+        try {
+            ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+            const source = ctx.createMediaStreamSource(stream);
+            // ScriptProcessor is deprecated but matches the rest of the
+            // plugin's audio paths (AudioWorklet would need a separate
+            // worklet file shipped with the plugin). Power-of-two buffer
+            // size in {256, 512, 1024, 2048, 4096, 8192, 16384}; 4096 is a
+            // ~93ms cadence at 44.1kHz, plenty for capture (we're not doing
+            // any latency-sensitive analysis in this path — that's the
+            // engine's job).
+            const processor = ctx.createScriptProcessor(4096, 1, 1);
+            // Push to the same _recChunks as the legacy processFrame path
+            // so saveRecordingNow() doesn't need to know which capture path
+            // produced the buffer. Gating mirrors the legacy push at
+            // line 2316: only push while armed AND the song is playing,
+            // so we don't fill the buffer with silence pre-Play.
+            processor.onaudioprocess = (e) => {
+                if (!_recArmed || !_recSongPlaying) return;
+                const input = e.inputBuffer.getChannelData(0);
+                const maxSamples = Math.floor((32 * 1024 * 1024) / 4);
+                if (_recTotalSamples >= maxSamples) {
+                    if (!_recCappedAt) _recCappedAt = _recTotalSamples / (ctx.sampleRate || 44100);
+                    return;
+                }
+                _recSampleRate = ctx.sampleRate || _recSampleRate;
+                // slice() — the underlying buffer is reused next callback.
+                const copy = input.slice();
+                _recChunks.push(copy);
+                _recTotalSamples += copy.length;
+            };
+            // Mirror the main capture graph (see ~line 1942): channel-select
+            // + input gain ahead of the processor, so the training WAV is
+            // the SAME signal the detector judged and matches the `channel`
+            // / `input_gain` recorded in the manifest. Reading channel 0 of
+            // the raw source instead would upload the wrong channel for a
+            // right-channel-DI user and skip the user's input gain.
+            const gain = ctx.createGain();
+            gain.gain.value = inputGain;
+            let splitter = null, merger = null;
+            if (source.channelCount >= 2 && selectedChannel !== 'mono') {
+                splitter = ctx.createChannelSplitter(2);
+                merger = ctx.createChannelMerger(1);
+                const chIdx = selectedChannel === 'left' ? 0 : 1;
+                source.connect(splitter);
+                splitter.connect(merger, chIdx, 0);
+                merger.connect(gain);
+            } else {
+                source.connect(gain);
             }
-            _recSampleRate = ctx.sampleRate || _recSampleRate;
-            // slice() — the underlying buffer is reused next callback.
-            const copy = input.slice();
-            _recChunks.push(copy);
-            _recTotalSamples += copy.length;
-        };
-        // Mirror the main capture graph (see ~line 1942): channel-select
-        // + input gain ahead of the processor, so the training WAV is
-        // the SAME signal the detector judged and matches the `channel`
-        // / `input_gain` recorded in the manifest. Reading channel 0 of
-        // the raw source instead would upload the wrong channel for a
-        // right-channel-DI user and skip the user's input gain.
-        const gain = ctx.createGain();
-        gain.gain.value = inputGain;
-        let splitter = null, merger = null;
-        if (source.channelCount >= 2 && selectedChannel !== 'mono') {
-            splitter = ctx.createChannelSplitter(2);
-            merger = ctx.createChannelMerger(1);
-            const chIdx = selectedChannel === 'left' ? 0 : 1;
-            source.connect(splitter);
-            splitter.connect(merger, chIdx, 0);
-            merger.connect(gain);
-        } else {
-            source.connect(gain);
+            gain.connect(processor);
+            // A ScriptProcessor only fires its onaudioprocess callback if
+            // it's connected to the destination graph. Route through a
+            // muted GainNode so the captured audio doesn't loop back to
+            // speakers (would be a feedback hazard with the JUCE engine
+            // also driving output).
+            const mute = ctx.createGain();
+            mute.gain.value = 0;
+            processor.connect(mute);
+            mute.connect(ctx.destination);
+            _trainingCapture = { stream, ctx, source, splitter, merger, gain, processor, mute };
+        } catch (e) {
+            try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+            try { if (ctx) ctx.close(); } catch (_) {}
+            throw new Error('training capture graph setup failed: ' + (e && e.message || e));
         }
-        gain.connect(processor);
-        // A ScriptProcessor only fires its onaudioprocess callback if
-        // it's connected to the destination graph. Route through a
-        // muted GainNode so the captured audio doesn't loop back to
-        // speakers (would be a feedback hazard with the JUCE engine
-        // also driving output).
-        const mute = ctx.createGain();
-        mute.gain.value = 0;
-        processor.connect(mute);
-        mute.connect(ctx.destination);
-        _trainingCapture = { stream, ctx, source, splitter, merger, gain, processor, mute };
     }
     function _stopParallelTrainingCapture() {
         if (!_trainingCapture) return;
@@ -5766,6 +5795,12 @@ function createNoteDetector(options = {}) {
                 let uploadUrl = null;
                 try { uploadUrl = localStorage.getItem('nd_training_upload_url') || null; } catch (_) {}
 
+                // Drain any in-flight /live-judgment POSTs first — the
+                // server zips whatever live_<id>.jsonl is on disk when
+                // /training-bundle runs, so unflushed judgments (or the
+                // session header) would be missing from the bundle.
+                await _flushLiveJudgments();
+
                 try {
                     const resp = await fetch('/api/plugins/note_detect/training-bundle', {
                         method:  'POST',
@@ -6064,9 +6099,12 @@ function createNoteDetector(options = {}) {
         _liveSessionId = null;
     }
 
-    function showSummary() {
+    // Returns true if a summary overlay was created, false if it bailed
+    // (fewer than 5 judgments) — callers deferring the summary use this
+    // to know whether there is actually an overlay to reveal later.
+    function showSummary(opts) {
         const total = hits + misses;
-        if (total < 5) return;
+        if (total < 5) return false;
 
         const existing = instanceRoot.querySelector('.nd-summary-overlay');
         if (existing) existing.remove();
@@ -6181,9 +6219,14 @@ function createNoteDetector(options = {}) {
         overlay.querySelector('.nd-summary-close').onclick = () => overlay.remove();
         const dlBtn = overlay.querySelector('.nd-summary-download');
         if (dlBtn) dlBtn.onclick = () => _downloadDiagnostic();
+        // startHidden: built now (so the stats are this song's) but kept
+        // out of view until _runDeferredSummary() reveals it — used when
+        // a training consent modal is taking the screen on song:ended.
+        if (opts && opts.startHidden) overlay.style.display = 'none';
         instanceRoot.appendChild(overlay);
 
         publishToJournal(accuracy);
+        return true;
     }
 
     function publishToJournal(accuracy) {
