@@ -1451,6 +1451,15 @@ function createNoteDetector(options = {}) {
     // user knows whether the bundle made it to the curated dataset.
     let _recTrainingUploadInFlight = false;
     let _recTrainingUploadResult = null; // { ok, bundle_filename, pcloud_result } | { ok:false, error, local_bundle }
+    // Parallel getUserMedia capture for training takes when the desktop
+    // bridge is active. The bridge intentionally does NOT open a JS-side
+    // audio chain (the native JUCE engine owns the device), so the
+    // existing _recChunks push site inside processFrame() never runs
+    // and the WAV would always be empty. This capture is orthogonal:
+    // its own MediaStream / AudioContext / ScriptProcessor solely to
+    // copy Float32 frames into _recChunks. Closed on disarm / discard /
+    // save-completion / destroy. Null when not in use.
+    let _trainingCapture = null;
     // slopsmith#254 — per-sustained-hit-note "still being held on-pitch"
     // grace timestamps: key -> performance.now() ms before which the
     // sustain still counts as actively held. Smooths the gap between
@@ -3656,10 +3665,17 @@ function createNoteDetector(options = {}) {
                 else if (!r.armed) armRecording();
                 renderRec();
             };
-            if (armTrnBtn) armTrnBtn.onclick = () => {
+            if (armTrnBtn) armTrnBtn.onclick = async () => {
                 const r = getRecordingState();
-                if (r.armed && r.armedForTraining) disarmRecording();
-                else if (!r.armed) armRecordingForTraining();
+                if (r.armed && r.armedForTraining) {
+                    disarmRecording();
+                } else if (!r.armed) {
+                    // armRecordingForTraining awaits getUserMedia when
+                    // the desktop bridge is active. Surface a permission /
+                    // device failure through _recLastSaveError (rendered
+                    // below) rather than as an uncaught promise rejection.
+                    try { await armRecordingForTraining(); } catch (_) { /* lastSaveError set inside */ }
+                }
                 renderRec();
             };
             if (saveBtn) saveBtn.onclick = async () => {
@@ -4845,6 +4861,7 @@ function createNoteDetector(options = {}) {
         _recChunks = [];
         _recTotalSamples = 0;
         _recTrainingUploadResult = null;
+        _stopParallelTrainingCapture();
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
         try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
@@ -5004,11 +5021,81 @@ function createNoteDetector(options = {}) {
         // destroy. Idempotent.
         _recBindEvents();
     }
-    function armRecordingForTraining() {
-        // Same capture path as armRecording, plus a flag that triggers
-        // the bundle-and-upload step on song:ended. Also force-binds the
-        // live-judgment stream regardless of tuningMode — the training
-        // bundle needs both the WAV and the JSONL.
+    async function _startParallelTrainingCapture() {
+        if (_trainingCapture) return;
+        if (!navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+            throw new Error('getUserMedia is not available in this context');
+        }
+        const constraints = { audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+        }};
+        if (selectedDeviceId) {
+            constraints.audio.deviceId = { exact: selectedDeviceId };
+        }
+        let stream;
+        try {
+            stream = await navigator.mediaDevices.getUserMedia(constraints);
+        } catch (e) {
+            throw new Error('mic permission denied or device unavailable: ' + (e && e.message || e));
+        }
+        const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+        const source = ctx.createMediaStreamSource(stream);
+        // ScriptProcessor is deprecated but matches the rest of the
+        // plugin's audio paths (AudioWorklet would need a separate
+        // worklet file shipped with the plugin). Power-of-two buffer
+        // size in {256, 512, 1024, 2048, 4096, 8192, 16384}; 4096 is a
+        // ~93ms cadence at 44.1kHz, plenty for capture (we're not doing
+        // any latency-sensitive analysis in this path — that's the
+        // engine's job).
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        // Push to the same _recChunks as the legacy processFrame path
+        // so saveRecordingNow() doesn't need to know which capture path
+        // produced the buffer. Gating mirrors the legacy push at
+        // line 2316: only push while armed AND the song is playing,
+        // so we don't fill the buffer with silence pre-Play.
+        processor.onaudioprocess = (e) => {
+            if (!_recArmed || !_recSongPlaying) return;
+            const input = e.inputBuffer.getChannelData(0);
+            const maxSamples = Math.floor((32 * 1024 * 1024) / 4);
+            if (_recTotalSamples >= maxSamples) {
+                if (!_recCappedAt) _recCappedAt = _recTotalSamples / (ctx.sampleRate || 44100);
+                return;
+            }
+            _recSampleRate = ctx.sampleRate || _recSampleRate;
+            // slice() — the underlying buffer is reused next callback.
+            const copy = input.slice();
+            _recChunks.push(copy);
+            _recTotalSamples += copy.length;
+        };
+        // A ScriptProcessor only fires its onaudioprocess callback if
+        // it's connected to the destination graph. Route through a
+        // muted GainNode so the captured audio doesn't loop back to
+        // speakers (would be a feedback hazard with the JUCE engine
+        // also driving output).
+        const mute = ctx.createGain();
+        mute.gain.value = 0;
+        source.connect(processor);
+        processor.connect(mute);
+        mute.connect(ctx.destination);
+        _trainingCapture = { stream, ctx, source, processor, mute };
+    }
+    function _stopParallelTrainingCapture() {
+        if (!_trainingCapture) return;
+        const cap = _trainingCapture;
+        _trainingCapture = null;
+        try { cap.source.disconnect(); } catch (_) {}
+        try { cap.processor.disconnect(); } catch (_) {}
+        try { cap.mute.disconnect(); } catch (_) {}
+        try { cap.stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        try { cap.ctx.close(); } catch (_) {}
+    }
+    async function armRecordingForTraining() {
+        // Same capture-buffer state reset as armRecording, plus a flag
+        // that triggers the bundle-and-upload step on song:ended. Also
+        // force-binds the live-judgment stream regardless of tuningMode
+        // (the training bundle needs both the WAV and the JSONL).
         _recArmed = true;
         _recArmedForTraining = true;
         _recChunks = [];
@@ -5018,6 +5105,29 @@ function createNoteDetector(options = {}) {
         _recTrainingUploadResult = null;
         _recBindEvents();
         _liveBindEvents();
+        // When the desktop bridge is active, the JS-side processFrame()
+        // never runs (native engine owns the device), so its
+        // _recChunks.push() at line ~2316 never fires and the WAV
+        // would always be empty. Open a parallel getUserMedia chain
+        // dedicated to capture — orthogonal to whatever the bridge is
+        // doing for detection. In non-bridge mode the legacy
+        // processFrame path is already pushing, so a parallel capture
+        // would double-push; skip it.
+        if (usingDesktopBridge) {
+            try {
+                await _startParallelTrainingCapture();
+            } catch (e) {
+                // Roll back the arm so the user isn't left thinking a
+                // take is being recorded when it isn't.
+                _recArmed = false;
+                _recArmedForTraining = false;
+                _recLastSaveError = String(e && e.message || e);
+                _recUnbindEvents();
+                if (!tuningMode) _liveUnbindEvents();
+                console.warn('[note_detect] arm-for-training getUserMedia failed:', e);
+                throw e;
+            }
+        }
     }
     function disarmRecording() {
         // Soft stop: turn capture off but keep the buffer so the user
@@ -5031,6 +5141,9 @@ function createNoteDetector(options = {}) {
         // Drop the live stream subscription too, unless tuningMode is
         // independently keeping it on. Mirrors the gate in setTuningMode.
         if (!tuningMode) _liveUnbindEvents();
+        // Release the mic. If the user disarmed mid-take the captured
+        // buffer is retained for a manual Save.
+        _stopParallelTrainingCapture();
     }
     function discardRecording() {
         _recArmed = false;
@@ -5042,6 +5155,7 @@ function createNoteDetector(options = {}) {
         _recTrainingUploadResult = null;
         _recUnbindEvents();
         if (!tuningMode) _liveUnbindEvents();
+        _stopParallelTrainingCapture();
     }
     async function saveRecordingNow() {
         if (_recSaveInFlight) return null;
@@ -5427,10 +5541,14 @@ function createNoteDetector(options = {}) {
                 // Fire-and-forget — the UI polls getRecordingState() so
                 // it'll surface the lastSavePath / lastError when it lands.
                 saveRecordingNow().then((data) => {
+                    // Save has the bytes; release the mic now even if
+                    // an upload is still pending (which uses the bytes
+                    // already in _recChunks / on disk).
+                    _stopParallelTrainingCapture();
                     if (data && shouldUpload) {
                         return _uploadTrainingBundle(data, sessionAtEnd);
                     }
-                }).catch(() => {});
+                }).catch(() => { _stopParallelTrainingCapture(); });
             } else if (_recArmed) {
                 // Armed but never captured anything (Detect was off, or
                 // song:play never fired). Disarm + release the bus
@@ -5440,6 +5558,7 @@ function createNoteDetector(options = {}) {
                 _recArmedForTraining = false;
                 _recLastSaveError = 'no audio captured before song:ended';
                 _recUnbindEvents();
+                _stopParallelTrainingCapture();
             }
         };
         try {
