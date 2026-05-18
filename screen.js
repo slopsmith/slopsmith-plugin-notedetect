@@ -1436,6 +1436,9 @@ function createNoteDetector(options = {}) {
     // endpoint; that dir is bind-mounted in the dev container so the
     // harness on the host can read it back without a copy step.
     let _recArmed = false;            // user clicked Arm; waiting for / actively recording
+    let _recArmedForTraining = false; // set alongside _recArmed when the user clicked Arm (training);
+                                      // triggers the post-save POST to /training-bundle that
+                                      // zips WAV+JSONL+manifest and uploads to pCloud
     let _recSongPlaying = false;      // tracks song:play / song:pause / song:ended
     let _recChunks = [];              // Array<Float32Array>; concatenated only on save
     let _recSampleRate = 44100;       // captured from audioCtx when the first frame lands
@@ -1444,6 +1447,10 @@ function createNoteDetector(options = {}) {
     let _recSaveInFlight = false;     // de-dupe rapid saves
     let _recCappedAt = null;          // seconds into the take where the client-side cap kicked in (null = no cap hit)
     let _recTotalSamples = 0;         // running sum of _recChunks lengths — avoids O(n²) reduce on the detection hot path
+    // Training-upload tracking — surfaced in the gear popover so the
+    // user knows whether the bundle made it to the curated dataset.
+    let _recTrainingUploadInFlight = false;
+    let _recTrainingUploadResult = null; // { ok, bundle_filename, pcloud_result } | { ok:false, error, local_bundle }
     // slopsmith#254 — per-sustained-hit-note "still being held on-pitch"
     // grace timestamps: key -> performance.now() ms before which the
     // sustain still counts as actively held. Smooths the gap between
@@ -2626,7 +2633,7 @@ function createNoteDetector(options = {}) {
         if (_diagEvents.length < _DIAG_EVENT_CAP) {
             _diagEvents.push(eventObj);
         }
-        if (tuningMode && _liveSessionId) {
+        if ((tuningMode || _recArmedForTraining) && _liveSessionId) {
             _streamLiveJudgment(eventObj);
         }
     }
@@ -3444,6 +3451,9 @@ function createNoteDetector(options = {}) {
                     <button class="nd-rec-arm flex-1 bg-accent hover:bg-accent-light disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-2 py-1.5 rounded text-xs font-semibold text-white transition">
                         Arm
                     </button>
+                    <button class="nd-rec-arm-training flex-1 bg-purple-600 hover:bg-purple-500 disabled:bg-dark-600 disabled:cursor-not-allowed disabled:text-gray-600 px-2 py-1.5 rounded text-xs font-semibold text-white transition" title="Capture this take and upload it to the curated training dataset (WAV + detect-stream + manifest, zipped, sent to pCloud)">
+                        Arm (training)
+                    </button>
                     <button class="nd-rec-save px-3 py-1.5 bg-dark-500 hover:bg-dark-400 rounded text-xs text-gray-300 transition disabled:opacity-40 disabled:cursor-not-allowed" title="Save what's captured so far">
                         Save
                     </button>
@@ -3452,6 +3462,7 @@ function createNoteDetector(options = {}) {
                     </button>
                 </div>
                 <div class="nd-rec-saved text-[10px] text-gray-500 mt-2 break-all"></div>
+                <div class="nd-rec-upload text-[10px] mt-1 break-all"></div>
             </div>
             ` : ''}
 
@@ -3576,11 +3587,13 @@ function createNoteDetector(options = {}) {
         const recBlock = panel.querySelector('.nd-rec-block');
         if (recBlock) {
             const armBtn  = recBlock.querySelector('.nd-rec-arm');
+            const armTrnBtn = recBlock.querySelector('.nd-rec-arm-training');
             const saveBtn = recBlock.querySelector('.nd-rec-save');
             const discBtn = recBlock.querySelector('.nd-rec-discard');
             const stateEl = recBlock.querySelector('.nd-rec-state');
             const infoEl  = recBlock.querySelector('.nd-rec-info');
             const savedEl = recBlock.querySelector('.nd-rec-saved');
+            const uploadEl = recBlock.querySelector('.nd-rec-upload');
             // Declared up-front (vs. `const` after setInterval below) so
             // the bail-out branch in renderRec can call clearInterval
             // even if it fires on the very first synchronous call before
@@ -3594,12 +3607,14 @@ function createNoteDetector(options = {}) {
                 if (!document.body.contains(panel)) { if (tick != null) clearInterval(tick); return; }
                 const r = getRecordingState();
                 const hasBuffer = r.samples > 0;
+                const trainTag = r.armedForTraining ? ' (training)' : '';
                 let label, info;
                 if (r.saveInFlight) { label = 'saving…'; info = 'Encoding + uploading the WAV…'; }
+                else if (r.trainingUploadInFlight) { label = 'uploading…'; info = 'Bundling WAV + detect-stream + manifest and shipping to pCloud…'; }
                 else if (r.lastError) { label = 'error'; info = 'Last attempt failed: ' + r.lastError; }
-                else if (r.armed && r.songPlaying) { label = 'recording'; info = `Capturing… ${r.durationS.toFixed(1)} s (${r.samples} samples @ ${r.sampleRate} Hz). Auto-saves on song end.`; }
-                else if (r.armed && !r.detectEnabled) { label = 'armed (Detect off)'; info = 'Armed, but Detect isn\'t on — no audio is flowing.'; }
-                else if (r.armed) { label = 'armed'; info = 'Armed. Press Play to start capturing.'; }
+                else if (r.armed && r.songPlaying) { label = 'recording' + trainTag; info = `Capturing… ${r.durationS.toFixed(1)} s (${r.samples} samples @ ${r.sampleRate} Hz). Auto-saves on song end${r.armedForTraining ? ' and uploads to the training dataset' : ''}.`; }
+                else if (r.armed && !r.detectEnabled) { label = 'armed (Detect off)' + trainTag; info = 'Armed, but Detect isn\'t on — no audio is flowing.'; }
+                else if (r.armed) { label = 'armed' + trainTag; info = 'Armed. Press Play to start capturing.'; }
                 else if (hasBuffer) { label = 'paused'; info = `${r.durationS.toFixed(1)} s captured; Save to keep it or Discard to throw it out.`; }
                 else if (r.lastSavePath) { label = 'idle'; info = 'Ready. Click Arm for the next take.'; }
                 else { label = 'idle'; info = 'Click Arm, then press Play.'; }
@@ -3615,13 +3630,36 @@ function createNoteDetector(options = {}) {
                         savedEl.textContent = '';
                     }
                 }
-                if (armBtn)  { armBtn.textContent = r.armed ? 'Disarm' : 'Arm'; armBtn.disabled = r.saveInFlight; }
-                if (saveBtn) saveBtn.disabled = !hasBuffer || r.saveInFlight;
-                if (discBtn) discBtn.disabled = !(r.armed || hasBuffer) || r.saveInFlight;
+                if (uploadEl) {
+                    const tr = r.trainingUploadResult;
+                    if (tr && tr.ok) {
+                        uploadEl.className = 'nd-rec-upload text-[10px] text-green-400 mt-1 break-all';
+                        uploadEl.innerHTML = 'Uploaded to training dataset: <code class="text-gray-300">' + (tr.bundle_filename || '(unknown)') + '</code>';
+                    } else if (tr && !tr.ok) {
+                        uploadEl.className = 'nd-rec-upload text-[10px] text-red-400 mt-1 break-all';
+                        uploadEl.textContent = 'Upload failed: ' + (tr.error || 'unknown error') + (tr.local_bundle ? ' (bundle retained at ' + tr.local_bundle + ')' : '');
+                    } else {
+                        uploadEl.textContent = '';
+                    }
+                }
+                // Disable the alternate arm path while one is active or
+                // an upload is in flight — switching modes mid-take would
+                // leave _recArmedForTraining ambiguous.
+                if (armBtn)  { armBtn.textContent = (r.armed && !r.armedForTraining) ? 'Disarm' : 'Arm'; armBtn.disabled = r.saveInFlight || r.trainingUploadInFlight || (r.armed && r.armedForTraining); }
+                if (armTrnBtn) { armTrnBtn.textContent = (r.armed && r.armedForTraining) ? 'Disarm' : 'Arm (training)'; armTrnBtn.disabled = r.saveInFlight || r.trainingUploadInFlight || (r.armed && !r.armedForTraining); }
+                if (saveBtn) saveBtn.disabled = !hasBuffer || r.saveInFlight || r.trainingUploadInFlight;
+                if (discBtn) discBtn.disabled = !(r.armed || hasBuffer) || r.saveInFlight || r.trainingUploadInFlight;
             }
             if (armBtn) armBtn.onclick = () => {
                 const r = getRecordingState();
-                if (r.armed) disarmRecording(); else armRecording();
+                if (r.armed && !r.armedForTraining) disarmRecording();
+                else if (!r.armed) armRecording();
+                renderRec();
+            };
+            if (armTrnBtn) armTrnBtn.onclick = () => {
+                const r = getRecordingState();
+                if (r.armed && r.armedForTraining) disarmRecording();
+                else if (!r.armed) armRecordingForTraining();
                 renderRec();
             };
             if (saveBtn) saveBtn.onclick = async () => {
@@ -4801,10 +4839,12 @@ function createNoteDetector(options = {}) {
         _recUnbindEvents();
         _liveUnbindEvents();
         // Discard any unsaved recording state — destroying the instance
-        // shouldn't write a half-captured WAV.
+        // shouldn't write a half-captured WAV (or fire off an upload).
         _recArmed = false;
+        _recArmedForTraining = false;
         _recChunks = [];
         _recTotalSamples = 0;
+        _recTrainingUploadResult = null;
         // Remove draw hook (may not exist on older highway versions;
         // swallow the error rather than crash on teardown).
         try { if (hw && hw.removeDrawHook) hw.removeDrawHook(drawHookFn); } catch (e) {}
@@ -4953,14 +4993,31 @@ function createNoteDetector(options = {}) {
     // audio to actually flow; armed-without-Detect is a no-op.
     function armRecording() {
         _recArmed = true;
+        _recArmedForTraining = false;
         _recChunks = [];
         _recTotalSamples = 0;
         _recLastSaveError = null;
         _recCappedAt = null;
+        _recTrainingUploadResult = null;
         // Bind song-event listeners lazily so an idle plugin instance
         // doesn't sit on the slopsmith bus. Unbind in disarm / save /
         // destroy. Idempotent.
         _recBindEvents();
+    }
+    function armRecordingForTraining() {
+        // Same capture path as armRecording, plus a flag that triggers
+        // the bundle-and-upload step on song:ended. Also force-binds the
+        // live-judgment stream regardless of tuningMode — the training
+        // bundle needs both the WAV and the JSONL.
+        _recArmed = true;
+        _recArmedForTraining = true;
+        _recChunks = [];
+        _recTotalSamples = 0;
+        _recLastSaveError = null;
+        _recCappedAt = null;
+        _recTrainingUploadResult = null;
+        _recBindEvents();
+        _liveBindEvents();
     }
     function disarmRecording() {
         // Soft stop: turn capture off but keep the buffer so the user
@@ -4969,15 +5026,22 @@ function createNoteDetector(options = {}) {
         // is what they were complaining about. Use discardRecording()
         // when you actually want to wipe.
         _recArmed = false;
+        _recArmedForTraining = false;
         _recUnbindEvents();
+        // Drop the live stream subscription too, unless tuningMode is
+        // independently keeping it on. Mirrors the gate in setTuningMode.
+        if (!tuningMode) _liveUnbindEvents();
     }
     function discardRecording() {
         _recArmed = false;
+        _recArmedForTraining = false;
         _recChunks = [];
         _recTotalSamples = 0;
         _recLastSaveError = null;
         _recCappedAt = null;
+        _recTrainingUploadResult = null;
         _recUnbindEvents();
+        if (!tuningMode) _liveUnbindEvents();
     }
     async function saveRecordingNow() {
         if (_recSaveInFlight) return null;
@@ -5038,6 +5102,7 @@ function createNoteDetector(options = {}) {
         const samples = _recTotalSamples;
         return {
             armed:        _recArmed,
+            armedForTraining: _recArmedForTraining,
             songPlaying:  _recSongPlaying,
             chunks:       _recChunks.length,
             samples,
@@ -5053,7 +5118,97 @@ function createNoteDetector(options = {}) {
             // Recording requires the audio pipeline to be live — surface
             // it here so the UI can prompt the user to enable Detect.
             detectEnabled: enabled,
+            // Training-bundle upload status. inFlight while the bundle
+            // POST is round-tripping; result is the last server response
+            // ({ok:true, bundle_filename, pcloud_result, ...} or
+            // {ok:false, error, local_bundle, ...}). Null between
+            // takes — the UI shows nothing in that state.
+            trainingUploadInFlight: _recTrainingUploadInFlight,
+            trainingUploadResult:   _recTrainingUploadResult,
         };
+    }
+    async function _uploadTrainingBundle(savedData, sessionId) {
+        if (_recTrainingUploadInFlight) return null;
+        _recTrainingUploadInFlight = true;
+        _recTrainingUploadResult = null;
+        try {
+            // Recover the slug from the server-returned filename. The
+            // /recording endpoint stamps `note_detect_<slug>_<ts>_<ms>_<suf>.wav`,
+            // so parsing once here is cheaper and more robust than
+            // mirroring saveRecordingNow's slug derivation (which depends
+            // on hw.getSongInfo() being identical at this later moment).
+            const filename = (savedData && savedData.filename) || '';
+            const m = /^note_detect_(.+?)_\d{8}_\d{6}_\d{3}_[0-9a-f]+\.wav$/.exec(filename);
+            if (!m) {
+                throw new Error('could not parse slug from saved filename: ' + filename);
+            }
+            const slug = m[1];
+
+            const info = (hw && hw.getSongInfo) ? hw.getSongInfo() : {};
+            const manifest = {
+                // schema, created_at, and resolved audio/detect_stream
+                // refs are filled server-side. Everything below is the
+                // client's contribution.
+                plugin: { id: 'note_detect' },
+                song: {
+                    filename: info.filename || null,
+                    title:    info.title    || null,
+                    artist:   info.artist   || null,
+                    arrangement: info.arrangement || null,
+                    arrangement_index: (info.arrangement_index != null) ? info.arrangement_index : null,
+                    tuning:   Array.isArray(info.tuning) ? info.tuning.slice() : null,
+                    capo:     (info.capo != null) ? info.capo : null,
+                    format:   info.format || null,
+                    duration_s: (info.duration != null) ? info.duration : null,
+                },
+                settings: {
+                    detection_method:        detectionMethod,
+                    av_offset_ms:            Math.round(latencyOffset * 1000),
+                    timing_tolerance_ms:     Math.round(timingTolerance * 1000),
+                    timing_hit_threshold_ms: Math.round(timingHitThreshold * 1000),
+                    pitch_tolerance_cents:   pitchTolerance,
+                },
+                audio: {
+                    sample_rate: _recSampleRate,
+                    channels:    1,
+                    bit_depth:   16,
+                    duration_s:  _recTotalSamples / Math.max(1, _recSampleRate),
+                    capped_at_s: _recCappedAt,
+                },
+                client: {
+                    user_agent: navigator.userAgent,
+                    platform:   navigator.platform || null,
+                    timestamp_local: new Date().toISOString(),
+                },
+            };
+
+            const resp = await fetch('/api/plugins/note_detect/training-bundle', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ slug, session: sessionId || 'default', manifest }),
+            });
+            let data = null;
+            try { data = await resp.json(); } catch (_) { /* leave null; surfaced below */ }
+            if (!resp.ok) {
+                throw new Error(
+                    `HTTP ${resp.status}: `
+                    + ((data && (data.detail || data.error)) || resp.statusText)
+                );
+            }
+            _recTrainingUploadResult = data;
+            return data;
+        } catch (e) {
+            _recTrainingUploadResult = { ok: false, error: String(e && e.message || e) };
+            console.warn('[note_detect] training-bundle upload failed:', e);
+            return null;
+        } finally {
+            _recTrainingUploadInFlight = false;
+            // One take per arm. The next training take must re-arm.
+            _recArmedForTraining = false;
+            // Drop the live stream subscription if it was only being kept
+            // alive by the training arm. Mirrors disarmRecording.
+            if (!tuningMode) _liveUnbindEvents();
+        }
     }
 
     // Wire song-play / song-end events on the slopsmith bus so an armed
@@ -5072,15 +5227,27 @@ function createNoteDetector(options = {}) {
         _recOnEnded = () => {
             _recSongPlaying = false;
             if (_recArmed && _recChunks.length > 0) {
+                // Capture training intent + session id SYNCHRONOUSLY —
+                // _liveOnEnded (registered separately) nulls _liveSessionId
+                // on the same event, and the event-bus doesn't promise
+                // listener order, so the bundle call needs the value
+                // pinned here rather than read later in the async chain.
+                const shouldUpload = _recArmedForTraining;
+                const sessionAtEnd = _liveSessionId;
                 // Fire-and-forget — the UI polls getRecordingState() so
                 // it'll surface the lastSavePath / lastError when it lands.
-                saveRecordingNow().catch(() => {});
+                saveRecordingNow().then((data) => {
+                    if (data && shouldUpload) {
+                        return _uploadTrainingBundle(data, sessionAtEnd);
+                    }
+                }).catch(() => {});
             } else if (_recArmed) {
                 // Armed but never captured anything (Detect was off, or
                 // song:play never fired). Disarm + release the bus
                 // listeners so the next song doesn't start an unintended
                 // recording and we don't keep flipping _recSongPlaying.
                 _recArmed = false;
+                _recArmedForTraining = false;
                 _recLastSaveError = 'no audio captured before song:ended';
                 _recUnbindEvents();
             }
@@ -5486,6 +5653,7 @@ function createNoteDetector(options = {}) {
         // without any copy step. See `getRecordingState()` for status
         // / lastSavePath / lastError fields the UI polls.
         armRecording,
+        armRecordingForTraining,
         disarmRecording,
         discardRecording,
         saveRecordingNow,

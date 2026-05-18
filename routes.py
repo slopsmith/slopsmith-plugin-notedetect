@@ -12,11 +12,29 @@ POST /api/plugins/note_detect/live-judgment
     Returns JSON: { ok: true, appended: <bytes> }.
     Appends one JSON line to
     ``static/note_detect_recordings/live_<session>.jsonl``. The plugin
-    streams judgments here only when tuning mode is on, so steady-state
+    streams judgments here only when tuning mode is on (or while
+    armed-for-training; see /training-bundle below), so steady-state
     play has zero overhead. Each line is a self-contained record —
     safe to tail / read partially / replay.
 
-Both endpoints write under ``<base>/note_detect_recordings/``, where
+POST /api/plugins/note_detect/training-bundle
+    Body: JSON { slug, session, manifest }.
+        slug    — locates the WAV file written by /recording (the most
+                  recent matching ``note_detect_<slug>_*.wav``).
+        session — locates the live-judgment JSONL written by
+                  /live-judgment (``live_<session>.jsonl``). Optional —
+                  bundle proceeds without it if absent.
+        manifest — JSON object recorded as-is into ``manifest.json``
+                   inside the bundle. The server adds schema, created_at,
+                   and resolved filename/bytes fields before writing.
+    Bundles the located files + manifest into
+    ``training_<slug>_<ts>.zip`` under the recordings directory, then
+    PUTs the bundle to the curated pCloud public upload link
+    (``_PCLOUD_UPLOAD_CODE`` below). On upload failure the local zip is
+    retained so the user can retry manually. Returns JSON with ``ok``
+    and either ``pcloud_result`` (success) or ``error`` (failure).
+
+All three endpoints write under ``<base>/note_detect_recordings/``, where
 ``<base>`` is the first writable directory among ``$STATIC_DIR``,
 ``$CONFIG_DIR``, and ``/app/static``. In Docker, ``$STATIC_DIR`` (or the
 ``/app/static`` bind mount) is host-reachable, so recordings land there.
@@ -32,8 +50,25 @@ import os
 import re
 import secrets
 import time
+import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import HTTPException, Request
+
+# pCloud public upload link ("puplink") for the curated note_detect
+# training set. Anyone with this code can upload to the destination
+# folder; they cannot list or read it. Hardcoded so every install routes
+# its training takes to the same dataset.
+_PCLOUD_UPLOAD_CODE = "itd7ZwmOK8S2D6XSAE1Q9cUPaF5c9WFfk"
+_PCLOUD_UPLOAD_URL = "https://eapi.pcloud.com/uploadtolink"
+# Cap on the bundle size we'll attempt to upload. WAV+JSONL+manifest for
+# a 3-minute take is ~15 MB; 64 MB lets longer takes and higher sample
+# rates through while still refusing to upload pathological blobs.
+_BUNDLE_MAX_BYTES = 64 * 1024 * 1024
+# pCloud HTTP timeout for the upload PUT. Slow links can take a while
+# for a 15 MB body; 5 minutes is generous without pinning the request
+# slot indefinitely.
+_PCLOUD_TIMEOUT_S = 300
 
 # Subdirectory under the slopsmith static tree where recordings land.
 # Bind-mounted via docker-compose (`./static:/app/static`), so the host
@@ -244,3 +279,177 @@ def setup(app, context):
                 f"could not write to live-judgment file ({path}): {e}",
             )
         return {"ok": True, "appended": len(line_bytes), "file": f"static/{_RECORDINGS_REL}/{path.name}"}
+
+    @app.post("/api/plugins/note_detect/training-bundle")
+    async def upload_training_bundle(request: Request):
+        # Body: { slug, session, manifest }. Slug locates the WAV
+        # previously written by /recording; session locates the JSONL
+        # written by /live-judgment (optional). Bundles both with the
+        # supplied manifest into a zip and PUTs it to pCloud.
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise HTTPException(400, f"body is not valid JSON: {e}")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be a JSON object")
+
+        slug = _sanitize_slug(body.get("slug", ""), default="")
+        if not slug:
+            raise HTTPException(400, "missing or empty 'slug'")
+        session = _sanitize_slug(body.get("session", "default"), default="default")
+        manifest = body.get("manifest") or {}
+        if not isinstance(manifest, dict):
+            raise HTTPException(400, "'manifest' must be a JSON object")
+
+        base = _ensure_out_dir()
+
+        # Locate the most recent WAV for this slug. /recording's filename
+        # convention is note_detect_<slug>_<ts>_<ms>_<suffix>.wav, so
+        # newest mtime wins when two takes with the same slug exist.
+        wav_candidates = sorted(
+            base.glob(f"note_detect_{slug}_*.wav"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if not wav_candidates:
+            raise HTTPException(
+                404,
+                f"no recording found for slug={slug!r} under {base} — "
+                "POST /recording first, then /training-bundle.",
+            )
+        wav_path = wav_candidates[0]
+
+        # JSONL is optional — the client may have armed for training
+        # without tuningMode on, or no judgments may have been streamed
+        # yet. Missing file is a soft-skip, not an error.
+        jsonl_path = base / f"live_{session}.jsonl"
+        has_jsonl = jsonl_path.exists() and jsonl_path.is_file()
+
+        # Compose server-authoritative manifest fields. The client's
+        # manifest is preserved as-is — we only add (never overwrite) the
+        # schema tag, the created_at stamp, and the resolved file refs.
+        manifest = dict(manifest)
+        manifest.setdefault("schema", "note_detect.training_bundle.v1")
+        manifest.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        manifest["audio"] = {
+            **(manifest.get("audio") or {}),
+            "filename": wav_path.name,
+            "bytes": wav_path.stat().st_size,
+        }
+        if has_jsonl:
+            manifest["detect_stream"] = {
+                **(manifest.get("detect_stream") or {}),
+                "filename": jsonl_path.name,
+                "bytes": jsonl_path.stat().st_size,
+            }
+
+        # Write the bundle zip. Filename mirrors the WAV's timestamp tail
+        # so a take and its bundle sort adjacently in the recordings dir.
+        bundle_name = "training_" + wav_path.stem.removeprefix("note_detect_") + ".zip"
+        bundle_path = base / bundle_name
+        tmp_path = bundle_path.with_suffix(bundle_path.suffix + ".tmp")
+        try:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(wav_path, arcname=wav_path.name)
+                if has_jsonl:
+                    zf.write(jsonl_path, arcname=jsonl_path.name)
+                zf.writestr(
+                    "manifest.json",
+                    json.dumps(manifest, indent=2, sort_keys=True),
+                )
+            tmp_path.replace(bundle_path)
+        except OSError as e:
+            if tmp_path.exists():
+                try: tmp_path.unlink()
+                except OSError: pass
+            raise HTTPException(500, f"could not write training bundle: {e}")
+
+        bundle_size = bundle_path.stat().st_size
+        if bundle_size > _BUNDLE_MAX_BYTES:
+            # Keep the zip on disk so the user can inspect / shrink it,
+            # but don't ship a multi-GB blob to pCloud.
+            raise HTTPException(
+                413,
+                f"bundle too large ({bundle_size} bytes > {_BUNDLE_MAX_BYTES}); "
+                f"retained at {bundle_path}",
+            )
+
+        rel = f"static/{_RECORDINGS_REL}/{bundle_name}"
+        log.info(
+            "wrote training bundle %s (%d bytes); uploading to pCloud",
+            bundle_name, bundle_size,
+        )
+        try:
+            pcloud_result = await _upload_to_pcloud(bundle_path, bundle_name)
+        except Exception as e:
+            # Local bundle is retained so the user can retry. Don't 500
+            # — the upload-failed-but-bundle-exists state is a valid
+            # outcome the UI surfaces differently from "no bundle".
+            log.warning(
+                "pCloud upload failed (%s); bundle retained at %s",
+                e, bundle_path,
+            )
+            return {
+                "ok": False,
+                "error": str(e),
+                "local_bundle": str(bundle_path),
+                "relative_path": rel,
+                "bundle_filename": bundle_name,
+                "bytes": bundle_size,
+            }
+
+        log.info(
+            "uploaded training bundle %s (%d bytes) to pCloud: %s",
+            bundle_name, bundle_size, pcloud_result,
+        )
+        return {
+            "ok": True,
+            "local_bundle": str(bundle_path),
+            "relative_path": rel,
+            "bundle_filename": bundle_name,
+            "bytes": bundle_size,
+            "pcloud_result": pcloud_result,
+        }
+
+    async def _upload_to_pcloud(file_path: Path, filename: str) -> dict:
+        # `requests` is sync; FastAPI is async. Wrap the PUT in a thread
+        # so a slow upload (15 MB over a residential up-link) doesn't
+        # stall the event loop and starve other plugins' routes.
+        try:
+            import requests  # lazy: only loaded for the upload path
+        except ImportError as e:
+            raise RuntimeError(
+                "requests is not installed; cannot upload to pCloud"
+            ) from e
+        import anyio
+
+        def _put() -> dict:
+            with open(file_path, "rb") as fh:
+                resp = requests.put(
+                    _PCLOUD_UPLOAD_URL,
+                    params={
+                        "code": _PCLOUD_UPLOAD_CODE,
+                        "filename": filename,
+                        "nopartial": "1",
+                    },
+                    data=fh,
+                    timeout=_PCLOUD_TIMEOUT_S,
+                )
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except ValueError as e:
+                raise RuntimeError(
+                    f"pCloud returned non-JSON response (HTTP {resp.status_code}): "
+                    f"{resp.text[:200]!r}"
+                ) from e
+            # pCloud encodes errors as a JSON 200 with `result != 0` —
+            # don't rely on HTTP status alone.
+            if data.get("result") != 0:
+                raise RuntimeError(
+                    f"pCloud rejected upload: result={data.get('result')}, "
+                    f"error={data.get('error')!r}"
+                )
+            return data
+
+        return await anyio.to_thread.run_sync(_put)
