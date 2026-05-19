@@ -2538,23 +2538,21 @@ function createNoteDetector(options = {}) {
         if (!enabled || !note || !Number.isFinite(chartTime)) return null;
         const key = noteKey(note, chartTime);
         const j = noteResults.get(key);
-        // TEMP DEBUG: log open-string lookups ONLY when j is non-null
-        // (verdict has landed), so we can see whether the highway is
-        // actually picking up the hit state post-verdict. Capped per
-        // key so each note logs at most once. Strip before merge.
-        if (j && note && note.f === 0) {
-            if (!window.__ndStateForHits) window.__ndStateForHits = new Set();
-            if (!window.__ndStateForHits.has(key)) {
-                window.__ndStateForHits.add(key);
-                const songTNow = ((hw && hw.getTime) ? hw.getTime() : 0)
+        // TEMP DEBUG: log open-string lookups (hit and miss-lookup) once
+        // per key per state-transition so we can see whether
+        // (a) the renderer ever queries this key, (b) j is present,
+        // (c) noteStateFor returns a non-null state to the highway.
+        // Strip before merge.
+        const _ndsfLog = (note && note.f === 0);
+        if (_ndsfLog && !j) {
+            if (!window.__ndSfNullLogged) window.__ndSfNullLogged = new Set();
+            if (!window.__ndSfNullLogged.has(key) && window.__ndSfNullLogged.size < 40) {
+                window.__ndSfNullLogged.add(key);
+                const _songTpre = ((hw && hw.getTime) ? hw.getTime() : 0)
                     + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
-                console.log('[nd-debug] noteStateFor HIT-FOUND',
-                    'key=', key,
-                    'j.hit=', j.hit,
-                    'j.detectedAt=', j.detectedAt,
-                    'songT=', songTNow,
-                    'noteTime=', j.noteTime,
-                    'sus=', note.sus);
+                console.log('[nd-sf] open null', 'key=', key, 's=', note.s, 'f=', note.f,
+                    'chartT=', chartTime, 'songT=', _songTpre.toFixed(3),
+                    'dt=', (_songTpre - chartTime).toFixed(3));
             }
         }
         if (!j) return null;  // not judged yet — render normally
@@ -2575,6 +2573,14 @@ function createNoteDetector(options = {}) {
             // Sustained note still inside its ring window AND currently
             // being played on-pitch → hold it at full glow.
             if (sus > 0.05 && songT < chartTime + sus + 0.05 && _sustainStillHeld(key, note)) {
+                if (_ndsfLog) {
+                    if (!window.__ndSfActiveLogged) window.__ndSfActiveLogged = new Set();
+                    if (!window.__ndSfActiveLogged.has(key) && window.__ndSfActiveLogged.size < 40) {
+                        window.__ndSfActiveLogged.add(key);
+                        console.log('[nd-sf] open active', 'key=', key, 'sus=', sus,
+                            'chartT=', chartTime, 'songT=', songT.toFixed(3));
+                    }
+                }
                 return { state: 'active', alpha: 1 };
             }
             // Brief post-strike glow that fades out over hitGlowDuration.
@@ -2592,14 +2598,67 @@ function createNoteDetector(options = {}) {
             const recT = Number.isFinite(j.recordedAt) ? j.recordedAt : -Infinity;
             const ageRef = Math.max(chartTime, detT, recT);
             const age = songT - ageRef;
-            if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
+            if (age < 0) {
+                if (_ndsfLog) {
+                    if (!window.__ndSfHitEarlyLogged) window.__ndSfHitEarlyLogged = new Set();
+                    if (!window.__ndSfHitEarlyLogged.has(key) && window.__ndSfHitEarlyLogged.size < 40) {
+                        window.__ndSfHitEarlyLogged.add(key);
+                        console.log('[nd-sf] open hit-early', 'key=', key,
+                            'chartT=', chartTime, 'detT=', detT, 'recT=', recT,
+                            'songT=', songT.toFixed(3), 'age=', age.toFixed(3));
+                    }
+                }
+                return { state: 'hit', alpha: 1 };  // struck a hair early
+            }
             const glowDur = Math.max(0.1, hitGlowDuration);
-            if (age >= glowDur) return null;
+            if (age >= glowDur) {
+                if (_ndsfLog) {
+                    if (!window.__ndSfHitExpLogged) window.__ndSfHitExpLogged = new Set();
+                    if (!window.__ndSfHitExpLogged.has(key) && window.__ndSfHitExpLogged.size < 40) {
+                        window.__ndSfHitExpLogged.add(key);
+                        console.log('[nd-sf] open hit-expired', 'key=', key,
+                            'chartT=', chartTime, 'detT=', detT, 'recT=', recT,
+                            'songT=', songT.toFixed(3), 'age=', age.toFixed(3),
+                            'glowDur=', glowDur);
+                    }
+                }
+                return null;
+            }
+            if (_ndsfLog) {
+                if (!window.__ndSfHitLogged) window.__ndSfHitLogged = new Set();
+                if (!window.__ndSfHitLogged.has(key) && window.__ndSfHitLogged.size < 40) {
+                    window.__ndSfHitLogged.add(key);
+                    console.log('[nd-sf] open HIT', 'key=', key,
+                        'chartT=', chartTime, 'detT=', detT, 'recT=', recT,
+                        'songT=', songT.toFixed(3), 'age=', age.toFixed(3),
+                        'alpha=', (1 - age / glowDur).toFixed(2));
+                }
+            }
             return { state: 'hit', alpha: 1 - age / glowDur };
         }
         // Missed (timing window expired, or matched-but-not-clean).
         const age = songT - chartTime;
-        if (age < 0 || age >= NOTE_MISS_GEM_TTL) return null;
+        if (age < 0 || age >= NOTE_MISS_GEM_TTL) {
+            if (_ndsfLog) {
+                if (!window.__ndSfMissExpLogged) window.__ndSfMissExpLogged = new Set();
+                if (!window.__ndSfMissExpLogged.has(key) && window.__ndSfMissExpLogged.size < 40) {
+                    window.__ndSfMissExpLogged.add(key);
+                    console.log('[nd-sf] open miss-expired', 'key=', key,
+                        'chartT=', chartTime, 'songT=', songT.toFixed(3),
+                        'age=', age.toFixed(3));
+                }
+            }
+            return null;
+        }
+        if (_ndsfLog) {
+            if (!window.__ndSfMissLogged) window.__ndSfMissLogged = new Set();
+            if (!window.__ndSfMissLogged.has(key) && window.__ndSfMissLogged.size < 40) {
+                window.__ndSfMissLogged.add(key);
+                console.log('[nd-sf] open MISS', 'key=', key,
+                    'chartT=', chartTime, 'songT=', songT.toFixed(3),
+                    'age=', age.toFixed(3));
+            }
+        }
         return { state: 'miss', alpha: 1 - age / NOTE_MISS_GEM_TTL };
     }
 
