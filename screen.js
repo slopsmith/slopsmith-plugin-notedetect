@@ -2512,19 +2512,23 @@ function createNoteDetector(options = {}) {
         if (!enabled || !note || !Number.isFinite(chartTime)) return null;
         const key = noteKey(note, chartTime);
         const j = noteResults.get(key);
-        // TEMP DEBUG: log noteStateFor calls for open-string notes
-        // so we can see if the highway is hitting the lookup miss
-        // (j === undefined) or finding the entry but it has hit=false.
-        // Capped at 60 to avoid spam. Strip before merge.
-        if (note && note.f === 0) {
-            if (!window.__ndStateForCount) window.__ndStateForCount = 0;
-            if (window.__ndStateForCount < 60) {
-                window.__ndStateForCount++;
-                console.log('[nd-debug] noteStateFor open',
+        // TEMP DEBUG: log open-string lookups ONLY when j is non-null
+        // (verdict has landed), so we can see whether the highway is
+        // actually picking up the hit state post-verdict. Capped per
+        // key so each note logs at most once. Strip before merge.
+        if (j && note && note.f === 0) {
+            if (!window.__ndStateForHits) window.__ndStateForHits = new Set();
+            if (!window.__ndStateForHits.has(key)) {
+                window.__ndStateForHits.add(key);
+                const songTNow = ((hw && hw.getTime) ? hw.getTime() : 0)
+                    + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
+                console.log('[nd-debug] noteStateFor HIT-FOUND',
                     'key=', key,
-                    's=', note.s,
-                    'sus=', note.sus,
-                    'j=', j ? { hit: j.hit, detectedAt: j.detectedAt, chord: j.chord } : null);
+                    'j.hit=', j.hit,
+                    'j.detectedAt=', j.detectedAt,
+                    'songT=', songTNow,
+                    'noteTime=', j.noteTime,
+                    'sus=', note.sus);
             }
         }
         if (!j) return null;  // not judged yet — render normally
