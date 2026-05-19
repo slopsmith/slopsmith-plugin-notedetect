@@ -4939,6 +4939,21 @@ function createNoteDetector(options = {}) {
                     cn, cn.t, judgedAt, expectedMidi, detectedMidiForJudgment, 1,
                     { pitchError, pitchThresholdCents: lenientPitch ? 600 : undefined }
                 );
+                // Trust the engine's verdict. _ndMakeJudgment derives
+                // `j.hit` from per-string `timingState === 'OK'` and
+                // `pitchState === 'OK'`-style checks. Those can
+                // disagree with the engine: a verdict the engine
+                // confirmed as detected (timing a few ms late, pitch
+                // a few cents off but still inside its own thresholds)
+                // gets flipped to `hit: false` here, which then
+                // (a) renders the gem red via the note-state provider
+                // and (b) bumps `misses++` via `recordJudgment`'s
+                // counter step. Override the bit explicitly so the
+                // engine's call is the source of truth. Diagnostic
+                // fields (timingState, pitchState, timingError,
+                // pitchError) keep their derived values for the
+                // harness's per-string analysis.
+                judgment.hit = true;
                 recordJudgment(key, judgment);
             } else {
                 // Engine finalized the note as a miss — its timing window
