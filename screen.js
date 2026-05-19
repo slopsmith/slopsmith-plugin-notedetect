@@ -1855,15 +1855,34 @@ function createNoteDetector(options = {}) {
                             // detectNotes / matchNotes work runs here — that
                             // is exactly the per-tick load this change moves
                             // off the renderer event loop.
+                            // Two retry paths into _ndPushChartToBridge:
+                            //   1. Verifier already active, but the live
+                            //      chart's signature diverges (mid-song
+                            //      arrangement switch, drill loop, etc.).
+                            //   2. Verifier NOT active yet — most often
+                            //      because song:loaded fired before the
+                            //      highway's WS notes/chords messages
+                            //      arrived. Keep trying every tick until
+                            //      hw has data and the push lands a
+                            //      non-empty chart.
                             if (_ndUsingEngineVerifier) {
-                                // The chart loads asynchronously after
-                                // song:loaded (and can switch mid-session);
-                                // re-push whenever the live chart diverges
-                                // from what the engine currently holds.
                                 if (_ndChartSignature() !== _ndVerifierChartSig) {
                                     await _ndPushChartToBridge();
                                     if (!enabled || gen !== sessionGen) return;
                                 }
+                            } else if (typeof bridgeDesktop.audio.setChart === 'function'
+                                       && typeof bridgeDesktop.audio.getNoteVerdicts === 'function') {
+                                // Verifier not active yet — most often
+                                // because song:loaded fired before the
+                                // highway's WS notes/chords arrived. Keep
+                                // attempting the push; _ndPushChartToBridge
+                                // returns early if hw still has no chart,
+                                // so calling per tick is cheap until it
+                                // succeeds.
+                                await _ndPushChartToBridge();
+                                if (!enabled || gen !== sessionGen) return;
+                            }
+                            if (_ndUsingEngineVerifier) {
                                 await _ndDrainEngineVerdicts();
                                 if (!enabled || gen !== sessionGen) return;
                                 _diagDetector = {
@@ -4773,6 +4792,17 @@ function createNoteDetector(options = {}) {
             for (const e of grp) chordKeyById.set(e.id, chordKey);
         }
 
+        // Defer the push if hw hasn't received the chart data yet
+        // — song:loaded fires BEFORE the highway WebSocket finishes
+        // streaming the notes/chords messages, so an onChange that
+        // races us here would otherwise stamp the verifier active
+        // with an empty chart, cache that empty signature, and never
+        // re-push (engine has no chart → no verdicts → no scoring).
+        // Leave _ndUsingEngineVerifier false; the next event /
+        // detect-interval tick will re-call us once hw is populated.
+        if (notes.length === 0) {
+            return;
+        }
         try {
             const ok = await bridgeDesktop.audio.setChart({
                 arrangement: currentArrangement,
