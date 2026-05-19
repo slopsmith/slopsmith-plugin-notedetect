@@ -4934,12 +4934,43 @@ function createNoteDetector(options = {}) {
         let hitStrings = 0;
         let detectedTime = null;   // onset-derived time from a struck string
         let bestCents = null;
+        // Per-constituent loop also writes per-string judgments into
+        // noteResults so the highway's note-state provider (slopsmith#254)
+        // can light up individual gems on hit / red-wash on miss, and the
+        // chord-frame tint can use the per-string state to decide green
+        // vs red. The legacy matchNotes path writes these alongside the
+        // chord-level entry (lines 3369, 3388, 3568); the verifier path
+        // was missing them, which made the highway look mostly red even
+        // when the chord scored as a hit because every chord constituent
+        // returned null from noteStateFor. We use noteResults.set directly
+        // (NOT recordJudgment) to match the legacy path — per-string
+        // entries are for the visual provider, not the hit/miss counters,
+        // which are bumped once at the chord level below.
         for (const id of grp.memberIds) {
             const v = verdictMap.get(id);
+            const cn = _ndVerifierChartById.get(id);
             if (v && v.detected) {
                 hitStrings++;
                 if (detectedTime === null) detectedTime = v.detectedSongTime;
                 if (bestCents === null && Number.isFinite(v.centsError)) bestCents = v.centsError;
+                if (cn) {
+                    const stringExpectedMidi = _ndMidiFromStringFret(
+                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    );
+                    const pitchError = Number.isFinite(v.centsError) ? v.centsError : null;
+                    const detMidi = Number.isFinite(pitchError)
+                        ? stringExpectedMidi + pitchError / 100
+                        : null;
+                    noteResults.set(id, makeMatchedJudgment(
+                        cn, cn.t, v.detectedSongTime, stringExpectedMidi, detMidi, 1,
+                        { pitchError }
+                    ));
+                }
+            } else if (cn) {
+                const stringExpectedMidi = _ndMidiFromStringFret(
+                    cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                );
+                noteResults.set(id, makeMissJudgment(cn, cn.t, grp.t, stringExpectedMidi));
             }
         }
         const totalStrings = grp.memberIds.length;
