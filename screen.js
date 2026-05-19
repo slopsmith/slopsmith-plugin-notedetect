@@ -4869,32 +4869,42 @@ function createNoteDetector(options = {}) {
                 // the whole chord finalizes, so the highway's note-state
                 // provider (slopsmith#254) can light up individual gems
                 // and the chord-frame can tint as soon as the first
-                // string verdict lands. _ndFinalizeChordVerdict still
-                // writes the chord-level entry once all members arrive
-                // (idempotent re-writes of per-constituents there are
-                // harmless). Before this, chord constituents had to
-                // wait until every member reported — partial-verdict
-                // chords sat without visual feedback for up to ~1 s
-                // (the stuck-chord timeout), making the highway look
-                // mostly red on fast chord runs even though scoring
-                // was correct.
+                // string verdict lands. Without this, chord constituents
+                // had to wait until every member reported — partial-
+                // verdict chords sat without visual feedback for up to
+                // ~1 s (the stuck-chord timeout), making the highway
+                // look mostly red on fast chord runs even though
+                // scoring was correct.
+                //
+                // Build the judgment with `hit: v.detected` directly —
+                // do NOT go through makeMatchedJudgment, which derives
+                // `hit` from per-string timing+pitch state checks that
+                // the chord scorer's leniency already accepted at the
+                // engine level. Re-judging here on per-string criteria
+                // produced `hit: false` for chord members the engine
+                // had counted as hits (especially on the lead string
+                // when timing or pitch were a hair off), which kept
+                // the highway provider returning 'miss' and the
+                // chord-frame staying red. noteStateFor only reads
+                // `j.hit` to choose 'hit' vs 'miss', so the lean
+                // shape below is all the provider needs.
                 if (!noteResults.has(v.id)) {
-                    const stringExpectedMidi = _ndMidiFromStringFret(
-                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
-                    );
-                    if (v.detected) {
-                        const pitchError = Number.isFinite(v.centsError) ? v.centsError : null;
-                        const detMidi = Number.isFinite(pitchError)
-                            ? stringExpectedMidi + pitchError / 100
-                            : null;
-                        noteResults.set(v.id, makeMatchedJudgment(
-                            cn, cn.t, v.detectedSongTime, stringExpectedMidi, detMidi, 1,
-                            { pitchError }
-                        ));
-                    } else {
-                        const tMiss = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
-                        noteResults.set(v.id, makeMissJudgment(cn, cn.t, tMiss, stringExpectedMidi));
-                    }
+                    noteResults.set(v.id, {
+                        chartNote: cn,
+                        note: { s: cn.s, f: cn.f },
+                        chord: false,                    // per-string entry, not chord-level
+                        hit: !!v.detected,
+                        timingState: null,
+                        timingError: null,
+                        pitchState: null,
+                        pitchError: Number.isFinite(v.centsError) ? Math.round(v.centsError) : null,
+                        detectedFreq: null,
+                        expectedFreq: null,
+                        detectedAt: v.detected && Number.isFinite(v.detectedSongTime) ? v.detectedSongTime : null,
+                        time: Number.isFinite(v.detectedSongTime) ? v.detectedSongTime : cn.t,
+                        noteTime: cn.t,
+                        confidence: v.detected ? 1 : 0,
+                    });
                 }
                 const grp = _ndVerifierChords.get(chordKey);
                 if (grp && pc.size >= grp.memberIds.length) {
@@ -4969,14 +4979,16 @@ function createNoteDetector(options = {}) {
         // noteResults so the highway's note-state provider (slopsmith#254)
         // can light up individual gems on hit / red-wash on miss, and the
         // chord-frame tint can use the per-string state to decide green
-        // vs red. The legacy matchNotes path writes these alongside the
-        // chord-level entry (lines 3369, 3388, 3568); the verifier path
-        // was missing them, which made the highway look mostly red even
-        // when the chord scored as a hit because every chord constituent
-        // returned null from noteStateFor. We use noteResults.set directly
-        // (NOT recordJudgment) to match the legacy path — per-string
-        // entries are for the visual provider, not the hit/miss counters,
-        // which are bumped once at the chord level below.
+        // vs red. The drain loop above writes these immediately on
+        // verdict arrival; we re-write here so finalize-time idempotent
+        // updates (e.g. stuck-chord timeout) carry the same data. Uses
+        // the lean { hit: v.detected } shape (NOT makeMatchedJudgment)
+        // because the engine's verifier has already done its timing /
+        // pitch checks before producing `detected: true`; running the
+        // per-string makeMatchedJudgment derivation on top would
+        // re-classify the lead-string's timing/pitch under stricter
+        // per-string thresholds and flip clean chord hits to `hit:
+        // false`, putting the highway back into red-wash mode.
         for (const id of grp.memberIds) {
             const v = verdictMap.get(id);
             const cn = _ndVerifierChartById.get(id);
@@ -4984,24 +4996,24 @@ function createNoteDetector(options = {}) {
                 hitStrings++;
                 if (detectedTime === null) detectedTime = v.detectedSongTime;
                 if (bestCents === null && Number.isFinite(v.centsError)) bestCents = v.centsError;
-                if (cn) {
-                    const stringExpectedMidi = _ndMidiFromStringFret(
-                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
-                    );
-                    const pitchError = Number.isFinite(v.centsError) ? v.centsError : null;
-                    const detMidi = Number.isFinite(pitchError)
-                        ? stringExpectedMidi + pitchError / 100
-                        : null;
-                    noteResults.set(id, makeMatchedJudgment(
-                        cn, cn.t, v.detectedSongTime, stringExpectedMidi, detMidi, 1,
-                        { pitchError }
-                    ));
-                }
-            } else if (cn) {
-                const stringExpectedMidi = _ndMidiFromStringFret(
-                    cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
-                );
-                noteResults.set(id, makeMissJudgment(cn, cn.t, grp.t, stringExpectedMidi));
+            }
+            if (cn) {
+                noteResults.set(id, {
+                    chartNote: cn,
+                    note: { s: cn.s, f: cn.f },
+                    chord: false,
+                    hit: !!(v && v.detected),
+                    timingState: null,
+                    timingError: null,
+                    pitchState: null,
+                    pitchError: (v && Number.isFinite(v.centsError)) ? Math.round(v.centsError) : null,
+                    detectedFreq: null,
+                    expectedFreq: null,
+                    detectedAt: (v && v.detected && Number.isFinite(v.detectedSongTime)) ? v.detectedSongTime : null,
+                    time: (v && Number.isFinite(v.detectedSongTime)) ? v.detectedSongTime : cn.t,
+                    noteTime: cn.t,
+                    confidence: (v && v.detected) ? 1 : 0,
+                });
             }
         }
         const totalStrings = grp.memberIds.length;
