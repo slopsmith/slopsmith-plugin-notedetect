@@ -2532,9 +2532,20 @@ function createNoteDetector(options = {}) {
             if (sus > 0.05 && songT < chartTime + sus + 0.05 && _sustainStillHeld(key, note)) {
                 return { state: 'active', alpha: 1 };
             }
-            // Otherwise: brief post-strike glow that fades out over
-            // hitGlowDuration.
-            const age = songT - chartTime;
+            // Brief post-strike glow that fades out over hitGlowDuration.
+            // Reference the LATER of the chart hit-line time and the
+            // engine's detected-at time: on the desktop bridge the
+            // verifier can take 300–500 ms to publish a verdict, by
+            // which point `songT - chartTime` has already eaten most
+            // of the 0.5 s glowDur and the gem would only flash a
+            // faint sliver if anything. Anchoring on detectedAt when
+            // it's later than chartTime gives the user the full glow
+            // window from the moment the engine actually confirms.
+            // For the legacy / fast paths detectedAt ≈ chartTime so
+            // this is a no-op.
+            const detT = Number.isFinite(j.detectedAt) ? j.detectedAt : null;
+            const ageRef = (detT !== null && detT > chartTime) ? detT : chartTime;
+            const age = songT - ageRef;
             if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
             const glowDur = Math.max(0.1, hitGlowDuration);
             if (age >= glowDur) return null;
