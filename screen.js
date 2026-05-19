@@ -4905,22 +4905,6 @@ function createNoteDetector(options = {}) {
                         noteTime: cn.t,
                         confidence: v.detected ? 1 : 0,
                     });
-                    // TEMP DEBUG: log first ~30 chord-constituent writes so
-                    // we can see whether v.detected is true and whether
-                    // the write is reaching the noteResults map. Strip
-                    // before merging the PR.
-                    if (!window.__ndChordWriteCount) window.__ndChordWriteCount = 0;
-                    if (window.__ndChordWriteCount < 30) {
-                        window.__ndChordWriteCount++;
-                        console.log('[nd-debug] chord-member verdict',
-                            'id=', v.id,
-                            'detected=', !!v.detected,
-                            'centsError=', v.centsError,
-                            'cn.t=', cn.t,
-                            'cn.s=', cn.s,
-                            'cn.f=', cn.f,
-                            'pendingCount=', pc.size);
-                    }
                 }
                 const grp = _ndVerifierChords.get(chordKey);
                 if (grp && pc.size >= grp.memberIds.length) {
