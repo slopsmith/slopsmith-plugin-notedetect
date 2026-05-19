@@ -1885,6 +1885,32 @@ function createNoteDetector(options = {}) {
                             if (_ndUsingEngineVerifier) {
                                 await _ndDrainEngineVerdicts();
                                 if (!enabled || gen !== sessionGen) return;
+                                // Also poll monophonic pitch on the
+                                // verifier path so `detectedMidi` is
+                                // current — without it _sustainStillHeld
+                                // always returns false (since detectedMidi
+                                // stays at -1), sustains never reach the
+                                // 'active' branch in noteStateFor, and
+                                // the gem just expires through its 0.5 s
+                                // hit-glow rather than glowing throughout
+                                // the held note. Pre-verifier loop branches
+                                // below already poll this; here we run it
+                                // for its side effect only (updates
+                                // detectedMidi / detectedConfidence) and
+                                // ignore the result.
+                                try {
+                                    const p = await desktop.audio.getPitchDetection();
+                                    if (!enabled || gen !== sessionGen) return;
+                                    if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
+                                        && typeof p.confidence === 'number'
+                                        && p.confidence >= detectionConfidenceMin) {
+                                        detectedMidi = p.midiNote;
+                                        detectedConfidence = p.confidence;
+                                    } else {
+                                        detectedMidi = -1;
+                                        detectedConfidence = 0;
+                                    }
+                                } catch (_) { /* leave detectedMidi as-is */ }
                                 _diagDetector = {
                                     desktop_bridge: true,
                                     ml: bridgeMlActive,
@@ -2552,18 +2578,19 @@ function createNoteDetector(options = {}) {
                 return { state: 'active', alpha: 1 };
             }
             // Brief post-strike glow that fades out over hitGlowDuration.
-            // Reference the LATER of the chart hit-line time and the
-            // engine's detected-at time: on the desktop bridge the
-            // verifier can take 300–500 ms to publish a verdict, by
-            // which point `songT - chartTime` has already eaten most
-            // of the 0.5 s glowDur and the gem would only flash a
-            // faint sliver if anything. Anchoring on detectedAt when
-            // it's later than chartTime gives the user the full glow
-            // window from the moment the engine actually confirms.
-            // For the legacy / fast paths detectedAt ≈ chartTime so
-            // this is a no-op.
-            const detT = Number.isFinite(j.detectedAt) ? j.detectedAt : null;
-            const ageRef = (detT !== null && detT > chartTime) ? detT : chartTime;
+            // Reference the LATEST of: chart hit-line time, engine's
+            // detected-at time, and renderer-clock verdict-arrival time
+            // (recordedAt). Engine verdicts on the desktop bridge can
+            // take 300 ms – 1.5 s to publish, by which point
+            // `songT - chartTime` has already eaten the entire 0.5 s
+            // glowDur and the gem would never show a glow. Anchoring
+            // on whichever timestamp is most recent gives the user a
+            // full glow window starting from when the verdict actually
+            // lands in noteResults. For the legacy / fast paths
+            // recordedAt ≈ detectedAt ≈ chartTime so this is a no-op.
+            const detT = Number.isFinite(j.detectedAt) ? j.detectedAt : -Infinity;
+            const recT = Number.isFinite(j.recordedAt) ? j.recordedAt : -Infinity;
+            const ageRef = Math.max(chartTime, detT, recT);
             const age = songT - ageRef;
             if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
             const glowDur = Math.max(0.1, hitGlowDuration);
@@ -4949,6 +4976,8 @@ function createNoteDetector(options = {}) {
                 // `j.hit` to choose 'hit' vs 'miss', so the lean
                 // shape below is all the provider needs.
                 if (!noteResults.has(v.id)) {
+                    const recordedAt = (hw && hw.getTime ? hw.getTime() : 0)
+                        + (hw && hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
                     noteResults.set(v.id, {
                         chartNote: cn,
                         note: { s: cn.s, f: cn.f },
@@ -4961,6 +4990,7 @@ function createNoteDetector(options = {}) {
                         detectedFreq: null,
                         expectedFreq: null,
                         detectedAt: v.detected && Number.isFinite(v.detectedSongTime) ? v.detectedSongTime : null,
+                        recordedAt,
                         time: Number.isFinite(v.detectedSongTime) ? v.detectedSongTime : cn.t,
                         noteTime: cn.t,
                         confidence: v.detected ? 1 : 0,
@@ -5017,21 +5047,22 @@ function createNoteDetector(options = {}) {
                     cn, cn.t, judgedAt, expectedMidi, detectedMidiForJudgment, 1,
                     { pitchError, pitchThresholdCents: lenientPitch ? 600 : undefined }
                 );
-                // Trust the engine's verdict. _ndMakeJudgment derives
-                // `j.hit` from per-string `timingState === 'OK'` and
-                // `pitchState === 'OK'`-style checks. Those can
-                // disagree with the engine: a verdict the engine
-                // confirmed as detected (timing a few ms late, pitch
-                // a few cents off but still inside its own thresholds)
-                // gets flipped to `hit: false` here, which then
-                // (a) renders the gem red via the note-state provider
-                // and (b) bumps `misses++` via `recordJudgment`'s
-                // counter step. Override the bit explicitly so the
-                // engine's call is the source of truth. Diagnostic
-                // fields (timingState, pitchState, timingError,
-                // pitchError) keep their derived values for the
-                // harness's per-string analysis.
+                // Trust the engine's verdict — see chord-constituent
+                // companion fix. `judgment.hit = true` overrides the
+                // strict per-string timing/pitch derivation that would
+                // otherwise flip an engine-confirmed hit into a miss.
                 judgment.hit = true;
+                // Renderer-clock time AT WHICH this verdict landed in
+                // noteResults. Distinct from `detectedAt` (the engine's
+                // playhead estimate of strike time) — used by
+                // noteStateFor to start the post-strike glow timer
+                // FROM the verdict's arrival, so a verdict that the
+                // engine spent ~1 s to publish still gets its full
+                // glow window visible after it lands instead of the
+                // remaining sliver of glowDur measured from the chart
+                // hit-line.
+                judgment.recordedAt = (hw && hw.getTime ? hw.getTime() : 0)
+                    + (hw && hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
                 recordJudgment(key, judgment);
             } else {
                 // Engine finalized the note as a miss — its timing window
@@ -5091,6 +5122,8 @@ function createNoteDetector(options = {}) {
                 if (bestCents === null && Number.isFinite(v.centsError)) bestCents = v.centsError;
             }
             if (cn) {
+                const recordedAt = (hw && hw.getTime ? hw.getTime() : 0)
+                    + (hw && hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
                 noteResults.set(id, {
                     chartNote: cn,
                     note: { s: cn.s, f: cn.f },
@@ -5103,6 +5136,7 @@ function createNoteDetector(options = {}) {
                     detectedFreq: null,
                     expectedFreq: null,
                     detectedAt: (v && v.detected && Number.isFinite(v.detectedSongTime)) ? v.detectedSongTime : null,
+                    recordedAt,
                     time: (v && Number.isFinite(v.detectedSongTime)) ? v.detectedSongTime : cn.t,
                     noteTime: cn.t,
                     confidence: (v && v.detected) ? 1 : 0,
