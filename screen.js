@@ -4865,6 +4865,37 @@ function createNoteDetector(options = {}) {
                 let pc = _ndPendingChords.get(chordKey);
                 if (!pc) { pc = new Map(); _ndPendingChords.set(chordKey, pc); }
                 pc.set(v.id, v);
+                // Write the per-constituent judgment immediately, BEFORE
+                // the whole chord finalizes, so the highway's note-state
+                // provider (slopsmith#254) can light up individual gems
+                // and the chord-frame can tint as soon as the first
+                // string verdict lands. _ndFinalizeChordVerdict still
+                // writes the chord-level entry once all members arrive
+                // (idempotent re-writes of per-constituents there are
+                // harmless). Before this, chord constituents had to
+                // wait until every member reported — partial-verdict
+                // chords sat without visual feedback for up to ~1 s
+                // (the stuck-chord timeout), making the highway look
+                // mostly red on fast chord runs even though scoring
+                // was correct.
+                if (!noteResults.has(v.id)) {
+                    const stringExpectedMidi = _ndMidiFromStringFret(
+                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    );
+                    if (v.detected) {
+                        const pitchError = Number.isFinite(v.centsError) ? v.centsError : null;
+                        const detMidi = Number.isFinite(pitchError)
+                            ? stringExpectedMidi + pitchError / 100
+                            : null;
+                        noteResults.set(v.id, makeMatchedJudgment(
+                            cn, cn.t, v.detectedSongTime, stringExpectedMidi, detMidi, 1,
+                            { pitchError }
+                        ));
+                    } else {
+                        const tMiss = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
+                        noteResults.set(v.id, makeMissJudgment(cn, cn.t, tMiss, stringExpectedMidi));
+                    }
+                }
                 const grp = _ndVerifierChords.get(chordKey);
                 if (grp && pc.size >= grp.memberIds.length) {
                     _ndFinalizeChordVerdict(chordKey, grp, pc);
