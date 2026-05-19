@@ -4918,6 +4918,24 @@ function createNoteDetector(options = {}) {
             const key = v.id;
             if (noteResults.has(key)) continue;
 
+            // TEMP DEBUG: log first ~40 single-note verdicts so we can
+            // see whether the engine is firing v.detected:true for open
+            // strings on the benchmark file. Filtered to f===0 (open)
+            // so the noise stays low. Strip before merging.
+            if (cn && cn.f === 0) {
+                if (!window.__ndOpenVerdictCount) window.__ndOpenVerdictCount = 0;
+                if (window.__ndOpenVerdictCount < 40) {
+                    window.__ndOpenVerdictCount++;
+                    console.log('[nd-debug] open-string verdict',
+                        'id=', v.id,
+                        's=', cn.s,
+                        'f=', cn.f,
+                        'detected=', !!v.detected,
+                        'centsError=', v.centsError,
+                        'detectedSongTime=', v.detectedSongTime);
+                }
+            }
+
             const expectedMidi = _ndMidiFromStringFret(
                 cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
             );
