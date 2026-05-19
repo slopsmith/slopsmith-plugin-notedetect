@@ -205,6 +205,21 @@ const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, h
 // headless harness's default --frame-size.
 const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size
 
+// Pitch window the DSP band-energy scorer uses to VERIFY a single note
+// (confirm the expected pitch is what is ringing, vs. a neighbouring
+// fret ~100 cents away). Deliberately decoupled from the user's
+// pitch_tolerance_cents — that setting governs the strict hit/miss
+// pitch CALL in makeMatchedJudgment, which is far tighter than what a
+// coarse FFT peak can verify. 50 cents = a quarter-tone, enough to
+// disambiguate adjacent frets without rejecting real-world intonation.
+const _ND_VERIFY_PITCH_CENTS = 50;
+
+// Minimum harmonic-to-floor ratio for the desktop engine's harmonic-comb
+// verifier (scoreChord harmonicVerify mode) to count a single note as
+// present. Tunable here — it rides through the IPC, so calibration does
+// not need a native rebuild.
+const _ND_VERIFY_HARMONIC_SNR = 3.0;
+
 // Tuning tables — standard-tuning MIDI base per (arrangement, stringCount).
 //
 // Bass ascends in perfect fourths end-to-end; guitar is fourths except
@@ -1565,6 +1580,39 @@ function createNoteDetector(options = {}) {
     // chord branch can dispatch `audio.scoreChord(ctx)` without
     // re-resolving from window on every tick. Cleared by stopAudio().
     let bridgeDesktop = null;
+    // True when the desktop engine exposes the continuous chart-verifier
+    // API (audio.setChart / audio.getNoteVerdicts) AND a chart has been
+    // pushed for the current song. When set, the desktop detect loop drains
+    // engine-finalized verdicts instead of running the per-tick matchNotes()
+    // scoreChord IPC — the engine scores the chart on its own background
+    // thread, so a starved renderer event loop no longer drops note runs.
+    // false on a downlevel addon (pre-NoteVerifier build), where the old
+    // matchNotes path stays in force unchanged.
+    let _ndUsingEngineVerifier = false;
+    // Chart-note lookup for the verifier path: noteKey -> the chart note
+    // object ({ s, f, t, sus, ho... }), so a drained verdict can be mapped
+    // back to its note for the judgment pipeline. Rebuilt on each chart push.
+    let _ndVerifierChartById = new Map();
+    // Chord grouping for the verifier path. The engine scores every chord
+    // constituent as an independent note; these maps let the drain step
+    // regroup the per-constituent verdicts into one chord judgment with
+    // N-of-M leniency (chordHitRatio), matching the legacy chord path.
+    //   _ndVerifierChords     : chordKey -> { t, memberIds[], memberNotes[], maxSus }
+    //   _ndVerifierChordKeyOf : constituent noteKey -> chordKey
+    //   _ndPendingChords      : chordKey -> Map(noteKey -> verdict) still arriving
+    let _ndVerifierChords = new Map();
+    let _ndVerifierChordKeyOf = new Map();
+    let _ndPendingChords = new Map();
+    // Signature of the chart last pushed to the engine (note/chord counts +
+    // arrangement). The chart loads asynchronously — `hw.getNotes()` is empty
+    // for a moment after `song:loaded` — so the detect loop re-pushes whenever
+    // the live signature diverges from this, covering late chart load and
+    // mid-session arrangement switches.
+    let _ndVerifierChartSig = '';
+    // Last playhead pushed to the engine, in corrected song time. Lets
+    // _ndDrainEngineVerdicts spot a backward jump (drill A-B loop wrap or a
+    // manual seek-back) and clear the dedup entries the engine is re-opening.
+    let _ndLastPushedPlayhead = 0;
     // Whether the desktop engine's polyphonic ML detector (Basic Pitch) is
     // actually active this session — queried once at bridge startup via
     // `audio.isMlNoteDetection()`. false on a downlevel addon or when the ML
@@ -1755,6 +1803,31 @@ function createNoteDetector(options = {}) {
                         processingFrame = true;
                         const gen = sessionGen;
                         try {
+                            // Engine-verifier path: the engine scores the
+                            // pushed chart on its own background thread, so
+                            // this loop just drains finalized verdicts and
+                            // feeds them through the judgment pipeline. No
+                            // detectNotes / matchNotes work runs here — that
+                            // is exactly the per-tick load this change moves
+                            // off the renderer event loop.
+                            if (_ndUsingEngineVerifier) {
+                                // The chart loads asynchronously after
+                                // song:loaded (and can switch mid-session);
+                                // re-push whenever the live chart diverges
+                                // from what the engine currently holds.
+                                if (_ndChartSignature() !== _ndVerifierChartSig) {
+                                    await _ndPushChartToBridge();
+                                    if (!enabled || gen !== sessionGen) return;
+                                }
+                                await _ndDrainEngineVerdicts();
+                                if (!enabled || gen !== sessionGen) return;
+                                _diagDetector = {
+                                    desktop_bridge: true,
+                                    ml: bridgeMlActive,
+                                    path: 'desktop-engine-verifier',
+                                };
+                                return;
+                            }
                             // Onset-event detection. detectNotes carries a
                             // per-pitch onsetSeq counter; a higher value than
                             // we last consumed means that pitch was struck
@@ -2001,6 +2074,15 @@ function createNoteDetector(options = {}) {
         // enable re-resolves window.slopsmithDesktop fresh.
         usingDesktopBridge = false;
         bridgeDesktop = null;
+        // Drop the engine-verifier state — a subsequent enable re-pushes a
+        // fresh chart via _ndPushChartToBridge(). Any chart still held by the
+        // engine is harmless: nothing drains its verdicts once the flag is off.
+        _ndUsingEngineVerifier = false;
+        _ndVerifierChartById = new Map();
+        _ndVerifierChords = new Map();
+        _ndVerifierChordKeyOf = new Map();
+        _ndPendingChords = new Map();
+        _ndLastPushedPlayhead = 0;
         bridgeMlActive = false;
         bridgeOnsetSeqSeen = new Map();
         bridgeNewOnsets = new Map();
@@ -2493,7 +2575,11 @@ function createNoteDetector(options = {}) {
             expectedFreq,
             detectedFreq,
             timingThresholdMs: (extra.chord ? chordTimingHitThreshold : timingHitThreshold) * 1000,
-            pitchThresholdCents: pitchHitThreshold,
+            // A bend / slide / harmonic note's pitch is intentionally not at
+            // the chart pitch — the caller passes a widened threshold so the
+            // hit is not gated on a moving target.
+            pitchThresholdCents: Number.isFinite(extra.pitchThresholdCents)
+                ? extra.pitchThresholdCents : pitchHitThreshold,
             hitStrings: extra.hitStrings,
             totalStrings: extra.totalStrings,
             score: extra.score,
@@ -2834,64 +2920,115 @@ function createNoteDetector(options = {}) {
             byTime.get(tk).push(cn);
         }
 
-        // ── ML bridge: onset-driven single-note matching ──────────────────
-        // Each fresh onset claims the ONE nearest unmatched single-note chart
-        // note of its pitch. Previously every same-pitch candidate checked the
-        // onset set independently, so a single onset matched 2-4 same-pitch
-        // notes at once on dense passages — recording the extras as early
-        // misses. That one-onset-to-many bug was the dominant accuracy loss.
-        if (usingDesktopBridge && bridgeOnsetPrimed && bridgeNewOnsets.size > 0) {
-            const singles = [];
-            for (const [, group] of byTime) {
-                if (group.length !== 1) continue;
-                const cn = group[0];
-                const key = noteKey(cn, cn.t);
-                if (noteResults.has(key)) continue;
-                singles.push({
-                    cn, key, claimed: false,
-                    em: _ndMidiFromStringFret(cn.s, cn.f, currentArrangement,
-                        currentStringCount, tuningOffsets, capo),
-                });
-            }
-            for (const [midi, onset] of bridgeNewOnsets) {
-                let best = null, bestDist = Infinity;
-                for (const s of singles) {
-                    if (s.claimed) continue;
-                    let ok = (s.em === midi);
-                    if (!ok && (s.cn.b || s.cn.sl)) ok = Math.abs(s.em - midi) <= 2;
-                    if (!ok && s.cn.hm) ok = (midi === s.em + 12 || midi === s.em + 19);
-                    if (!ok) continue;
-                    const dist = Math.abs(s.cn.t - t);  // nearest to the playhead
-                    if (dist < bestDist) { bestDist = dist; best = s; }
+        // ── Single notes: one batched DSP band-energy score per tick ──────
+        // A single note is a 1-string chord. Scoring each one with its own
+        // scoreChord IPC fires one round-trip per note per detect tick — on
+        // a dense lead that floods the renderer event loop and visibly
+        // stutters the highway. scoreChord already returns a per-note
+        // results[] array, so the whole pending set is verified in ONE call
+        // (one FFT). bypassMl forces the DSP spectral check over the
+        // onset-driven ML path, which silently drops fast notes. The
+        // open-domain detector still drives the live HUD readout.
+        const _ndSingleNotes = [];   // cn objects, 1:1 with the batch results
+        for (const [, group] of byTime) {
+            if (group.length !== 1) continue;
+            const cn = group[0];
+            if (noteResults.has(noteKey(cn, cn.t))) continue;
+            _ndSingleNotes.push(cn);
+        }
+        const _ndSingleResult = new Map();   // cn -> per-note band-energy result
+        if (_ndSingleNotes.length > 0) {
+            let batch = null;
+            if (usingDesktopBridge) {
+                if (bridgeDesktop && bridgeDesktop.audio
+                    && typeof bridgeDesktop.audio.scoreChord === 'function') {
+                    const ctx = {
+                        arrangement: currentArrangement,
+                        stringCount: currentStringCount,
+                        offsets: tuningOffsets.slice(0, currentStringCount),
+                        capo,
+                        // Verification window, deliberately generous. This
+                        // only confirms the chart note is the pitch ringing
+                        // (and rejects a neighbouring fret, ~100 cents away).
+                        // The strict hit/miss pitch call belongs to
+                        // makeMatchedJudgment below, from the measured
+                        // centsError. Passing the user's tight
+                        // pitch_tolerance_cents straight into the DSP scorer
+                        // made it reject ~90% of correctly-played notes — a
+                        // spectral peak is far coarser than a ±10-cent gate.
+                        pitchCheckCents: _ND_VERIFY_PITCH_CENTS,
+                        minHitRatio: chordHitRatio,   // unused — per-note results read directly
+                        bypassMl: true,               // force the DSP scorer, not the ML path
+                        harmonicVerify: true,         // harmonic-comb check, not band-energy/total
+                        harmonicSnr: _ND_VERIFY_HARMONIC_SNR,
+                        notes: _ndSingleNotes.map(cn => ({
+                            s: cn.s, f: cn.f,
+                            ho: !!cn.ho, po: !!cn.po,
+                            b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                        })),
+                    };
+                    const gen = sessionGen;
+                    try {
+                        batch = await bridgeDesktop.audio.scoreChord(ctx);
+                    } catch (e) {
+                        console.warn('[note_detect] scoreChord IPC failed:', e && e.message ? e.message : e);
+                        batch = null;
+                    }
+                    // Re-validate after the IPC await (mirrors the chord path).
+                    if (!enabled || gen !== sessionGen) return;
                 }
-                if (best) {
-                    best.claimed = true;
-                    recordJudgment(best.key, makeMatchedJudgment(
-                        best.cn, best.cn.t, t, best.em, best.em, onset.conf,
-                        { pitchError: 0 }));
+            } else if (frameBuffer) {
+                // Browser: _ndScoreChord is already a DSP band-energy check.
+                const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+                batch = _ndScoreChord(
+                    frameBuffer, sr,
+                    _ndSingleNotes, currentArrangement, currentStringCount,
+                    tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS, chordHitRatio
+                );
+            }
+            // results[] is aligned 1:1 with the notes[] array we sent.
+            if (batch && Array.isArray(batch.results)) {
+                for (let i = 0; i < _ndSingleNotes.length && i < batch.results.length; i++) {
+                    _ndSingleResult.set(_ndSingleNotes[i], batch.results[i]);
                 }
             }
         }
 
         for (const [, group] of byTime) {
             if (group.length === 1) {
-                // ML bridge single notes are matched by the onset-driven pass
-                // above; here, only the web / downlevel monophonic path.
-                if (usingDesktopBridge && bridgeOnsetPrimed) continue;
-                if (detectedMidi < 0) continue;
+                // ── Single-note path: DSP band-energy verification ──────────
+                // Per-note result comes from the single batched score above —
+                // a 1-string-chord spectral check at the expected fundamental,
+                // not an open-domain pitch estimate or an ML onset.
                 const cn = group[0];
                 const key = noteKey(cn, cn.t);
                 if (noteResults.has(key)) continue;
 
+                const r = _ndSingleResult.get(cn);
+                // Not verified on this frame (harmonic comb below the SNR
+                // threshold, or off-pitch) — leave the note for a later
+                // frame or for checkMisses() to retire.
+                if (!r || !r.hit) continue;
+
+                // Energy + pitch verified. Build the judgment at the current
+                // playhead, but COMMIT only when the timing is clean. An
+                // isHit frame can land well before the chart time when the
+                // note's string is still ringing from an earlier strike;
+                // committing then would lock in an EARLY miss. Defer until a
+                // frame lands inside the clean window — checkMisses() retires
+                // the note if none ever does.
+                const pitchError = Number.isFinite(r.centsError) ? r.centsError : null;
                 const expectedMidi = _ndMidiFromStringFret(
                     cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
-                const detectedCents = _ndNearestOctaveCents(detectedMidi, expectedMidi);
-                if (Math.abs(detectedCents) <= centsTolerance) {
-                    const judgment = makeMatchedJudgment(
-                        cn, cn.t, t, expectedMidi, detectedMidi, detectedConfidence,
-                        { pitchError: detectedCents }
-                    );
+                const detectedMidiForJudgment = Number.isFinite(pitchError)
+                    ? expectedMidi + pitchError / 100
+                    : null;
+                const judgment = makeMatchedJudgment(
+                    cn, cn.t, t, expectedMidi, detectedMidiForJudgment, detectedConfidence,
+                    { pitchError }
+                );
+                if (judgment.hit) {
                     recordJudgment(key, judgment);
                 }
             } else {
@@ -3212,6 +3349,11 @@ function createNoteDetector(options = {}) {
 
     function checkMisses() {
         if (!enabled) return;
+        // On the engine-verifier path the engine finalizes misses itself
+        // (detected:false verdicts, drained by _ndDrainEngineVerdicts), so
+        // this renderer-side retire scan is superseded. The browser path —
+        // and any desktop session on a downlevel addon — still relies on it.
+        if (_ndUsingEngineVerifier) return;
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
         const tolerance = timingTolerance;
@@ -4416,6 +4558,314 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // ── Engine-side chart verification (desktop bridge) ───────────────────
+    // Build the song's note chart from the host and push it to the desktop
+    // engine, which scores it continuously on a background thread. Replaces
+    // the renderer's per-tick scoreChord IPC loop. Called once per
+    // arrangement load (and on song:loaded / arrangement:changed). When the
+    // addon predates the NoteVerifier API the function leaves
+    // `_ndUsingEngineVerifier` false and the caller keeps the old matchNotes
+    // path. Safe to call when the bridge isn't active — it just no-ops.
+    // Cheap signature of the currently-loaded chart — raw note/chord counts
+    // plus the active arrangement. Changes exactly when the chart the engine
+    // should be scoring changes (late load, song change, arrangement switch).
+    function _ndChartSignature() {
+        if (!hw || typeof hw.getNotes !== 'function') return '';
+        const notes = hw.getNotes() || [];
+        const n = notes.length;
+        let c = 0;
+        for (const ch of (hw.getChords() || [])) c += ((ch && ch.notes) || []).length;
+        // Cheap content discriminator: first + last note onset time. Two
+        // different songs with the same note/chord counts and arrangement
+        // would otherwise hash identically, leaving a stale chart on the
+        // engine if a song:loaded handler ever misfired.
+        const firstT = n > 0 && Number.isFinite(notes[0].t) ? notes[0].t : 0;
+        const lastT = n > 0 && Number.isFinite(notes[n - 1].t) ? notes[n - 1].t : 0;
+        // timingTolerance / pitchTolerance are part of the signature so moving
+        // a tolerance slider re-pushes the chart and the engine picks the new
+        // value up live — without this the popup sliders are inert on the
+        // engine-verifier path until the next song/arrangement change.
+        return n + ':' + c + ':' + currentArrangement + ':' + currentStringCount
+            + ':' + capo + ':' + timingTolerance + ':' + pitchTolerance
+            + ':' + firstT + ':' + lastT;
+    }
+
+    async function _ndPushChartToBridge() {
+        _ndUsingEngineVerifier = false;
+        _ndVerifierChartById = new Map();
+        _ndVerifierChords = new Map();
+        _ndVerifierChordKeyOf = new Map();
+        _ndPendingChords = new Map();
+        _ndVerifierChartSig = '';
+        _ndLastPushedPlayhead = 0;
+        if (!usingDesktopBridge || !bridgeDesktop || !bridgeDesktop.audio) return;
+        if (typeof bridgeDesktop.audio.setChart !== 'function'
+            || typeof bridgeDesktop.audio.getNoteVerdicts !== 'function') {
+            // Downlevel addon — fall back to the legacy matchNotes path.
+            return;
+        }
+        if (!hw || typeof hw.getNotes !== 'function' || typeof hw.getChords !== 'function') return;
+
+        const notes = [];
+        const byId = new Map();
+        // Chord grouping, built alongside `notes` — see _ndVerifierChords.
+        const chordGroups = new Map();
+        const chordKeyById = new Map();
+        // Single notes. `mt` (muted) notes are skipped — the legacy
+        // matchNotes path skips them too (`if (n.mt) continue`).
+        const single = hw.getNotes() || [];
+        for (const n of single) {
+            if (!n || n.mt) continue;
+            const id = noteKey(n, n.t);
+            if (byId.has(id)) continue;
+            const entry = {
+                id,
+                t: n.t,
+                s: n.s,
+                f: n.f,
+                sus: Number.isFinite(n.sus) ? n.sus : 0,
+                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+            };
+            notes.push(entry);
+            byId.set(id, { ...n });
+        }
+        // Chord constituents from hw.getChords() — pushed as plain notes;
+        // chord grouping happens by timestamp below.
+        const chords = hw.getChords() || [];
+        for (const c of chords) {
+            for (const cn of (c.notes || [])) {
+                if (!cn || cn.mt) continue;
+                const id = noteKey(cn, c.t);
+                if (byId.has(id)) continue;
+                const entry = {
+                    id,
+                    t: c.t,
+                    s: cn.s,
+                    f: cn.f,
+                    sus: Number.isFinite(cn.sus) ? cn.sus : 0,
+                    ho: !!cn.ho, po: !!cn.po, b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                };
+                notes.push(entry);
+                byId.set(id, { ...cn, t: c.t });
+            }
+        }
+        // Chord grouping by shared onset time. A power chord / double-stop is
+        // 2+ notes at the same chart time — and in many arrangements (the
+        // "I'm Alive" Lead included) those arrive through hw.getNotes(), not
+        // hw.getChords(). Grouping the flattened note list by timestamp catches
+        // chords regardless of which host array delivered them.
+        const byTime = new Map();
+        for (const e of notes) {
+            const tk = e.t.toFixed(3);
+            if (!byTime.has(tk)) byTime.set(tk, []);
+            byTime.get(tk).push(e);
+        }
+        for (const [tk, grp] of byTime) {
+            if (grp.length < 2) continue;
+            const chordKey = tk + '_chord';
+            let maxSus = 0;
+            for (const e of grp) if ((e.sus || 0) > maxSus) maxSus = e.sus || 0;
+            chordGroups.set(chordKey, {
+                t: grp[0].t,
+                memberIds: grp.map(e => e.id),
+                memberNotes: grp.map(e => ({ s: e.s, f: e.f })),
+                maxSus,
+            });
+            for (const e of grp) chordKeyById.set(e.id, chordKey);
+        }
+
+        try {
+            const ok = await bridgeDesktop.audio.setChart({
+                arrangement: currentArrangement,
+                stringCount: currentStringCount,
+                tuningOffsets: tuningOffsets.slice(0, currentStringCount),
+                capo,
+                // The engine's harmonic-comb uses pitchCheckCents as its
+                // presence gate — feed the user's Pitch tolerance slider so
+                // it is honoured, rather than a fixed constant.
+                pitchCheckCents: pitchTolerance,
+                harmonicSnr: _ND_VERIFY_HARMONIC_SNR,
+                timingTolerance,
+                notes,
+            });
+            // setChart resolves null on a downlevel addon — keep the legacy
+            // path in that case.
+            if (ok === null || ok === false) return;
+            _ndVerifierChartById = byId;
+            _ndVerifierChords = chordGroups;
+            _ndVerifierChordKeyOf = chordKeyById;
+            _ndPendingChords = new Map();
+            _ndVerifierChartSig = _ndChartSignature();
+            _ndUsingEngineVerifier = true;
+            console.log(`[note_detect] engine chart verifier active — ${notes.length} notes pushed`
+                + ` (${chordGroups.size} chords)`);
+        } catch (e) {
+            console.warn('[note_detect] setChart failed, falling back to matchNotes:',
+                e && e.message ? e.message : e);
+        }
+    }
+
+    // Drain the verdicts the engine's NoteVerifier has finalized and feed
+    // each through the SAME judgment pipeline the legacy path uses, so HUD /
+    // notedetect:* events / live-judgment JSONL all fire unchanged.
+    async function _ndDrainEngineVerdicts() {
+        if (!_ndUsingEngineVerifier || !bridgeDesktop || !bridgeDesktop.audio) return;
+
+        // The engine scores against a playhead the renderer pushes: its own
+        // JUCE backing transport is frozen for HTML5-routed (sloppak) songs.
+        // Push the same corrected clock the legacy matchNotes() path judges
+        // against — hw.getTime() + avOffset - latencyOffset.
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const playheadAudio = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
+        const playing = !!(window.slopsmith && window.slopsmith.isPlaying);
+
+        // A backward jump (drill A-B loop wrap or a manual seek-back): the
+        // engine re-opens notes at/after the new position, so drop our dedup
+        // entries for those same notes. Otherwise the re-scored verdicts are
+        // skipped by the `noteResults.has(key)` guard below and a drilled
+        // passage scores only on its first iteration. 0.25 s matches the
+        // engine's own backward-jump threshold.
+        if (playheadAudio < _ndLastPushedPlayhead - 0.25) {
+            for (const [id, cn] of _ndVerifierChartById) {
+                if (cn && Number.isFinite(cn.t) && cn.t >= playheadAudio) {
+                    noteResults.delete(id);
+                    _susActiveUntil.delete(id);
+                }
+            }
+            // Re-opened chords: drop the chord judgment + any half-collected
+            // verdicts so the next pass can re-grade the whole chord.
+            for (const [ckey, grp] of _ndVerifierChords) {
+                if (grp && Number.isFinite(grp.t) && grp.t >= playheadAudio) {
+                    noteResults.delete(ckey);
+                    _ndPendingChords.delete(ckey);
+                }
+            }
+        }
+        _ndLastPushedPlayhead = playheadAudio;
+
+        let verdicts = null;
+        try {
+            verdicts = await bridgeDesktop.audio.getNoteVerdicts(playheadAudio, playing);
+        } catch (e) {
+            console.warn('[note_detect] getNoteVerdicts failed:', e && e.message ? e.message : e);
+            return;
+        }
+        if (!Array.isArray(verdicts) || verdicts.length === 0) return;
+
+        for (const v of verdicts) {
+            if (!v || typeof v.id !== 'string') continue;
+            const cn = _ndVerifierChartById.get(v.id);
+            if (!cn) continue;
+
+            // Chord constituent — buffer the verdict until every member of
+            // the chord has reported, then judge the whole chord at once
+            // with N-of-M leniency (see _ndFinalizeChordVerdict).
+            const chordKey = _ndVerifierChordKeyOf.get(v.id);
+            if (chordKey) {
+                if (noteResults.has(chordKey)) continue;  // chord already judged
+                let pc = _ndPendingChords.get(chordKey);
+                if (!pc) { pc = new Map(); _ndPendingChords.set(chordKey, pc); }
+                pc.set(v.id, v);
+                const grp = _ndVerifierChords.get(chordKey);
+                if (grp && pc.size >= grp.memberIds.length) {
+                    _ndFinalizeChordVerdict(chordKey, grp, pc);
+                    _ndPendingChords.delete(chordKey);
+                }
+                continue;
+            }
+
+            // Lone single note.
+            const key = v.id;
+            if (noteResults.has(key)) continue;
+
+            const expectedMidi = _ndMidiFromStringFret(
+                cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+            );
+            if (v.detected) {
+                // detectedSongTime is the playhead the renderer pushed, which
+                // is already avOffset/latency-corrected — use it directly. (It
+                // was previously the engine's own backing clock and needed the
+                // correction here; re-applying it now would double-correct.)
+                const judgedAt = v.detectedSongTime;
+                const pitchError = Number.isFinite(v.centsError) ? v.centsError : null;
+                const detectedMidiForJudgment = Number.isFinite(pitchError)
+                    ? expectedMidi + pitchError / 100
+                    : null;
+                // A bend / slide / harmonic note's pitch deliberately leaves
+                // the chart pitch; widen the pitch gate so the hit rides on
+                // presence + timing, not a moving target.
+                const lenientPitch = !!(cn.b || cn.sl || cn.hm);
+                const judgment = makeMatchedJudgment(
+                    cn, cn.t, judgedAt, expectedMidi, detectedMidiForJudgment, 1,
+                    { pitchError, pitchThresholdCents: lenientPitch ? 600 : undefined }
+                );
+                recordJudgment(key, judgment);
+            } else {
+                // Engine finalized the note as a miss — its timing window
+                // has fully passed. Mirror the legacy checkMisses() retire.
+                const t = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
+                recordJudgment(key, makeMissJudgment(cn, cn.t, t, expectedMidi));
+            }
+        }
+
+        // Flush stuck chords. A chord is normally judged once every
+        // constituent reports a verdict; if the engine ever drops one, the
+        // chord would sit in _ndPendingChords forever (checkMisses is
+        // short-circuited on this path). Once a pending chord's window has
+        // long passed, finalize it with whatever verdicts did arrive —
+        // _ndFinalizeChordVerdict handles a partial set (missing members
+        // simply don't count toward hitStrings).
+        for (const [ckey, pc] of _ndPendingChords) {
+            const grp = _ndVerifierChords.get(ckey);
+            if (!grp) { _ndPendingChords.delete(ckey); continue; }
+            if (playheadAudio > grp.t + (grp.maxSus || 0) + timingTolerance + 1.0) {
+                _ndFinalizeChordVerdict(ckey, grp, pc);
+                _ndPendingChords.delete(ckey);
+            }
+        }
+    }
+
+    // Judge a whole chord from its constituents' engine verdicts. A chord is
+    // a hit when at least chordHitRatio of its strings verified (N-of-M
+    // leniency) — power-chord constituents share harmonics, so demanding
+    // every string would reject chords that clearly rang. Emits one chord
+    // judgment (chord:true), mirroring the legacy chord path.
+    function _ndFinalizeChordVerdict(chordKey, grp, verdictMap) {
+        if (noteResults.has(chordKey)) return;
+        let hitStrings = 0;
+        let detectedTime = null;   // onset-derived time from a struck string
+        let bestCents = null;
+        for (const id of grp.memberIds) {
+            const v = verdictMap.get(id);
+            if (v && v.detected) {
+                hitStrings++;
+                if (detectedTime === null) detectedTime = v.detectedSongTime;
+                if (bestCents === null && Number.isFinite(v.centsError)) bestCents = v.centsError;
+            }
+        }
+        const totalStrings = grp.memberIds.length;
+        const score = totalStrings > 0 ? hitStrings / totalStrings : 0;
+        const lead = _ndVerifierChartById.get(grp.memberIds[0]) || { s: 0, f: 0 };
+        const expectedMidi = _ndMidiFromStringFret(
+            lead.s, lead.f, currentArrangement, currentStringCount, tuningOffsets, capo
+        );
+        const lateGraceMs = Math.min((grp.maxSus || 0) * 1000, 1000);
+
+        if (score >= chordHitRatio && detectedTime !== null) {
+            const detMidi = Number.isFinite(bestCents) ? expectedMidi + bestCents / 100 : null;
+            recordJudgment(chordKey, makeMatchedJudgment(
+                lead, grp.t, detectedTime, expectedMidi, detMidi, 1,
+                { chord: true, notes: grp.memberNotes, hitStrings, totalStrings,
+                  score, pitchError: bestCents, lateGraceMs }
+            ));
+        } else {
+            recordJudgment(chordKey, makeMissJudgment(
+                lead, grp.t, grp.t, expectedMidi,
+                { chord: true, notes: grp.memberNotes, hitStrings, totalStrings, score }
+            ));
+        }
+    }
+
     let _chartStateSubscribed = false;
     let _chartStateOnChange = null;
     function _chartStateBindEvents() {
@@ -4423,7 +4873,16 @@ function createNoteDetector(options = {}) {
         if (!window.slopsmith
             || typeof window.slopsmith.on !== 'function'
             || typeof window.slopsmith.off !== 'function') return;
-        const onChange = () => { _syncChartStateFromHw(); };
+        // On a song / arrangement change, refresh the chart context and —
+        // on the desktop bridge — re-push the new note chart to the engine
+        // verifier. _ndPushChartToBridge() no-ops on the browser path.
+        const onChange = () => {
+            _syncChartStateFromHw();
+            // Swallow rejections — a chart-build failure (e.g. hw.getNotes()
+            // throwing) inside a slopsmith host event callback must not
+            // surface as an unhandled rejection in the host's dispatch.
+            Promise.resolve(_ndPushChartToBridge()).catch(() => {});
+        };
         try {
             window.slopsmith.on('song:loaded',          onChange);
             window.slopsmith.on('arrangement:changed',  onChange);
@@ -4737,6 +5196,13 @@ function createNoteDetector(options = {}) {
 
         missCheckInterval = setInterval(checkMisses, 100);
         startHUD();
+
+        // Desktop bridge: push the current song's note chart to the engine
+        // so its NoteVerifier thread scores it continuously. No-ops on the
+        // browser path and on a downlevel addon (where the legacy matchNotes
+        // loop stays in force). startAudio() has already established
+        // usingDesktopBridge / bridgeDesktop by this point.
+        await _ndPushChartToBridge();
 
         // Per-instance GC of noteResults — previously a module-level
         // setInterval; moving it into the closure lets each instance
