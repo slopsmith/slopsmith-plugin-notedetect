@@ -5103,18 +5103,29 @@ function createNoteDetector(options = {}) {
             const constituentDetected = !!(verdictMap.get(id) || {}).detected;
             let mJudgment;
             if (chordIsHit) {
-                // A bend / slide / harmonic constituent leaves the chart
-                // pitch deliberately — widen the pitch gate, as the lone
-                // single-note path does.
+                // Pass `chord: true` so _ndMakeJudgment routes through the
+                // chord-judgment branch and the per-constituent `hit`
+                // tracks the chord-level verdict (timing-only). Without
+                // it, `hit` gets gated by per-string pitchState/
+                // pitchHitThreshold and can become false even when
+                // chordIsHit is true — e.g. a chord scored a hit via
+                // N-of-M leniency but bestCents (lifted from one
+                // constituent) sits outside the 28¢ pitch threshold.
+                // That false-`hit` would then make noteStateFor return
+                // 'miss' for the constituent, undoing the whole point of
+                // stamping it with the chord verdict.
                 const lenientPitch = !!(mcn.b || mcn.sl || mcn.hm);
                 const mDetMidi = Number.isFinite(bestCents)
                     ? mExpectedMidi + bestCents / 100 : null;
                 mJudgment = makeMatchedJudgment(
                     mcn, mcn.t, detectedTime, mExpectedMidi, mDetMidi, 1,
-                    { pitchError: bestCents, pitchThresholdCents: lenientPitch ? 600 : undefined }
+                    { chord: true, pitchError: bestCents,
+                      pitchThresholdCents: lenientPitch ? 600 : undefined,
+                      lateGraceMs }
                 );
             } else {
-                mJudgment = makeMissJudgment(mcn, mcn.t, missAt, mExpectedMidi);
+                mJudgment = makeMissJudgment(mcn, mcn.t, missAt, mExpectedMidi,
+                    { chord: true, lateGraceMs });
             }
             // Verdict landed now — anchor the highway gem's display window
             // here (see recordJudgment / noteStateFor).
