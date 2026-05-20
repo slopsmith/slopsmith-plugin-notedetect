@@ -5118,11 +5118,21 @@ function createNoteDetector(options = {}) {
             Promise.resolve(_ndPushChartToBridge()).catch(() => {});
         };
         try {
+            // song:loaded fires early (with metadata) — chart contents
+            // (notes / chords / beats) stream in afterwards over the WS.
+            // song:ready fires once the chart has fully arrived, which is
+            // the actually-correct moment to push to the engine. We
+            // subscribe to both: song:loaded keeps the legacy path that
+            // also resets chart-derived state, and song:ready guarantees
+            // a re-push once hw.getNotes()/getChords() returns the full
+            // chart instead of an empty / partial early snapshot.
             window.slopsmith.on('song:loaded',          onChange);
+            window.slopsmith.on('song:ready',           onChange);
             window.slopsmith.on('arrangement:changed',  onChange);
         } catch (e) {
             if (typeof window.slopsmith.off === 'function') {
                 try { window.slopsmith.off('song:loaded',         onChange); } catch (_) {}
+                try { window.slopsmith.off('song:ready',          onChange); } catch (_) {}
                 try { window.slopsmith.off('arrangement:changed', onChange); } catch (_) {}
             }
             return;
@@ -5134,6 +5144,7 @@ function createNoteDetector(options = {}) {
         if (!_chartStateSubscribed) return;
         if (window.slopsmith && typeof window.slopsmith.off === 'function' && _chartStateOnChange) {
             try { window.slopsmith.off('song:loaded',         _chartStateOnChange); } catch (_) {}
+            try { window.slopsmith.off('song:ready',          _chartStateOnChange); } catch (_) {}
             try { window.slopsmith.off('arrangement:changed', _chartStateOnChange); } catch (_) {}
         }
         _chartStateOnChange = null;
