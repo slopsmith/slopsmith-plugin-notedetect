@@ -1330,6 +1330,19 @@ function createNoteDetector(options = {}) {
     let inputPeak = 0;
     let peakDecay = 0;
 
+    // Renderer-side silence gate. CREPE on this engine emits high-
+    // confidence stuck-pitch output on silence (interference / induced
+    // signal even with the guitar muted); the engine's verifier accepts
+    // it, and bent / slide / harmonic notes' 600¢ pitch leniency widens
+    // the window so far that those phantom pitches pass as hits — giving
+    // ~50% false-hit rate with no input. The fix is to track recent
+    // input levels and, when a verdict arrives, force its `detected` to
+    // false if no real signal existed around the note's chart time.
+    const _ndLevelSamples = [];
+    const _ND_LEVEL_HISTORY_S = 6;
+    const _ND_LEVEL_WIN_HALF = 0.2;  // ±200 ms around chartTime
+    const _ND_SILENCE_THRESHOLD = 0.02;  // ~2% of full scale
+
     // Scoring
     let hits = 0;
     let misses = 0;
@@ -2273,6 +2286,41 @@ function createNoteDetector(options = {}) {
                 // x, which would inflate the bar during quiet moments.
                 const rawLevel = Number.isFinite(levels.inputLevel) ? levels.inputLevel : 0;
                 inputLevel = Math.min(1, Math.max(0, rawLevel));
+                // Record (songT, level) for the silence gate in the engine
+                // verdict drain. The buffer assumes songT advances
+                // monotonically; on a backward jump (seek, drill loop
+                // restart) we'd otherwise keep stale post-jump high-time
+                // samples that the shift()-prune never removes, mixing two
+                // timelines into the same window and forcing false misses.
+                // Clear the buffer on any backward jump.
+                if (hw && typeof hw.getTime === 'function') {
+                    const avO = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+                    const songT = hw.getTime() + avO;
+                    const last = _ndLevelSamples.length
+                        ? _ndLevelSamples[_ndLevelSamples.length - 1].songT
+                        : -Infinity;
+                    if (songT < last - 0.05) {
+                        // Time went backward (seek / drill wrap). Reset.
+                        _ndLevelSamples.length = 0;
+                    }
+                    _ndLevelSamples.push({ songT, level: inputLevel });
+                    const cutoff = songT - _ND_LEVEL_HISTORY_S;
+                    while (_ndLevelSamples.length > 0 && _ndLevelSamples[0].songT < cutoff) {
+                        _ndLevelSamples.shift();
+                    }
+                    // Pause-safe cap: songT-only pruning relies on songT
+                    // advancing, but if playback is paused (or stuck in a
+                    // menu) while this 50 ms timer keeps firing, every new
+                    // sample has the same songT and the time-based prune
+                    // never fires. Enforce a hard sample-count cap as a
+                    // safety net so the buffer can't grow unbounded across
+                    // a paused session. 6 s of 50 ms polls → 120 samples,
+                    // so 240 (2× headroom) is plenty for active playback
+                    // and still bounded during pauses.
+                    while (_ndLevelSamples.length > 240) {
+                        _ndLevelSamples.shift();
+                    }
+                }
                 const rawPeak = Number.isFinite(levels.inputPeak) ? levels.inputPeak : inputLevel;
                 const peak = Math.min(1, Math.max(0, rawPeak));
                 if (peak > inputPeak) {
@@ -2506,6 +2554,16 @@ function createNoteDetector(options = {}) {
         const songT = ((hw && hw.getTime) ? hw.getTime() : 0)
             + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
 
+        // Anchor the post-strike glow / miss-wash age on when the verdict
+        // landed (_ndDisplayFrom, stamped in recordJudgment), not the note's
+        // chart time. An engine verdict arrives ~0.4 s after the note
+        // crosses the line; measuring the fade from chart time would leave
+        // only a sliver of the window — or none — by the time the gem can
+        // actually be tinted. clamp to chartTime so a verdict that somehow
+        // predates the note can't start the fade early.
+        const dispAnchor = Number.isFinite(j._ndDisplayFrom)
+            ? Math.max(chartTime, j._ndDisplayFrom) : chartTime;
+
         if (j.hit) {
             const sus = +note.sus || 0;
             // Sustained note still inside its ring window AND currently
@@ -2514,15 +2572,15 @@ function createNoteDetector(options = {}) {
                 return { state: 'active', alpha: 1 };
             }
             // Otherwise: brief post-strike glow that fades out over
-            // hitGlowDuration.
-            const age = songT - chartTime;
+            // hitGlowDuration (measured from when the verdict landed).
+            const age = songT - dispAnchor;
             if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
             const glowDur = Math.max(0.1, hitGlowDuration);
             if (age >= glowDur) return null;
             return { state: 'hit', alpha: 1 - age / glowDur };
         }
         // Missed (timing window expired, or matched-but-not-clean).
-        const age = songT - chartTime;
+        const age = songT - dispAnchor;
         if (age < 0 || age >= NOTE_MISS_GEM_TTL) return null;
         return { state: 'miss', alpha: 1 - age / NOTE_MISS_GEM_TTL };
     }
@@ -2822,6 +2880,17 @@ function createNoteDetector(options = {}) {
     }
 
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
+        // slopsmith#254 — stamp the song-time at which this verdict became
+        // known. noteStateFor() measures the highway gem's hit/miss display
+        // window from here, not from the note's chart time: the engine
+        // verifier reports verdicts ~0.4 s after the note crosses the line,
+        // so anchoring on chart time would burn most of the glow window
+        // before the verdict even exists. Browser-path judgments are
+        // recorded near chart time, so this is effectively a no-op there.
+        if (judgment && !Number.isFinite(judgment._ndDisplayFrom)) {
+            judgment._ndDisplayFrom = ((hw && hw.getTime) ? hw.getTime() : 0)
+                + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
+        }
         noteResults.set(key, judgment);
         if (count) {
             _recordDiagnostic(judgment);
@@ -4856,6 +4925,46 @@ function createNoteDetector(options = {}) {
             const cn = _ndVerifierChartById.get(v.id);
             if (!cn) continue;
 
+            // Silence gate — see _ndLevelSamples. If the input was below
+            // the silence threshold across the entire ±200 ms window
+            // around this note's chart time, the engine's "detected:true"
+            // is almost certainly a CREPE-on-silence phantom-pitch false
+            // positive. Force a miss so the HUD reflects "nothing was
+            // played" instead of the engine's optimistic verdict.
+            //
+            // Skip the gate entirely if the window contained no level
+            // samples — e.g. startup, level-meter hiccup, or right after a
+            // backward-seek reset cleared the buffer. Treating "no
+            // telemetry" as "silent" would force false misses on legitimate
+            // detections in those transient states.
+            if (v.detected && _ndLevelSamples.length > 0) {
+                // _ndLevelSamples are timestamped in the visual clock
+                // (hw.getTime() + avOffset), but `cn.t` (and everywhere
+                // else in this file that compares times against chart
+                // notes) is audio-aligned — see the
+                // `hw.getTime() + avOffset - latencyOffset` formula the
+                // detection pipeline uses to align audio to chart. So
+                // visual time = audio/chart time + latencyOffset. To
+                // find level samples that match this note's chart time,
+                // center the search at `cn.t + latencyOffset` in visual
+                // time; otherwise the configured user latency (up to
+                // 250 ms) would push the real peak outside the
+                // ±_ND_LEVEL_WIN_HALF window and trip false misses.
+                const cnCenterVisualT = cn.t + latencyOffset;
+                let peakL = 0;
+                let inWindow = 0;
+                for (let i = _ndLevelSamples.length - 1; i >= 0; i--) {
+                    const s = _ndLevelSamples[i];
+                    if (s.songT > cnCenterVisualT + _ND_LEVEL_WIN_HALF) continue;
+                    if (s.songT < cnCenterVisualT - _ND_LEVEL_WIN_HALF) break;
+                    inWindow++;
+                    if (s.level > peakL) peakL = s.level;
+                }
+                if (inWindow > 0 && peakL < _ND_SILENCE_THRESHOLD) {
+                    v.detected = false;
+                }
+            }
+
             // Chord constituent — buffer the verdict until every member of
             // the chord has reported, then judge the whole chord at once
             // with N-of-M leniency (see _ndFinalizeChordVerdict).
@@ -4950,7 +5059,8 @@ function createNoteDetector(options = {}) {
         );
         const lateGraceMs = Math.min((grp.maxSus || 0) * 1000, 1000);
 
-        if (score >= chordHitRatio && detectedTime !== null) {
+        const chordIsHit = score >= chordHitRatio && detectedTime !== null;
+        if (chordIsHit) {
             const detMidi = Number.isFinite(bestCents) ? expectedMidi + bestCents / 100 : null;
             recordJudgment(chordKey, makeMatchedJudgment(
                 lead, grp.t, detectedTime, expectedMidi, detMidi, 1,
@@ -4958,10 +5068,93 @@ function createNoteDetector(options = {}) {
                   score, pitchError: bestCents, lateGraceMs }
             ));
         } else {
+            // Match the legacy chord-miss path: judgedAt is the current
+            // corrected playhead (matchChords' `t`, not the chord's chart
+            // time), and lateGraceMs is included so a chord with a long
+            // sustain stays open to a late grab — both fields needed for
+            // _ndMakeJudgment's timing classification to give the same
+            // result as the legacy browser/desktop chord-miss path.
+            const avOffsetSecMiss = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+            const missJudgedAt = (hw.getTime ? hw.getTime() : 0) + avOffsetSecMiss - latencyOffset;
             recordJudgment(chordKey, makeMissJudgment(
-                lead, grp.t, grp.t, expectedMidi,
-                { chord: true, notes: grp.memberNotes, hitStrings, totalStrings, score }
+                lead, grp.t, missJudgedAt, expectedMidi,
+                { chord: true, notes: grp.memberNotes, hitStrings, totalStrings, score, lateGraceMs }
             ));
+        }
+
+        // Stash a per-constituent judgment for every chord string, keyed by
+        // its own noteKey (== its engine id). The chord-level judgment above
+        // owns the HUD totals / event log; these per-string entries exist
+        // purely so the highway's note-state provider (slopsmith#254) can
+        // tint each chord gem and the chord frame. Without them the engine
+        // path stored only `chordKey`, which the highway never queries —
+        // hence the missing chord hit/miss feedback.
+        //
+        // Every constituent carries the *chord-level* verdict, not its own
+        // string's detection: a chord is judged as a unit under N-of-M
+        // leniency — power-chord strings share harmonics, so not every
+        // string verifies individually even on a clean strum. Tinting each
+        // gem and the chord frame with the unit verdict keeps them
+        // consistent: the frame goes green when the chord scored a hit,
+        // instead of red because one harmonically-masked string failed to
+        // verify on its own. (Stashed straight into noteResults +
+        // _recordPerStringForChord, bypassing recordJudgment so the chord
+        // isn't double-counted in HUD totals.)
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const nowSongT = (hw.getTime ? hw.getTime() : 0) + avOffsetSec;
+        const missAt = nowSongT - latencyOffset;
+        for (const id of grp.memberIds) {
+            if (noteResults.has(id)) continue;
+            const mcn = _ndVerifierChartById.get(id);
+            if (!mcn) continue;
+            const mExpectedMidi = _ndMidiFromStringFret(
+                mcn.s, mcn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+            );
+            // The noteResults entry is stamped with the chord-level verdict
+            // (so the highway tints every chord gem and the chord frame
+            // consistently — power-chord strings share harmonics and aren't
+            // each independently verifiable under N-of-M leniency). But the
+            // per-string diagnostic counter (_diagPerString via
+            // _recordPerStringForChord) needs the *individual* constituent
+            // outcome to stay accurate — otherwise a 4-string chord scored
+            // hit via N-of-M would credit all four strings as hits even
+            // when only two were actually detected, inflating per-string
+            // accuracy.
+            const constituentDetected = !!(verdictMap.get(id) || {}).detected;
+            let mJudgment;
+            if (chordIsHit) {
+                // Pass `chord: true` so _ndMakeJudgment routes through the
+                // chord-judgment branch and the per-constituent `hit`
+                // tracks the chord-level verdict (timing-only). Without
+                // it, `hit` gets gated by per-string pitchState/
+                // pitchHitThreshold and can become false even when
+                // chordIsHit is true — e.g. a chord scored a hit via
+                // N-of-M leniency but bestCents (lifted from one
+                // constituent) sits outside the 28¢ pitch threshold.
+                // That false-`hit` would then make noteStateFor return
+                // 'miss' for the constituent, undoing the whole point of
+                // stamping it with the chord verdict.
+                const lenientPitch = !!(mcn.b || mcn.sl || mcn.hm);
+                const mDetMidi = Number.isFinite(bestCents)
+                    ? mExpectedMidi + bestCents / 100 : null;
+                mJudgment = makeMatchedJudgment(
+                    mcn, mcn.t, detectedTime, mExpectedMidi, mDetMidi, 1,
+                    { chord: true, pitchError: bestCents,
+                      pitchThresholdCents: lenientPitch ? 600 : undefined,
+                      lateGraceMs }
+                );
+            } else {
+                mJudgment = makeMissJudgment(mcn, mcn.t, missAt, mExpectedMidi,
+                    { chord: true, lateGraceMs });
+            }
+            // Verdict landed now — anchor the highway gem's display window
+            // here (see recordJudgment / noteStateFor).
+            mJudgment._ndDisplayFrom = nowSongT;
+            noteResults.set(id, mJudgment);
+            // Per-string diagnostic uses the individual outcome rather than
+            // the unit chord verdict. Built as a minimal shape — only `hit`
+            // and `chartNote` are read by _recordPerStringForChord.
+            _recordPerStringForChord({ hit: constituentDetected, chartNote: mcn });
         }
     }
 
@@ -4983,11 +5176,21 @@ function createNoteDetector(options = {}) {
             Promise.resolve(_ndPushChartToBridge()).catch(() => {});
         };
         try {
+            // song:loaded fires early (with metadata) — chart contents
+            // (notes / chords / beats) stream in afterwards over the WS.
+            // song:ready fires once the chart has fully arrived, which is
+            // the actually-correct moment to push to the engine. We
+            // subscribe to both: song:loaded keeps the legacy path that
+            // also resets chart-derived state, and song:ready guarantees
+            // a re-push once hw.getNotes()/getChords() returns the full
+            // chart instead of an empty / partial early snapshot.
             window.slopsmith.on('song:loaded',          onChange);
+            window.slopsmith.on('song:ready',           onChange);
             window.slopsmith.on('arrangement:changed',  onChange);
         } catch (e) {
             if (typeof window.slopsmith.off === 'function') {
                 try { window.slopsmith.off('song:loaded',         onChange); } catch (_) {}
+                try { window.slopsmith.off('song:ready',          onChange); } catch (_) {}
                 try { window.slopsmith.off('arrangement:changed', onChange); } catch (_) {}
             }
             return;
@@ -4999,6 +5202,7 @@ function createNoteDetector(options = {}) {
         if (!_chartStateSubscribed) return;
         if (window.slopsmith && typeof window.slopsmith.off === 'function' && _chartStateOnChange) {
             try { window.slopsmith.off('song:loaded',         _chartStateOnChange); } catch (_) {}
+            try { window.slopsmith.off('song:ready',          _chartStateOnChange); } catch (_) {}
             try { window.slopsmith.off('arrangement:changed', _chartStateOnChange); } catch (_) {}
         }
         _chartStateOnChange = null;
