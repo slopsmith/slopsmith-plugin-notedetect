@@ -221,6 +221,61 @@ test('engine-verifier path: a backward playhead jump clears dedup so a drilled n
     await flushPendingAsync();
 });
 
+test('engine-verifier path: silence gate forces miss when input level is sub-threshold around chart time', async () => {
+    // Regression guard for the CREPE-on-silence false-positive: the engine
+    // can return `detected: true` on silence (CREPE emits a high-confidence
+    // stuck-pitch from induced signal even with the guitar muted), and the
+    // bent-note 600¢ pitch leniency widens the window enough that those
+    // phantoms pass as hits. The plugin's silence gate (an _ndLevelSamples
+    // ring populated from the bridge's getLevels poll) must override
+    // `v.detected = true` to false when no real signal was present in the
+    // ±_ND_LEVEL_WIN_HALF window around the note's chart time. Without it
+    // a muted-guitar playthrough scored ~57% hits instead of ~0%.
+    const env = engineVerifierSandbox();
+    const det = env.createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    // Drive every registered interval at least once so the bridge level
+    // meter records at least one (songT, level) sample with the silent
+    // getLevels stub (inputLevel: 0). Without this the gate's "no
+    // telemetry → skip" branch would let the engine's optimistic verdict
+    // through, defeating the test.
+    for (const cb of env.intervalCallbacks) {
+        // eslint-disable-next-line no-await-in-loop
+        await cb();
+        // eslint-disable-next-line no-await-in-loop
+        await flushPendingAsync();
+    }
+
+    // Queue an engine verdict saying the note WAS detected. Without the
+    // silence gate this would record a hit; with the gate it should be
+    // overridden to a miss because the only recorded level samples are
+    // sub-threshold around cn.t + latencyOffset.
+    const id = env.chartNoteId();
+    assert.equal(typeof id, 'string', 'setChart should have received a note with a string id');
+    env.verdictQueue.push([
+        { id, detected: true, detectedSongTime: CHART_NOTE.t, centsError: 0, snr: 6 },
+    ]);
+
+    const detectTick = await driveDetectTick(env.intervalCallbacks, env.calls);
+    assert.equal(typeof detectTick, 'function');
+    // Drain again so the queued verdict is delivered + gated.
+    await detectTick();
+    await flushPendingAsync();
+
+    const stats = det.getStats();
+    assert.equal(stats.hits, 0,
+        'silence-gate must override the engine\'s detected:true → no hit on a silent input');
+    assert.equal(stats.misses, 1, 'the gated verdict should be recorded as a miss instead');
+    assert.equal(env.hitEvents.length, 0,
+        'no notedetect:hit event should be dispatched when the gate fires');
+    assert.equal(env.missEvents.length, 1, 'one notedetect:miss event should be dispatched');
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
 test('engine-verifier path: downlevel addon without the verifier API stays on the legacy path', async () => {
     const env = engineVerifierSandbox({ withVerifierApi: false });
     const det = env.createNoteDetector({ isDefault: false });
