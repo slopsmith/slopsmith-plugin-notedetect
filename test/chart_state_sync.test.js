@@ -103,24 +103,28 @@ test('_bindChartStateEvents is idempotent', () => {
     det._bindChartStateEvents();
     det._bindChartStateEvents();
     assert.equal(core.slopsmith._listenerCount('song:loaded'), 1);
+    assert.equal(core.slopsmith._listenerCount('song:ready'), 1);
     assert.equal(core.slopsmith._listenerCount('arrangement:changed'), 1);
     det.destroy();
 });
 
-test('destroy() unbinds song:loaded and arrangement:changed listeners', () => {
+test('destroy() unbinds song:loaded, song:ready and arrangement:changed listeners', () => {
     const core = loadDetectionCore();
     const det = mountDetectorWithSong(core, {});
     det._bindChartStateEvents();
     assert.equal(core.slopsmith._listenerCount('song:loaded'), 1);
+    assert.equal(core.slopsmith._listenerCount('song:ready'), 1);
     assert.equal(core.slopsmith._listenerCount('arrangement:changed'), 1);
 
     det.destroy();
     assert.equal(core.slopsmith._listenerCount('song:loaded'), 0);
+    assert.equal(core.slopsmith._listenerCount('song:ready'), 0);
     assert.equal(core.slopsmith._listenerCount('arrangement:changed'), 0);
 
     // Firing post-destroy must not throw.
     assert.doesNotThrow(() => {
         core.slopsmith._fire('song:loaded', { filename: 'x.psarc' });
+        core.slopsmith._fire('song:ready', { hasPhraseData: true });
         core.slopsmith._fire('arrangement:changed', { arrangement: 'Lead' });
     });
 });

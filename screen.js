@@ -4927,15 +4927,16 @@ function createNoteDetector(options = {}) {
             // detections in those transient states.
             if (v.detected && _ndLevelSamples.length > 0) {
                 // _ndLevelSamples are timestamped in the visual clock
-                // (hw.getTime() + avOffset). cn.t is the chart time, which
-                // matches the visual clock at the moment the note crosses
-                // the line. Audio at chart time `t` arrives at the engine
-                // latencyOffset later in visual time (the detection
-                // pipeline computes audio-aligned time as
-                // `hw.getTime() + avOffset - latencyOffset`, i.e. visual ≈
-                // audio + latencyOffset). Center the silence-gate window
-                // at `cn.t + latencyOffset` so the configured user latency
-                // (up to 250 ms) doesn't push the real peak outside the
+                // (hw.getTime() + avOffset), but `cn.t` (and everywhere
+                // else in this file that compares times against chart
+                // notes) is audio-aligned — see the
+                // `hw.getTime() + avOffset - latencyOffset` formula the
+                // detection pipeline uses to align audio to chart. So
+                // visual time = audio/chart time + latencyOffset. To
+                // find level samples that match this note's chart time,
+                // center the search at `cn.t + latencyOffset` in visual
+                // time; otherwise the configured user latency (up to
+                // 250 ms) would push the real peak outside the
                 // ±_ND_LEVEL_WIN_HALF window and trip false misses.
                 const cnCenterVisualT = cn.t + latencyOffset;
                 let peakL = 0;
