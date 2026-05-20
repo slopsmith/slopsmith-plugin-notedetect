@@ -2308,6 +2308,18 @@ function createNoteDetector(options = {}) {
                     while (_ndLevelSamples.length > 0 && _ndLevelSamples[0].songT < cutoff) {
                         _ndLevelSamples.shift();
                     }
+                    // Pause-safe cap: songT-only pruning relies on songT
+                    // advancing, but if playback is paused (or stuck in a
+                    // menu) while this 50 ms timer keeps firing, every new
+                    // sample has the same songT and the time-based prune
+                    // never fires. Enforce a hard sample-count cap as a
+                    // safety net so the buffer can't grow unbounded across
+                    // a paused session. 6 s of 50 ms polls → 120 samples,
+                    // so 240 (2× headroom) is plenty for active playback
+                    // and still bounded during pauses.
+                    while (_ndLevelSamples.length > 240) {
+                        _ndLevelSamples.shift();
+                    }
                 }
                 const rawPeak = Number.isFinite(levels.inputPeak) ? levels.inputPeak : inputLevel;
                 const peak = Math.min(1, Math.max(0, rawPeak));
