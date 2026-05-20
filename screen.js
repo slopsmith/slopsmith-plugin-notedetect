@@ -2506,6 +2506,16 @@ function createNoteDetector(options = {}) {
         const songT = ((hw && hw.getTime) ? hw.getTime() : 0)
             + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
 
+        // Anchor the post-strike glow / miss-wash age on when the verdict
+        // landed (_ndDisplayFrom, stamped in recordJudgment), not the note's
+        // chart time. An engine verdict arrives ~0.4 s after the note
+        // crosses the line; measuring the fade from chart time would leave
+        // only a sliver of the window — or none — by the time the gem can
+        // actually be tinted. clamp to chartTime so a verdict that somehow
+        // predates the note can't start the fade early.
+        const dispAnchor = Number.isFinite(j._ndDisplayFrom)
+            ? Math.max(chartTime, j._ndDisplayFrom) : chartTime;
+
         if (j.hit) {
             const sus = +note.sus || 0;
             // Sustained note still inside its ring window AND currently
@@ -2514,15 +2524,15 @@ function createNoteDetector(options = {}) {
                 return { state: 'active', alpha: 1 };
             }
             // Otherwise: brief post-strike glow that fades out over
-            // hitGlowDuration.
-            const age = songT - chartTime;
+            // hitGlowDuration (measured from when the verdict landed).
+            const age = songT - dispAnchor;
             if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
             const glowDur = Math.max(0.1, hitGlowDuration);
             if (age >= glowDur) return null;
             return { state: 'hit', alpha: 1 - age / glowDur };
         }
         // Missed (timing window expired, or matched-but-not-clean).
-        const age = songT - chartTime;
+        const age = songT - dispAnchor;
         if (age < 0 || age >= NOTE_MISS_GEM_TTL) return null;
         return { state: 'miss', alpha: 1 - age / NOTE_MISS_GEM_TTL };
     }
@@ -2822,6 +2832,17 @@ function createNoteDetector(options = {}) {
     }
 
     function recordJudgment(key, judgment, { count = true, emit = true } = {}) {
+        // slopsmith#254 — stamp the song-time at which this verdict became
+        // known. noteStateFor() measures the highway gem's hit/miss display
+        // window from here, not from the note's chart time: the engine
+        // verifier reports verdicts ~0.4 s after the note crosses the line,
+        // so anchoring on chart time would burn most of the glow window
+        // before the verdict even exists. Browser-path judgments are
+        // recorded near chart time, so this is effectively a no-op there.
+        if (judgment && !Number.isFinite(judgment._ndDisplayFrom)) {
+            judgment._ndDisplayFrom = ((hw && hw.getTime) ? hw.getTime() : 0)
+                + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
+        }
         noteResults.set(key, judgment);
         if (count) {
             _recordDiagnostic(judgment);
@@ -4950,7 +4971,8 @@ function createNoteDetector(options = {}) {
         );
         const lateGraceMs = Math.min((grp.maxSus || 0) * 1000, 1000);
 
-        if (score >= chordHitRatio && detectedTime !== null) {
+        const chordIsHit = score >= chordHitRatio && detectedTime !== null;
+        if (chordIsHit) {
             const detMidi = Number.isFinite(bestCents) ? expectedMidi + bestCents / 100 : null;
             recordJudgment(chordKey, makeMatchedJudgment(
                 lead, grp.t, detectedTime, expectedMidi, detMidi, 1,
@@ -4962,6 +4984,56 @@ function createNoteDetector(options = {}) {
                 lead, grp.t, grp.t, expectedMidi,
                 { chord: true, notes: grp.memberNotes, hitStrings, totalStrings, score }
             ));
+        }
+
+        // Stash a per-constituent judgment for every chord string, keyed by
+        // its own noteKey (== its engine id). The chord-level judgment above
+        // owns the HUD totals / event log; these per-string entries exist
+        // purely so the highway's note-state provider (slopsmith#254) can
+        // tint each chord gem and the chord frame. Without them the engine
+        // path stored only `chordKey`, which the highway never queries —
+        // hence the missing chord hit/miss feedback.
+        //
+        // Every constituent carries the *chord-level* verdict, not its own
+        // string's detection: a chord is judged as a unit under N-of-M
+        // leniency — power-chord strings share harmonics, so not every
+        // string verifies individually even on a clean strum. Tinting each
+        // gem and the chord frame with the unit verdict keeps them
+        // consistent: the frame goes green when the chord scored a hit,
+        // instead of red because one harmonically-masked string failed to
+        // verify on its own. (Stashed straight into noteResults +
+        // _recordPerStringForChord, bypassing recordJudgment so the chord
+        // isn't double-counted in HUD totals.)
+        const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+        const nowSongT = (hw.getTime ? hw.getTime() : 0) + avOffsetSec;
+        const missAt = nowSongT - latencyOffset;
+        for (const id of grp.memberIds) {
+            if (noteResults.has(id)) continue;
+            const mcn = _ndVerifierChartById.get(id);
+            if (!mcn) continue;
+            const mExpectedMidi = _ndMidiFromStringFret(
+                mcn.s, mcn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+            );
+            let mJudgment;
+            if (chordIsHit) {
+                // A bend / slide / harmonic constituent leaves the chart
+                // pitch deliberately — widen the pitch gate, as the lone
+                // single-note path does.
+                const lenientPitch = !!(mcn.b || mcn.sl || mcn.hm);
+                const mDetMidi = Number.isFinite(bestCents)
+                    ? mExpectedMidi + bestCents / 100 : null;
+                mJudgment = makeMatchedJudgment(
+                    mcn, mcn.t, detectedTime, mExpectedMidi, mDetMidi, 1,
+                    { pitchError: bestCents, pitchThresholdCents: lenientPitch ? 600 : undefined }
+                );
+            } else {
+                mJudgment = makeMissJudgment(mcn, mcn.t, missAt, mExpectedMidi);
+            }
+            // Verdict landed now — anchor the highway gem's display window
+            // here (see recordJudgment / noteStateFor).
+            mJudgment._ndDisplayFrom = nowSongT;
+            noteResults.set(id, mJudgment);
+            _recordPerStringForChord(mJudgment);
         }
     }
 
