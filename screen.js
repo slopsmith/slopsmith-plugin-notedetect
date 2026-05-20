@@ -4926,12 +4926,24 @@ function createNoteDetector(options = {}) {
             // telemetry" as "silent" would force false misses on legitimate
             // detections in those transient states.
             if (v.detected && _ndLevelSamples.length > 0) {
+                // _ndLevelSamples are timestamped in the visual clock
+                // (hw.getTime() + avOffset). cn.t is the chart time, which
+                // matches the visual clock at the moment the note crosses
+                // the line. Audio at chart time `t` arrives at the engine
+                // latencyOffset later in visual time (the detection
+                // pipeline computes audio-aligned time as
+                // `hw.getTime() + avOffset - latencyOffset`, i.e. visual ≈
+                // audio + latencyOffset). Center the silence-gate window
+                // at `cn.t + latencyOffset` so the configured user latency
+                // (up to 250 ms) doesn't push the real peak outside the
+                // ±_ND_LEVEL_WIN_HALF window and trip false misses.
+                const cnCenterVisualT = cn.t + latencyOffset;
                 let peakL = 0;
                 let inWindow = 0;
                 for (let i = _ndLevelSamples.length - 1; i >= 0; i--) {
                     const s = _ndLevelSamples[i];
-                    if (s.songT > cn.t + _ND_LEVEL_WIN_HALF) continue;
-                    if (s.songT < cn.t - _ND_LEVEL_WIN_HALF) break;
+                    if (s.songT > cnCenterVisualT + _ND_LEVEL_WIN_HALF) continue;
+                    if (s.songT < cnCenterVisualT - _ND_LEVEL_WIN_HALF) break;
                     inWindow++;
                     if (s.level > peakL) peakL = s.level;
                 }
@@ -5077,6 +5089,17 @@ function createNoteDetector(options = {}) {
             const mExpectedMidi = _ndMidiFromStringFret(
                 mcn.s, mcn.f, currentArrangement, currentStringCount, tuningOffsets, capo
             );
+            // The noteResults entry is stamped with the chord-level verdict
+            // (so the highway tints every chord gem and the chord frame
+            // consistently — power-chord strings share harmonics and aren't
+            // each independently verifiable under N-of-M leniency). But the
+            // per-string diagnostic counter (_diagPerString via
+            // _recordPerStringForChord) needs the *individual* constituent
+            // outcome to stay accurate — otherwise a 4-string chord scored
+            // hit via N-of-M would credit all four strings as hits even
+            // when only two were actually detected, inflating per-string
+            // accuracy.
+            const constituentDetected = !!(verdictMap.get(id) || {}).detected;
             let mJudgment;
             if (chordIsHit) {
                 // A bend / slide / harmonic constituent leaves the chart
@@ -5096,7 +5119,10 @@ function createNoteDetector(options = {}) {
             // here (see recordJudgment / noteStateFor).
             mJudgment._ndDisplayFrom = nowSongT;
             noteResults.set(id, mJudgment);
-            _recordPerStringForChord(mJudgment);
+            // Per-string diagnostic uses the individual outcome rather than
+            // the unit chord verdict. Built as a minimal shape — only `hit`
+            // and `chartNote` are read by _recordPerStringForChord.
+            _recordPerStringForChord({ hit: constituentDetected, chartNote: mcn });
         }
     }
 
