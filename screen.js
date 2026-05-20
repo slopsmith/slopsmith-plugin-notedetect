@@ -5056,9 +5056,17 @@ function createNoteDetector(options = {}) {
                   score, pitchError: bestCents, lateGraceMs }
             ));
         } else {
+            // Match the legacy chord-miss path: judgedAt is the current
+            // corrected playhead (matchChords' `t`, not the chord's chart
+            // time), and lateGraceMs is included so a chord with a long
+            // sustain stays open to a late grab — both fields needed for
+            // _ndMakeJudgment's timing classification to give the same
+            // result as the legacy browser/desktop chord-miss path.
+            const avOffsetSecMiss = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+            const missJudgedAt = (hw.getTime ? hw.getTime() : 0) + avOffsetSecMiss - latencyOffset;
             recordJudgment(chordKey, makeMissJudgment(
-                lead, grp.t, grp.t, expectedMidi,
-                { chord: true, notes: grp.memberNotes, hitStrings, totalStrings, score }
+                lead, grp.t, missJudgedAt, expectedMidi,
+                { chord: true, notes: grp.memberNotes, hitStrings, totalStrings, score, lateGraceMs }
             ));
         }
 
