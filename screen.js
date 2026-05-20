@@ -1330,6 +1330,19 @@ function createNoteDetector(options = {}) {
     let inputPeak = 0;
     let peakDecay = 0;
 
+    // Renderer-side silence gate. CREPE on this engine emits high-
+    // confidence stuck-pitch output on silence (interference / induced
+    // signal even with the guitar muted); the engine's verifier accepts
+    // it, and bent / slide / harmonic notes' 600¢ pitch leniency widens
+    // the window so far that those phantom pitches pass as hits — giving
+    // ~50% false-hit rate with no input. The fix is to track recent
+    // input levels and, when a verdict arrives, force its `detected` to
+    // false if no real signal existed around the note's chart time.
+    const _ndLevelSamples = [];
+    const _ND_LEVEL_HISTORY_S = 6;
+    const _ND_LEVEL_WIN_HALF = 0.2;  // ±200 ms around chartTime
+    const _ND_SILENCE_THRESHOLD = 0.02;  // ~2% of full scale
+
     // Scoring
     let hits = 0;
     let misses = 0;
@@ -2273,6 +2286,29 @@ function createNoteDetector(options = {}) {
                 // x, which would inflate the bar during quiet moments.
                 const rawLevel = Number.isFinite(levels.inputLevel) ? levels.inputLevel : 0;
                 inputLevel = Math.min(1, Math.max(0, rawLevel));
+                // Record (songT, level) for the silence gate in the engine
+                // verdict drain. The buffer assumes songT advances
+                // monotonically; on a backward jump (seek, drill loop
+                // restart) we'd otherwise keep stale post-jump high-time
+                // samples that the shift()-prune never removes, mixing two
+                // timelines into the same window and forcing false misses.
+                // Clear the buffer on any backward jump.
+                if (hw && typeof hw.getTime === 'function') {
+                    const avO = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
+                    const songT = hw.getTime() + avO;
+                    const last = _ndLevelSamples.length
+                        ? _ndLevelSamples[_ndLevelSamples.length - 1].songT
+                        : -Infinity;
+                    if (songT < last - 0.05) {
+                        // Time went backward (seek / drill wrap). Reset.
+                        _ndLevelSamples.length = 0;
+                    }
+                    _ndLevelSamples.push({ songT, level: inputLevel });
+                    const cutoff = songT - _ND_LEVEL_HISTORY_S;
+                    while (_ndLevelSamples.length > 0 && _ndLevelSamples[0].songT < cutoff) {
+                        _ndLevelSamples.shift();
+                    }
+                }
                 const rawPeak = Number.isFinite(levels.inputPeak) ? levels.inputPeak : inputLevel;
                 const peak = Math.min(1, Math.max(0, rawPeak));
                 if (peak > inputPeak) {
@@ -4876,6 +4912,33 @@ function createNoteDetector(options = {}) {
             if (!v || typeof v.id !== 'string') continue;
             const cn = _ndVerifierChartById.get(v.id);
             if (!cn) continue;
+
+            // Silence gate — see _ndLevelSamples. If the input was below
+            // the silence threshold across the entire ±200 ms window
+            // around this note's chart time, the engine's "detected:true"
+            // is almost certainly a CREPE-on-silence phantom-pitch false
+            // positive. Force a miss so the HUD reflects "nothing was
+            // played" instead of the engine's optimistic verdict.
+            //
+            // Skip the gate entirely if the window contained no level
+            // samples — e.g. startup, level-meter hiccup, or right after a
+            // backward-seek reset cleared the buffer. Treating "no
+            // telemetry" as "silent" would force false misses on legitimate
+            // detections in those transient states.
+            if (v.detected && _ndLevelSamples.length > 0) {
+                let peakL = 0;
+                let inWindow = 0;
+                for (let i = _ndLevelSamples.length - 1; i >= 0; i--) {
+                    const s = _ndLevelSamples[i];
+                    if (s.songT > cn.t + _ND_LEVEL_WIN_HALF) continue;
+                    if (s.songT < cn.t - _ND_LEVEL_WIN_HALF) break;
+                    inWindow++;
+                    if (s.level > peakL) peakL = s.level;
+                }
+                if (inWindow > 0 && peakL < _ND_SILENCE_THRESHOLD) {
+                    v.detected = false;
+                }
+            }
 
             // Chord constituent — buffer the verdict until every member of
             // the chord has reported, then judge the whole chord at once
