@@ -2819,7 +2819,23 @@ function createNoteDetector(options = {}) {
                         : 'Microphone access is not available in this browser. Use Chrome or Edge.';
                     throw new Error(msg);
                 }
-                stream = await navigator.mediaDevices.getUserMedia(constraints);
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia(constraints);
+                } catch (e) {
+                    if (e.name === 'OverconstrainedError' && selectedDeviceId) {
+                        // Saved device no longer available — fall back to default.
+                        selectedDeviceId = '';
+                        saveSettings();
+                        delete constraints.audio.deviceId;
+                        stream = await navigator.mediaDevices.getUserMedia(constraints);
+                    } else if (e.name === 'OverconstrainedError') {
+                        // Device rejects channelCount:2 (e.g. mono-only USB audio like Real Tone Cable).
+                        delete constraints.audio.channelCount;
+                        stream = await navigator.mediaDevices.getUserMedia(constraints);
+                    } else {
+                        throw e;
+                    }
+                }
             }
 
             // Acquire the context independently — a caller can supply
@@ -9453,6 +9469,8 @@ function createNoteDetector(options = {}) {
         && (typeof window.AudioContext === 'function'
             || typeof window.webkitAudioContext === 'function');
     if (isDefault && detectPreference && _hasAudio) {
+        // Delay auto-enable slightly so USB audio devices (e.g. Real Tone Cable)
+        // have time to finish enumerating their channels before getUserMedia fires.
         setTimeout(() => {
             // Re-check BOTH enabled and detectPreference. A fast user
             // click could have already enabled us (`enabled`), and
@@ -9464,7 +9482,7 @@ function createNoteDetector(options = {}) {
             if (!enabled && detectPreference) enable().catch((e) => {
                 console.warn('[note_detect] auto-enable failed:', e && e.message ? e.message : e);
             });
-        }, 0);
+        }, 1500);
     }
 
     _ndInstances.add(api);
