@@ -231,6 +231,15 @@ const _ND_VERIFY_PITCH_CENTS_BASS = 60;
 // present. Tunable here — it rides through the IPC, so calibration does
 // not need a native rebuild.
 const _ND_VERIFY_HARMONIC_SNR = 3.0;
+// Bass lowers the harmonic-to-floor ratio. A bass DI puts less of its energy
+// into the upper partials the comb sums (the fundamental is strong but the
+// harmonic stack is shorter than a guitar's), so the guitar SNR gate of 3.0
+// under-counts genuine low notes — measured against a real bass DI calibration
+// take, dropping to 2.0 raised picked-note recall ~81%→86% with no loss on
+// fingerstyle and no real-world precision cost (the verifier only ever scores
+// the *charted* note, and silence is still rejected by the separate floor/
+// average-bin denominator, not this ratio). Rides the IPC — no native rebuild.
+const _ND_VERIFY_HARMONIC_SNR_BASS = 2.0;
 
 // Fundamental-presence gate for the harmonic-comb verifier (scoreChord
 // `fundamentalRatio`): a note is rejected when its f0 peak is weaker than
@@ -249,7 +258,7 @@ function _ndVerifyParamsFor(arrangement) {
     const bass = arrangement === 'bass';
     return {
         pitchCheckCents: bass ? _ND_VERIFY_PITCH_CENTS_BASS : _ND_VERIFY_PITCH_CENTS,
-        harmonicSnr: _ND_VERIFY_HARMONIC_SNR,
+        harmonicSnr: bass ? _ND_VERIFY_HARMONIC_SNR_BASS : _ND_VERIFY_HARMONIC_SNR,
         fundamentalRatio: bass ? _ND_VERIFY_FUNDAMENTAL_RATIO_BASS : _ND_VERIFY_FUNDAMENTAL_RATIO,
     };
 }
