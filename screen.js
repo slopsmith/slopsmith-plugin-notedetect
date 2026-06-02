@@ -219,12 +219,53 @@ const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size
 // coarse FFT peak can verify. 50 cents = a quarter-tone, enough to
 // disambiguate adjacent frets without rejecting real-world intonation.
 const _ND_VERIFY_PITCH_CENTS = 50;
+// Bass widens the pitch-verify window: a low-string fundamental (B0 ≈ 31 Hz)
+// spans barely one FFT bin (~157 cents/bin), so even the engine's
+// harmonic-blended pitch estimate is coarser than guitar's. 60 cents still
+// disambiguates adjacent bass frets (a semitone is 100 cents) without
+// rejecting real intonation on a note the low bins resolve loosely.
+const _ND_VERIFY_PITCH_CENTS_BASS = 60;
 
 // Minimum harmonic-to-floor ratio for the desktop engine's harmonic-comb
 // verifier (scoreChord harmonicVerify mode) to count a single note as
 // present. Tunable here — it rides through the IPC, so calibration does
 // not need a native rebuild.
 const _ND_VERIFY_HARMONIC_SNR = 3.0;
+// Bass lowers the harmonic-to-floor ratio. A bass DI puts less of its energy
+// into the upper partials the comb sums (the fundamental is strong but the
+// harmonic stack is shorter than a guitar's), so the guitar SNR gate of 3.0
+// under-counts genuine low notes — measured against a real bass DI calibration
+// take, dropping to 2.0 raised picked-note recall ~81%→86% with no loss on
+// fingerstyle and no real-world precision cost (the verifier only ever scores
+// the *charted* note, and silence is still rejected by the separate floor/
+// average-bin denominator, not this ratio). Rides the IPC — no native rebuild.
+const _ND_VERIFY_HARMONIC_SNR_BASS = 2.0;
+
+// Fundamental-presence gate for the harmonic-comb verifier (scoreChord
+// `fundamentalRatio`): a note is rejected when its f0 peak is weaker than
+// ratio × its strongest partial — the specificity guard against octave-up
+// impostors. Guitar's DI fundamental is healthy, so 0.20 is safe. A bass DI
+// fundamental is routinely WEAKER than the 2nd harmonic (amp-sim DIs,
+// compression, roll-off below ~60 Hz — see _ndHpsDetect), so the guitar gate
+// false-rejects real bass notes; bass uses a low ratio that still rejects a
+// true octave impostor (which has ~no energy at f0) but passes a weak-but-
+// present fundamental. Rides the IPC — no native rebuild to recalibrate.
+const _ND_VERIFY_FUNDAMENTAL_RATIO = 0.20;
+const _ND_VERIFY_FUNDAMENTAL_RATIO_BASS = 0.08;
+
+// Per-arrangement harmonic-comb verify parameters. `harmonicSnr` and
+// `fundamentalRatio` feed both the setChart payload and the scoreChord
+// harmonic-verify call. This helper's `pitchCheckCents` feeds only the
+// scoreChord call; setChart's own `pitchCheckCents` field is populated from
+// the user's Pitch-tolerance slider instead, not from this helper.
+function _ndVerifyParamsFor(arrangement) {
+    const bass = arrangement === 'bass';
+    return {
+        pitchCheckCents: bass ? _ND_VERIFY_PITCH_CENTS_BASS : _ND_VERIFY_PITCH_CENTS,
+        harmonicSnr: bass ? _ND_VERIFY_HARMONIC_SNR_BASS : _ND_VERIFY_HARMONIC_SNR,
+        fundamentalRatio: bass ? _ND_VERIFY_FUNDAMENTAL_RATIO_BASS : _ND_VERIFY_FUNDAMENTAL_RATIO,
+    };
+}
 
 // Tuning tables — standard-tuning MIDI base per (arrangement, stringCount).
 //
@@ -504,6 +545,23 @@ function _ndNextPow2(n) {
     let p = 1;
     while (p < n) p <<= 1;
     return p;
+}
+
+// Minimum samples to accumulate before a single-note detection frame. Guitar
+// keeps the proven _ND_MIN_YIN_SAMPLES (4096). Bass must span ~2 periods of
+// the lowest detectable fundamental (_ND_MIN_DETECTABLE_HZ, B0 ≈ 31 Hz) for
+// YIN/HPS to lock it — at 96 kHz that exceeds 4096, so a fixed buffer drops
+// low bass silently (the "undersized buffer" warning). Size from the device
+// rate so the floor holds at 44.1, 48, 96, 192 kHz.
+function _ndMinAnalysisSamples(arrangement, sampleRate) {
+    if (arrangement !== 'bass' || !(sampleRate > 0)) return _ND_MIN_YIN_SAMPLES;
+    // Exact two-period floor — do NOT round up to a power of two. YIN's
+    // difference loop is O(n²) in buffer length, so an overshoot (e.g. 192 kHz:
+    // 12800 → 16384) adds real CPU for no benefit; _ndFftMagnitude already
+    // zero-pads its own input to a pow2 ≥ resolutionFloor, so the HPS/FFT path
+    // is unaffected by a non-pow2 accumulation length.
+    const need = Math.ceil(2 * sampleRate / _ND_MIN_DETECTABLE_HZ);
+    return Math.max(_ND_MIN_YIN_SAMPLES, need);
 }
 
 // In-place radix-2 Cooley-Tukey on interleaved {re, im} pairs.
@@ -1190,6 +1248,11 @@ function createNoteDetector(options = {}) {
     // singleton writes back to localStorage; non-default instances keep
     // mutations local.
     let detectionMethod = 'yin';
+    // Whether the user explicitly picked a detection method (settings or the
+    // dropdown). When false, a bass arrangement auto-uses HPS — see
+    // _ndEffectiveDetectionMethod — since YIN locks onto the 2nd harmonic of a
+    // weak-fundamental bass note and reports an octave high.
+    let detectionMethodUserSet = false;
     let timingTolerance = 0.150;
     let pitchTolerance = 50;
     let timingHitThreshold = 0.100;
@@ -1270,7 +1333,16 @@ function createNoteDetector(options = {}) {
             // default to the right channel. Same defensive shape as
             // the method allowlist below.
             if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
-            if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
+            const storedMethod = (typeof s.method === 'string'
+                && ['yin', 'hps', 'crepe'].includes(s.method)) ? s.method : null;
+            if (storedMethod) detectionMethod = storedMethod;
+            // A persisted `method` alone is NOT a manual override: saveSettings()
+            // always writes the current method, including the untouched default
+            // 'yin'. Treat it as user-set only when the explicit flag is stored,
+            // or a VALIDATED non-default method was stored — otherwise a returning
+            // user who only changed an unrelated setting (or has a corrupted
+            // method value) would lose bass auto-HPS.
+            detectionMethodUserSet = !!s.methodUserSet || (storedMethod !== null && storedMethod !== 'yin');
             // Clamp tolerances to the UI slider ranges (30–300ms, 10–100c)
             // before deriving hit thresholds so a stale or manually-edited
             // stored value can't produce an invalid range input or a hit
@@ -1747,6 +1819,9 @@ function createNoteDetector(options = {}) {
                 deviceId: selectedDeviceId,
                 channel: selectedChannel,
                 method: detectionMethod,
+                // Explicit override flag so the loader can tell a deliberate
+                // method choice from the always-persisted default (see load).
+                methodUserSet: detectionMethodUserSet,
                 timingTolerance,
                 pitchTolerance,
                 timingHitThreshold,
@@ -2070,9 +2145,12 @@ function createNoteDetector(options = {}) {
                 const combined = new Float32Array(prev.length + input.length);
                 combined.set(prev);
                 combined.set(input, prev.length);
-                if (combined.length >= _ND_MIN_YIN_SAMPLES) {
-                    const start = combined.length - _ND_MIN_YIN_SAMPLES;
-                    pendingBuffer = combined.slice(start, start + _ND_MIN_YIN_SAMPLES);
+                // Bass needs a longer window to resolve its low fundamental;
+                // size the analysis frame from the arrangement + device rate.
+                const minSamples = _ndMinAnalysisSamples(currentArrangement, audioCtx.sampleRate);
+                if (combined.length >= minSamples) {
+                    const start = combined.length - minSamples;
+                    pendingBuffer = combined.slice(start, start + minSamples);
                     accumBuffer = new Float32Array(0);
                 } else {
                     accumBuffer = combined;
@@ -2415,7 +2493,8 @@ function createNoteDetector(options = {}) {
         // sample rate cached at startAudio() time instead. Browser
         // path keeps reading audioCtx.sampleRate.
         const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
-        switch (detectionMethod) {
+        const activeMethod = _ndEffectiveDetectionMethod();
+        switch (activeMethod) {
             case 'crepe':
                 if (_ndShared.model) {
                     result = await _ndCrepeDetect(buffer);
@@ -2466,7 +2545,10 @@ function createNoteDetector(options = {}) {
         }
 
         // Stamp the detector identity for the diagnostic — web JS-DSP path.
-        _diagDetector = { desktop_bridge: false, ml: false, path: 'web-' + detectionMethod };
+        // Use `detectorUsed` (the detector that actually ran this frame), so an
+        // auto-HPS bass frame reports as hps AND a crepe→yin low-confidence/
+        // missing-model fallback reports the real yin, not the requested crepe.
+        _diagDetector = { desktop_bridge: false, ml: false, path: 'web-' + (detectorUsed || activeMethod) };
 
         // Pass the current frame's buffer through to matchNotes so the
         // chord scorer can run on the same audio that was just analysed
@@ -3052,6 +3134,10 @@ function createNoteDetector(options = {}) {
         }
         const _ndSingleResult = new Map();   // cn -> per-note band-energy result
         if (_ndSingleNotes.length > 0) {
+            // Compute the arrangement-aware verify params once per tick — both
+            // the desktop-bridge scoreChord call and the browser fallback below
+            // read from this, instead of re-allocating the object per field.
+            const verifyParams = _ndVerifyParamsFor(currentArrangement);
             let batch = null;
             if (usingDesktopBridge) {
                 if (bridgeDesktop && bridgeDesktop.audio
@@ -3070,11 +3156,15 @@ function createNoteDetector(options = {}) {
                         // pitch_tolerance_cents straight into the DSP scorer
                         // made it reject ~90% of correctly-played notes — a
                         // spectral peak is far coarser than a ±10-cent gate.
-                        pitchCheckCents: _ND_VERIFY_PITCH_CENTS,
+                        // Bass relaxes the pitch window + fundamental-presence
+                        // gate (see _ndVerifyParamsFor) — its DI fundamental is
+                        // weak and its low bins resolve pitch coarsely.
+                        pitchCheckCents: verifyParams.pitchCheckCents,
                         minHitRatio: chordHitRatio,   // unused — per-note results read directly
                         bypassMl: true,               // force the DSP scorer, not the ML path
                         harmonicVerify: true,         // harmonic-comb check, not band-energy/total
-                        harmonicSnr: _ND_VERIFY_HARMONIC_SNR,
+                        harmonicSnr: verifyParams.harmonicSnr,
+                        fundamentalRatio: verifyParams.fundamentalRatio,
                         notes: _ndSingleNotes.map(cn => ({
                             s: cn.s, f: cn.f,
                             ho: !!cn.ho, po: !!cn.po,
@@ -3097,7 +3187,13 @@ function createNoteDetector(options = {}) {
                 batch = _ndScoreChord(
                     frameBuffer, sr,
                     _ndSingleNotes, currentArrangement, currentStringCount,
-                    tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS, chordHitRatio
+                    // Same arrangement-aware pitch window as the desktop-bridge
+                    // path above, so bass gets the wider 60c gate in the browser
+                    // fallback too (otherwise the fallback undercuts the bass
+                    // improvement on low strings whose bins resolve coarsely).
+                    tuningOffsets, capo,
+                    verifyParams.pitchCheckCents,
+                    chordHitRatio
                 );
             }
             // results[] is aligned 1:1 with the notes[] array we sent.
@@ -4091,8 +4187,20 @@ function createNoteDetector(options = {}) {
 
     function setMethod(method) {
         detectionMethod = method;
+        detectionMethodUserSet = true;  // explicit choice — disable bass auto-HPS
         saveSettings();
         if (method === 'crepe') _ndLoadCrepe();
+    }
+
+    // The detection method actually used per frame (web path). A bass
+    // arrangement auto-uses HPS when the user has not explicitly chosen a
+    // method and is still on the YIN default: YIN's time-domain autocorrelation
+    // latches onto the 2nd harmonic of a weak-fundamental bass note and reports
+    // an octave high, while HPS reinforces the true fundamental.
+    function _ndEffectiveDetectionMethod() {
+        if (currentArrangement === 'bass' && !detectionMethodUserSet && detectionMethod === 'yin')
+            return 'hps';
+        return detectionMethod;
     }
 
     // Accepts only the documented channel indices (-1 mono, 0 left,
@@ -4843,6 +4951,7 @@ function createNoteDetector(options = {}) {
         }
 
         try {
+            const verifyParams = _ndVerifyParamsFor(currentArrangement);
             const ok = await bridgeDesktop.audio.setChart({
                 arrangement: currentArrangement,
                 stringCount: currentStringCount,
@@ -4852,7 +4961,10 @@ function createNoteDetector(options = {}) {
                 // presence gate — feed the user's Pitch tolerance slider so
                 // it is honoured, rather than a fixed constant.
                 pitchCheckCents: pitchTolerance,
-                harmonicSnr: _ND_VERIFY_HARMONIC_SNR,
+                harmonicSnr: verifyParams.harmonicSnr,
+                // Relax the fundamental-presence gate for bass — its DI
+                // fundamental is legitimately weak (see _ndVerifyParamsFor).
+                fundamentalRatio: verifyParams.fundamentalRatio,
                 timingTolerance,
                 notes,
             });
@@ -7002,6 +7114,7 @@ function createNoteDetector(options = {}) {
             partial = partial || {};
             if (typeof partial.method === 'string' && ['yin', 'hps', 'crepe'].includes(partial.method)) {
                 detectionMethod = partial.method;
+                detectionMethodUserSet = true;  // explicit choice — disable bass auto-HPS
             }
             if (Number.isFinite(partial.timingTolerance)) {
                 timingTolerance = Math.max(0.03, Math.min(0.3, partial.timingTolerance));
@@ -7131,7 +7244,11 @@ function createNoteDetector(options = {}) {
                 outputLatency: Number.isFinite(audioCtx.outputLatency) ? audioCtx.outputLatency : null,
                 sampleRate:    audioCtx.sampleRate,
                 frameSize:     _ND_FRAME_SIZE,
-                yinBufferSize: _ND_MIN_YIN_SAMPLES,
+                // Effective single-note analysis window: bass widens this from
+                // the YIN floor to span ~2 periods of the lowest detectable
+                // fundamental at the device rate (see _ndMinAnalysisSamples), so
+                // report the real value, not the fixed floor.
+                yinBufferSize: _ndMinAnalysisSamples(currentArrangement, audioCtx.sampleRate),
                 state:         audioCtx.state,
             };
         },
@@ -7210,8 +7327,10 @@ function createNoteDetector(options = {}) {
                 // that the harness CLI explicitly rejects — and the
                 // detector would silently fall back to YIN at runtime.
                 // Keep the internal API aligned with the CLI's whitelist.
-                if (typeof s.method === 'string' && ['yin', 'hps'].includes(s.method))
+                if (typeof s.method === 'string' && ['yin', 'hps'].includes(s.method)) {
                     detectionMethod = s.method;
+                    detectionMethodUserSet = true;  // explicit choice — disable bass auto-HPS
+                }
                 if (Number.isFinite(s.pitchTolerance))      pitchTolerance      = s.pitchTolerance;
                 if (Number.isFinite(s.pitchHitThreshold))   pitchHitThreshold   = s.pitchHitThreshold;
                 if (Number.isFinite(s.timingTolerance))     timingTolerance     = s.timingTolerance;
