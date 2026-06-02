@@ -253,7 +253,10 @@ const _ND_VERIFY_HARMONIC_SNR_BASS = 2.0;
 const _ND_VERIFY_FUNDAMENTAL_RATIO = 0.20;
 const _ND_VERIFY_FUNDAMENTAL_RATIO_BASS = 0.08;
 
-// Per-arrangement harmonic-comb verify parameters for setChart / scoreChord.
+// Per-arrangement harmonic-comb verify parameters. `harmonicSnr` and
+// `fundamentalRatio` feed both the setChart payload and the scoreChord
+// harmonic-verify call; `pitchCheckCents` feeds only the scoreChord call
+// (setChart carries its own `pitchTolerance`, not this value).
 function _ndVerifyParamsFor(arrangement) {
     const bass = arrangement === 'bass';
     return {
@@ -551,7 +554,12 @@ function _ndNextPow2(n) {
 // rate so the floor holds at 44.1, 48, 96, 192 kHz.
 function _ndMinAnalysisSamples(arrangement, sampleRate) {
     if (arrangement !== 'bass' || !(sampleRate > 0)) return _ND_MIN_YIN_SAMPLES;
-    const need = _ndNextPow2(Math.ceil(2 * sampleRate / _ND_MIN_DETECTABLE_HZ));
+    // Exact two-period floor — do NOT round up to a power of two. YIN's
+    // difference loop is O(n²) in buffer length, so an overshoot (e.g. 192 kHz:
+    // 12800 → 16384) adds real CPU for no benefit; _ndFftMagnitude already
+    // zero-pads its own input to a pow2 ≥ resolutionFloor, so the HPS/FFT path
+    // is unaffected by a non-pow2 accumulation length.
+    const need = Math.ceil(2 * sampleRate / _ND_MIN_DETECTABLE_HZ);
     return Math.max(_ND_MIN_YIN_SAMPLES, need);
 }
 
@@ -1324,7 +1332,13 @@ function createNoteDetector(options = {}) {
             // default to the right channel. Same defensive shape as
             // the method allowlist below.
             if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
-            if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) { detectionMethod = s.method; detectionMethodUserSet = true; }
+            if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
+            // A persisted `method` alone is NOT a manual override: saveSettings()
+            // always writes the current method, including the untouched default
+            // 'yin'. Treat it as user-set only when the explicit flag is stored,
+            // or the stored method is non-default — otherwise a returning user
+            // who only changed an unrelated setting would lose bass auto-HPS.
+            detectionMethodUserSet = !!s.methodUserSet || (!!s.method && s.method !== 'yin');
             // Clamp tolerances to the UI slider ranges (30–300ms, 10–100c)
             // before deriving hit thresholds so a stale or manually-edited
             // stored value can't produce an invalid range input or a hit
@@ -1801,6 +1815,9 @@ function createNoteDetector(options = {}) {
                 deviceId: selectedDeviceId,
                 channel: selectedChannel,
                 method: detectionMethod,
+                // Explicit override flag so the loader can tell a deliberate
+                // method choice from the always-persisted default (see load).
+                methodUserSet: detectionMethodUserSet,
                 timingTolerance,
                 pitchTolerance,
                 timingHitThreshold,
@@ -2524,8 +2541,10 @@ function createNoteDetector(options = {}) {
         }
 
         // Stamp the detector identity for the diagnostic — web JS-DSP path.
-        // Use the effective method so an auto-HPS bass frame is reported as hps.
-        _diagDetector = { desktop_bridge: false, ml: false, path: 'web-' + activeMethod };
+        // Use `detectorUsed` (the detector that actually ran this frame), so an
+        // auto-HPS bass frame reports as hps AND a crepe→yin low-confidence/
+        // missing-model fallback reports the real yin, not the requested crepe.
+        _diagDetector = { desktop_bridge: false, ml: false, path: 'web-' + (detectorUsed || activeMethod) };
 
         // Pass the current frame's buffer through to matchNotes so the
         // chord scorer can run on the same audio that was just analysed
