@@ -1333,13 +1333,16 @@ function createNoteDetector(options = {}) {
             // default to the right channel. Same defensive shape as
             // the method allowlist below.
             if (['mono', 'left', 'right'].includes(s.channel)) selectedChannel = s.channel;
-            if (s.method && ['yin', 'hps', 'crepe'].includes(s.method)) detectionMethod = s.method;
+            const storedMethod = (typeof s.method === 'string'
+                && ['yin', 'hps', 'crepe'].includes(s.method)) ? s.method : null;
+            if (storedMethod) detectionMethod = storedMethod;
             // A persisted `method` alone is NOT a manual override: saveSettings()
             // always writes the current method, including the untouched default
             // 'yin'. Treat it as user-set only when the explicit flag is stored,
-            // or the stored method is non-default — otherwise a returning user
-            // who only changed an unrelated setting would lose bass auto-HPS.
-            detectionMethodUserSet = !!s.methodUserSet || (!!s.method && s.method !== 'yin');
+            // or a VALIDATED non-default method was stored — otherwise a returning
+            // user who only changed an unrelated setting (or has a corrupted
+            // method value) would lose bass auto-HPS.
+            detectionMethodUserSet = !!s.methodUserSet || (storedMethod !== null && storedMethod !== 'yin');
             // Clamp tolerances to the UI slider ranges (30–300ms, 10–100c)
             // before deriving hit thresholds so a stale or manually-edited
             // stored value can't produce an invalid range input or a hit
