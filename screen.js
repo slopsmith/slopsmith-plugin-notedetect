@@ -3769,6 +3769,33 @@ function createNoteDetector(options = {}) {
         else sec.misses++;
     }
 
+    // slopsmith#502 — scrollable gear popover steals horizontal drags from
+    // range sliders. Lock panel scroll while a slider is active; UI-only.
+    function _ndWireSettingsRangeScrollLock(panel) {
+        if (!panel || panel._ndRangeScrollLock) return;
+        panel._ndRangeScrollLock = true;
+
+        const release = () => {
+            panel.style.overflowY = 'auto';
+            panel.classList.remove('nd-settings-panel--slider-drag');
+        };
+
+        for (const el of panel.querySelectorAll('input[type=range]')) {
+            el.style.touchAction = 'none';
+            el.style.userSelect = 'none';
+
+            el.addEventListener('pointerdown', (e) => {
+                panel.style.overflowY = 'hidden';
+                panel.classList.add('nd-settings-panel--slider-drag');
+                try { el.setPointerCapture(e.pointerId); } catch (_) { /* host */ }
+            });
+
+            el.addEventListener('pointerup', release);
+            el.addEventListener('pointercancel', release);
+            el.addEventListener('lostpointercapture', release);
+        }
+    }
+
     // ── Settings panel ────────────────────────────────────────────────
     function showSettings() {
         let panel = instanceRoot.querySelector('.nd-settings-panel');
@@ -4153,6 +4180,7 @@ function createNoteDetector(options = {}) {
             saveSettings();
         };
 
+        _ndWireSettingsRangeScrollLock(panel);
         populateDevices();
     }
 
