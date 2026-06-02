@@ -3179,7 +3179,13 @@ function createNoteDetector(options = {}) {
                 batch = _ndScoreChord(
                     frameBuffer, sr,
                     _ndSingleNotes, currentArrangement, currentStringCount,
-                    tuningOffsets, capo, _ND_VERIFY_PITCH_CENTS, chordHitRatio
+                    // Same arrangement-aware pitch window as the desktop-bridge
+                    // path above, so bass gets the wider 60c gate in the browser
+                    // fallback too (otherwise the fallback undercuts the bass
+                    // improvement on low strings whose bins resolve coarsely).
+                    tuningOffsets, capo,
+                    _ndVerifyParamsFor(currentArrangement).pitchCheckCents,
+                    chordHitRatio
                 );
             }
             // results[] is aligned 1:1 with the notes[] array we sent.
@@ -7229,7 +7235,11 @@ function createNoteDetector(options = {}) {
                 outputLatency: Number.isFinite(audioCtx.outputLatency) ? audioCtx.outputLatency : null,
                 sampleRate:    audioCtx.sampleRate,
                 frameSize:     _ND_FRAME_SIZE,
-                yinBufferSize: _ND_MIN_YIN_SAMPLES,
+                // Effective single-note analysis window: bass widens this from
+                // the YIN floor to span ~2 periods of the lowest detectable
+                // fundamental at the device rate (see _ndMinAnalysisSamples), so
+                // report the real value, not the fixed floor.
+                yinBufferSize: _ndMinAnalysisSamples(currentArrangement, audioCtx.sampleRate),
                 state:         audioCtx.state,
             };
         },
