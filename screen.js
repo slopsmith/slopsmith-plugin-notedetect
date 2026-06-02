@@ -255,8 +255,9 @@ const _ND_VERIFY_FUNDAMENTAL_RATIO_BASS = 0.08;
 
 // Per-arrangement harmonic-comb verify parameters. `harmonicSnr` and
 // `fundamentalRatio` feed both the setChart payload and the scoreChord
-// harmonic-verify call; `pitchCheckCents` feeds only the scoreChord call
-// (setChart carries its own `pitchTolerance`, not this value).
+// harmonic-verify call. This helper's `pitchCheckCents` feeds only the
+// scoreChord call; setChart's own `pitchCheckCents` field is populated from
+// the user's Pitch-tolerance slider instead, not from this helper.
 function _ndVerifyParamsFor(arrangement) {
     const bass = arrangement === 'bass';
     return {
@@ -3130,6 +3131,10 @@ function createNoteDetector(options = {}) {
         }
         const _ndSingleResult = new Map();   // cn -> per-note band-energy result
         if (_ndSingleNotes.length > 0) {
+            // Compute the arrangement-aware verify params once per tick — both
+            // the desktop-bridge scoreChord call and the browser fallback below
+            // read from this, instead of re-allocating the object per field.
+            const verifyParams = _ndVerifyParamsFor(currentArrangement);
             let batch = null;
             if (usingDesktopBridge) {
                 if (bridgeDesktop && bridgeDesktop.audio
@@ -3151,12 +3156,12 @@ function createNoteDetector(options = {}) {
                         // Bass relaxes the pitch window + fundamental-presence
                         // gate (see _ndVerifyParamsFor) — its DI fundamental is
                         // weak and its low bins resolve pitch coarsely.
-                        pitchCheckCents: _ndVerifyParamsFor(currentArrangement).pitchCheckCents,
+                        pitchCheckCents: verifyParams.pitchCheckCents,
                         minHitRatio: chordHitRatio,   // unused — per-note results read directly
                         bypassMl: true,               // force the DSP scorer, not the ML path
                         harmonicVerify: true,         // harmonic-comb check, not band-energy/total
-                        harmonicSnr: _ndVerifyParamsFor(currentArrangement).harmonicSnr,
-                        fundamentalRatio: _ndVerifyParamsFor(currentArrangement).fundamentalRatio,
+                        harmonicSnr: verifyParams.harmonicSnr,
+                        fundamentalRatio: verifyParams.fundamentalRatio,
                         notes: _ndSingleNotes.map(cn => ({
                             s: cn.s, f: cn.f,
                             ho: !!cn.ho, po: !!cn.po,
@@ -3184,7 +3189,7 @@ function createNoteDetector(options = {}) {
                     // fallback too (otherwise the fallback undercuts the bass
                     // improvement on low strings whose bins resolve coarsely).
                     tuningOffsets, capo,
-                    _ndVerifyParamsFor(currentArrangement).pitchCheckCents,
+                    verifyParams.pitchCheckCents,
                     chordHitRatio
                 );
             }
@@ -4943,6 +4948,7 @@ function createNoteDetector(options = {}) {
         }
 
         try {
+            const verifyParams = _ndVerifyParamsFor(currentArrangement);
             const ok = await bridgeDesktop.audio.setChart({
                 arrangement: currentArrangement,
                 stringCount: currentStringCount,
@@ -4952,10 +4958,10 @@ function createNoteDetector(options = {}) {
                 // presence gate — feed the user's Pitch tolerance slider so
                 // it is honoured, rather than a fixed constant.
                 pitchCheckCents: pitchTolerance,
-                harmonicSnr: _ndVerifyParamsFor(currentArrangement).harmonicSnr,
+                harmonicSnr: verifyParams.harmonicSnr,
                 // Relax the fundamental-presence gate for bass — its DI
                 // fundamental is legitimately weak (see _ndVerifyParamsFor).
-                fundamentalRatio: _ndVerifyParamsFor(currentArrangement).fundamentalRatio,
+                fundamentalRatio: verifyParams.fundamentalRatio,
                 timingTolerance,
                 notes,
             });
