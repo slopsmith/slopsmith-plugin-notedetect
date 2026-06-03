@@ -4556,11 +4556,22 @@ function createNoteDetector(options = {}) {
     }
 
     function injectButton(bar) {
-        const controls = bar || document.getElementById('player-controls');
+        // v3: mount into the host's plugin-control slot (a stable container in
+        // the Plugins rail popover) rather than the auto-hiding #player-controls
+        // transport. We mount here directly instead of letting the host's
+        // re-homing shim move us, because moving the button out of
+        // #player-controls would break the `controls.contains(detectBtn)`
+        // idempotency guard below (it would re-create the button every song).
+        const slot = (window.slopsmith && window.slopsmith.uiVersion === 'v3'
+            && window.slopsmith.ui && typeof window.slopsmith.ui.playerControlSlot === 'function')
+            ? window.slopsmith.ui.playerControlSlot() : null;
+        const controls = slot || bar || document.getElementById('player-controls');
         if (!controls) return;
         if (detectBtn && controls.contains(detectBtn)) return;
 
-        const closeBtn = controls.querySelector('button:last-child');
+        // Legacy inserts before the \u2715 Close button; the v3 slot has no such
+        // anchor, so just append there.
+        const closeBtn = slot ? null : controls.querySelector('button:last-child');
 
         detectBtn = document.createElement('button');
         detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
