@@ -253,6 +253,20 @@ const _ND_VERIFY_HARMONIC_SNR_BASS = 2.0;
 const _ND_VERIFY_FUNDAMENTAL_RATIO = 0.20;
 const _ND_VERIFY_FUNDAMENTAL_RATIO_BASS = 0.08;
 
+// Temporal-persistence floor for the engine NoteVerifier (setChart
+// `presenceRatio`): a chart note counts as hit only when the comb confirms its
+// pitch in at least this FRACTION of the frames scored in its window, instead
+// of the legacy "ever present" (any single frame). Measured against real
+// wrong-position bass DI takes: a correctly-fretted note rings present through
+// ~70-100% of its frames, while a note played 2 frets off only flickers present
+// on a handful of stray frames (its harmonics don't align with the comb), so a
+// 0.3 floor cuts wrong-position false-accepts ~70-95% with no loss on the
+// correct take. Guitar keeps 0 (legacy ever-present, byte-identical) — guitar
+// was never reported to false-accept and a floor risks dropping fast/staccato
+// passages. Rides the IPC — no native rebuild to recalibrate.
+const _ND_VERIFY_PRESENCE_RATIO = 0.0;
+const _ND_VERIFY_PRESENCE_RATIO_BASS = 0.3;
+
 // Per-arrangement harmonic-comb verify parameters. `harmonicSnr` and
 // `fundamentalRatio` feed both the setChart payload and the scoreChord
 // harmonic-verify call. This helper's `pitchCheckCents` feeds only the
@@ -264,6 +278,7 @@ function _ndVerifyParamsFor(arrangement) {
         pitchCheckCents: bass ? _ND_VERIFY_PITCH_CENTS_BASS : _ND_VERIFY_PITCH_CENTS,
         harmonicSnr: bass ? _ND_VERIFY_HARMONIC_SNR_BASS : _ND_VERIFY_HARMONIC_SNR,
         fundamentalRatio: bass ? _ND_VERIFY_FUNDAMENTAL_RATIO_BASS : _ND_VERIFY_FUNDAMENTAL_RATIO,
+        presenceRatio: bass ? _ND_VERIFY_PRESENCE_RATIO_BASS : _ND_VERIFY_PRESENCE_RATIO,
     };
 }
 
@@ -4965,6 +4980,10 @@ function createNoteDetector(options = {}) {
                 // Relax the fundamental-presence gate for bass — its DI
                 // fundamental is legitimately weak (see _ndVerifyParamsFor).
                 fundamentalRatio: verifyParams.fundamentalRatio,
+                // Temporal-persistence floor — bass rejects wrong-position notes
+                // that only flicker present on a few frames (see
+                // _ndVerifyParamsFor). 0 on guitar keeps the legacy any-frame rule.
+                presenceRatio: verifyParams.presenceRatio,
                 timingTolerance,
                 notes,
             });
