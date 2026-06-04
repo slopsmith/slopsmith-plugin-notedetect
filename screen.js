@@ -4575,7 +4575,7 @@ function createNoteDetector(options = {}) {
         if (!controls) return;
         if (detectBtn && controls.contains(detectBtn)) return;
 
-        const closeBtn = controls.querySelector('button:last-child');
+        const closeBtn = controls.querySelector(':scope > button:last-of-type');
 
         detectBtn = document.createElement('button');
         detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
