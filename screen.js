@@ -6349,12 +6349,6 @@ function createNoteDetector(options = {}) {
         _syncChartStateFromHw();
         _chartStateBindEvents();
 
-        // Auto-record every play (default singleton only; no-op otherwise).
-        // Bound here, with the other enable-time song listeners, so it's
-        // only live while detection is — capture taps the detector graph,
-        // and the vm tests (which can't enable()) never register it.
-        _bindAutoRecord();
-
         resetScoring();
 
         // Queue the audio acquisition through the shared chain so
@@ -6440,6 +6434,15 @@ function createNoteDetector(options = {}) {
         }, 5000);
 
         if (detectionMethod === 'crepe') _ndLoadCrepe();
+
+        // Auto-record every play (default singleton only; no-op otherwise).
+        // Bound only here, on the fully-enabled path after audio is up, and
+        // unbound in disable() — so the song listeners never linger or arm
+        // a take while Detect is off (a plain disable() doesn't flip
+        // detectPreference, so a stale listener could otherwise fire). The
+        // vm tests can't enable(), so they never register it, keeping the
+        // listener-count contracts intact.
+        _bindAutoRecord();
         return true;
     }
 
@@ -6458,6 +6461,10 @@ function createNoteDetector(options = {}) {
         sessionGen++;
         stopAudio();
         stopHUD();
+        // Auto-record is the one enable-bound listener we drop on disable()
+        // (not only on destroy): its handler arms/saves takes, so it must
+        // not stay live while Detect is off. Re-enable rebinds it.
+        _unbindAutoRecord();
         if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
         if (gcInterval) { clearInterval(gcInterval); gcInterval = null; }
         for (const tid of flashTimeouts) clearTimeout(tid);
