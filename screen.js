@@ -267,6 +267,14 @@ const _ND_VERIFY_FUNDAMENTAL_RATIO_BASS = 0.08;
 const _ND_VERIFY_PRESENCE_RATIO = 0.0;
 const _ND_VERIFY_PRESENCE_RATIO_BASS = 0.3;
 
+// Fraction of a verify target's strings that must ring for notedetect:verify
+// to fire. Deliberately FIXED and independent of the user-facing gameplay
+// `chordHitRatio` slider: a verify consumer (Step Mode) needs stable,
+// predictable chord acceptance, not one that drifts with a scoring preference.
+// 0.5 keeps it forgiving (single notes are 1/1 = always pass) without letting
+// a 2-of-5 partial voicing count as the chord.
+const _ND_VERIFY_MIN_HIT_RATIO = 0.5;
+
 // Per-arrangement harmonic-comb verify parameters. `harmonicSnr` and
 // `fundamentalRatio` feed both the setChart payload and the scoreChord
 // harmonic-verify call. This helper's `pitchCheckCents` feeds only the
@@ -3175,6 +3183,7 @@ function createNoteDetector(options = {}) {
             if (!bridgeDesktop || !bridgeDesktop.audio
                 || typeof bridgeDesktop.audio.scoreChord !== 'function') return;
             const gen = sessionGen;
+            const sig = _ndChartSignature();
             try {
                 result = await bridgeDesktop.audio.scoreChord({
                     arrangement: currentArrangement,
@@ -3182,7 +3191,7 @@ function createNoteDetector(options = {}) {
                     offsets: tuningOffsets.slice(0, currentStringCount),
                     capo,
                     pitchCheckCents: verifyParams.pitchCheckCents,
-                    minHitRatio: chordHitRatio,
+                    minHitRatio: _ND_VERIFY_MIN_HIT_RATIO,
                     bypassMl: true,               // force the DSP scorer, not the ML path
                     harmonicVerify: true,         // harmonic-comb check, not band-energy/total
                     harmonicSnr: verifyParams.harmonicSnr,
@@ -3192,17 +3201,18 @@ function createNoteDetector(options = {}) {
             } catch (e) { return; }
             if (!enabled || gen !== sessionGen) return;
             // The IPC round-trip yields; if the consumer cleared or replaced
-            // the target meanwhile, this result is for a stale note — drop it
-            // so we don't fire verify for the wrong step. setVerifyTarget
-            // always stores a fresh array, so an identity check suffices.
+            // the target, or a song/arrangement switch changed the chart
+            // (neither bumps sessionGen), this result is for a stale note —
+            // drop it so we don't fire verify for the wrong step.
             if (_verifyTarget !== target) return;
+            if (_ndChartSignature() !== sig) return;
         } else {
             if (!frameBuffer) return;
             const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
             result = _ndScoreChord(
                 frameBuffer, sr, target,
                 currentArrangement, currentStringCount, tuningOffsets, capo,
-                verifyParams.pitchCheckCents, chordHitRatio
+                verifyParams.pitchCheckCents, _ND_VERIFY_MIN_HIT_RATIO
             );
         }
         if (result && result.isHit) {
