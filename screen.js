@@ -1696,6 +1696,11 @@ function createNoteDetector(options = {}) {
     let detectInterval = null;
     let levelRaf = null;
     let bridgeLevelTimer = null;  // setInterval for the desktop-bridge level meter
+    // Capability latch: true once we confirm the bridge engine has no
+    // getLevels, so the sustain glow can fall back to a fixed alpha. Distinct
+    // from `!bridgeLevelTimer` (which is also true mid-startup/after teardown);
+    // defaults false so we level-gate until the capability is actually known.
+    let bridgeLevelsUnavailable = false;
     let hudInterval = null;
     let missCheckInterval = null;
     let gcInterval = null;
@@ -1992,14 +1997,29 @@ function createNoteDetector(options = {}) {
                                     if (!enabled || gen !== sessionGen) return;
                                     if (lp && typeof lp.midiNote === 'number' && lp.midiNote >= 0
                                         && typeof lp.confidence === 'number'
-                                        && lp.confidence >= detectionConfidenceMin) {
+                                        // Strict `>` to match _sustainStillHeld's
+                                        // gate — a confidence landing exactly on
+                                        // the threshold must not store a pitch the
+                                        // hold logic would then ignore (flicker).
+                                        && lp.confidence > detectionConfidenceMin) {
                                         detectedMidi = lp.midiNote;
                                         detectedConfidence = lp.confidence;
                                     } else {
                                         detectedMidi = -1;
                                         detectedConfidence = 0;
                                     }
-                                } catch (_) { /* transient IPC hiccup — keep last */ }
+                                } catch (_) {
+                                    // Clear on failure, don't keep-last: the sustain
+                                    // glow is driven from detectedMidi, and
+                                    // _sustainStillHeld refreshes its grace window
+                                    // every render. Holding a stale pitch across
+                                    // repeated IPC failures would keep a muted note
+                                    // glowing indefinitely. Clearing still lets
+                                    // NOTE_SUS_GRACE_MS bridge a one-off hiccup, then
+                                    // expire if the failures persist.
+                                    detectedMidi = -1;
+                                    detectedConfidence = 0;
+                                }
                                 _diagDetector = {
                                     desktop_bridge: true,
                                     ml: bridgeMlActive,
@@ -2380,9 +2400,18 @@ function createNoteDetector(options = {}) {
         // Bail before installing the timer if the engine doesn't expose
         // getLevels — otherwise we'd run a no-op poll forever, leak the
         // interval, and never surface the missing capability.
-        if (!desktop || !desktop.audio || typeof desktop.audio.getLevels !== 'function') {
+        if (!desktop || !desktop.audio) {
+            // Bridge/audio not ready yet — a timing state, NOT a capability
+            // verdict. Don't latch unavailable here, or a pre-init call would
+            // wrongly force fixed full glow; leave the latch for a confirmed
+            // missing getLevels below.
             return;
         }
+        if (typeof desktop.audio.getLevels !== 'function') {
+            bridgeLevelsUnavailable = true;
+            return;
+        }
+        bridgeLevelsUnavailable = false;
         // In-flight guard — if an IPC `getLevels()` round-trip takes
         // longer than the 50 ms timer, queueing further calls would
         // build up a backlog and process stale readings out-of-order.
@@ -2680,6 +2709,14 @@ function createNoteDetector(options = {}) {
     // Live-level → sustain-glow alpha. Returns 0 when the string isn't ringing
     // above the threshold (the caller then leaves the gem un-lit).
     function _ndSustainGlowAlpha() {
+        // Fixed-glow fallback for bridge builds whose engine lacks getLevels:
+        // startBridgeLevelMeter() bails (latching bridgeLevelsUnavailable), so
+        // inputLevel never moves off 0 and a level-gated glow would never light
+        // at all. Preserve the pre-level-metering behaviour (full glow) so
+        // sustained notes still show as active on those builds. Keyed on the
+        // capability latch — not `!bridgeLevelTimer`, which is also true during
+        // startup/teardown and would wrongly force full glow then.
+        if (usingDesktopBridge && bridgeLevelsUnavailable) return 1;
         if (!(inputLevel > NOTE_GLOW_LEVEL_THRESHOLD)) return 0;
         const span = NOTE_GLOW_REF_LEVEL - NOTE_GLOW_LEVEL_THRESHOLD;
         const a = span > 0 ? (inputLevel - NOTE_GLOW_LEVEL_THRESHOLD) / span : 1;

@@ -34,11 +34,12 @@ const AV_OFFSET_MS = 240;
 
 // Build an engine-verifier sandbox. `verdictQueue` is drained one entry per
 // getNoteVerdicts call; each entry is the array that call resolves to.
-function engineVerifierSandbox({ withVerifierApi = true } = {}) {
+function engineVerifierSandbox({ withVerifierApi = true, withRawPitch = false } = {}) {
     const calls = {
         setChart: 0,
         getNoteVerdicts: 0,
         getPitchDetection: 0,
+        getRawPitch: 0,
         getUserMedia: 0,
     };
     const getVerdictsArgs = [];   // [songTime, playing] per call
@@ -57,6 +58,14 @@ function engineVerifierSandbox({ withVerifierApi = true } = {}) {
             return { midiNote: -1, confidence: 0, frequency: -1, cents: 0, noteName: '' };
         },
     };
+    if (withRawPitch) {
+        // Post-noise-gate live pitch. The engine-verifier detect tick should
+        // prefer this over getPitchDetection for the provisional on-strike glow.
+        audio.getRawPitch = async () => {
+            calls.getRawPitch++;
+            return { midiNote: -1, confidence: 0, frequency: -1, cents: 0, noteName: '' };
+        };
+    }
     if (withVerifierApi) {
         audio.setChart = async (chart) => {
             calls.setChart++;
@@ -271,6 +280,48 @@ test('engine-verifier path: silence gate forces miss when input level is sub-thr
     assert.equal(env.hitEvents.length, 0,
         'no notedetect:hit event should be dispatched when the gate fires');
     assert.equal(env.missEvents.length, 1, 'one notedetect:miss event should be dispatched');
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
+test('engine-verifier path: live-pitch poll prefers getRawPitch when the addon exposes it', async () => {
+    // The provisional on-strike sustain glow reads detectedMidi from a live
+    // monophonic poll. It must prefer getRawPitch (post-noise-gate → -1 the
+    // instant the string is muted) over getPitchDetection (holds the note
+    // through its decay, keeping muted sustains lit). When getRawPitch exists,
+    // getPitchDetection must NOT be used for this poll.
+    const env = engineVerifierSandbox({ withRawPitch: true });
+    const det = env.createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    const detectTick = await driveDetectTick(env.intervalCallbacks, env.calls);
+    assert.equal(typeof detectTick, 'function', 'a detect tick should be registered');
+    assert.ok(env.calls.getNoteVerdicts >= 1, 'still the engine-verifier path');
+    assert.ok(env.calls.getRawPitch >= 1,
+        'getRawPitch should drive the live-pitch poll when available');
+    assert.equal(env.calls.getPitchDetection, 0,
+        'getPitchDetection must not be polled when getRawPitch is present');
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
+test('engine-verifier path: live-pitch poll falls back to getPitchDetection without getRawPitch', async () => {
+    // An addon that predates getRawPitch still gets a live-pitch poll, via the
+    // getPitchDetection fallback (its decay-hold is a known downlevel tradeoff).
+    const env = engineVerifierSandbox({ withRawPitch: false });
+    const det = env.createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+
+    const detectTick = await driveDetectTick(env.intervalCallbacks, env.calls);
+    assert.equal(typeof detectTick, 'function', 'a detect tick should be registered');
+    assert.ok(env.calls.getNoteVerdicts >= 1, 'still the engine-verifier path');
+    assert.equal(env.calls.getRawPitch, 0, 'no getRawPitch on a downlevel addon');
+    assert.ok(env.calls.getPitchDetection >= 1,
+        'getPitchDetection should be the fallback live-pitch poll');
 
     det.destroy();
     await flushPendingAsync();
