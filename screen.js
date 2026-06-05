@@ -1662,6 +1662,10 @@ function createNoteDetector(options = {}) {
     let detectedFret = -1;
     let detectedDisplayMidi = -1;
     let underBufferWarned = false;
+    // Timing-free verify target (see _runVerifyTarget / setVerifyTarget). An
+    // array of {s, f, ...technique flags} or null. When set, every frame
+    // scores it against the live audio and emits notedetect:verify on a hit.
+    let _verifyTarget = null;
     // Last chord constraint result — shown in HUD when no single note is detected.
     // Reset on song change via resetScoring(). `lastChordTime` is the
     // chart timestamp of the chord that produced these readings; the HUD
@@ -2025,6 +2029,15 @@ function createNoteDetector(options = {}) {
                                     ml: bridgeMlActive,
                                     path: 'desktop-engine-verifier',
                                 };
+                                // The engine-verifier path returns before
+                                // matchNotes(), so run the timing-free verify
+                                // target here too (else notedetect:verify never
+                                // fires under the engine verifier). Done LAST so
+                                // the playhead-dependent drain/live-pitch above
+                                // run against this frame's playhead, not a
+                                // post-IPC-shifted one. Bridge path → scoreChord
+                                // IPC; the null buffer is unused there.
+                                if (_verifyTarget) await _runVerifyTarget(null);
                                 return;
                             }
                             // Onset-event detection. detectNotes carries a
@@ -3139,6 +3152,70 @@ function createNoteDetector(options = {}) {
         if (emit) dispatchJudgment(judgment);
     }
 
+    // Timing-free, chart-aware verify hook. When a consumer (e.g. Step Mode,
+    // which freezes the playhead ON a note) has registered a target via
+    // setVerifyTarget(), score that note set against the live audio EVERY
+    // frame, regardless of the playhead, and emit notedetect:verify on a hit.
+    // This is the same harmonic-comb verifier the chart path uses
+    // (_ndScoreChord / scoreChord IPC) but WITHOUT the playhead-relative
+    // timing gate that makes notedetect:hit unusable on a frozen playhead
+    // (#468 / #630). Runs only while a target is set, so it costs nothing in
+    // normal play.
+    async function _runVerifyTarget(frameBuffer) {
+        const target = _verifyTarget;
+        if (!target || !target.length) return;
+        // Same arrangement-aware harmonic-comb verify window the single-note
+        // path uses. Passing the user's tight pitch_tolerance_cents straight
+        // into the DSP scorer rejects ~90% of correctly-played notes (a
+        // spectral peak is far coarser than a ±10-cent gate), so use the
+        // deliberately-generous verify window instead.
+        const verifyParams = _ndVerifyParamsFor(currentArrangement);
+        let result;
+        if (usingDesktopBridge) {
+            if (!bridgeDesktop || !bridgeDesktop.audio
+                || typeof bridgeDesktop.audio.scoreChord !== 'function') return;
+            const gen = sessionGen;
+            try {
+                result = await bridgeDesktop.audio.scoreChord({
+                    arrangement: currentArrangement,
+                    stringCount: currentStringCount,
+                    offsets: tuningOffsets.slice(0, currentStringCount),
+                    capo,
+                    pitchCheckCents: verifyParams.pitchCheckCents,
+                    minHitRatio: chordHitRatio,
+                    bypassMl: true,               // force the DSP scorer, not the ML path
+                    harmonicVerify: true,         // harmonic-comb check, not band-energy/total
+                    harmonicSnr: verifyParams.harmonicSnr,
+                    fundamentalRatio: verifyParams.fundamentalRatio,
+                    notes: target,
+                });
+            } catch (e) { return; }
+            if (!enabled || gen !== sessionGen) return;
+            // The IPC round-trip yields; if the consumer cleared or replaced
+            // the target meanwhile, this result is for a stale note — drop it
+            // so we don't fire verify for the wrong step. setVerifyTarget
+            // always stores a fresh array, so an identity check suffices.
+            if (_verifyTarget !== target) return;
+        } else {
+            if (!frameBuffer) return;
+            const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+            result = _ndScoreChord(
+                frameBuffer, sr, target,
+                currentArrangement, currentStringCount, tuningOffsets, capo,
+                verifyParams.pitchCheckCents, chordHitRatio
+            );
+        }
+        if (result && result.isHit) {
+            dispatchInstanceEvent('notedetect:verify', {
+                isHit: true,
+                score: result.score,
+                hitStrings: result.hitStrings,
+                totalStrings: result.totalStrings,
+                notes: target.map(n => ({ s: n.s, f: n.f })),
+            });
+        }
+    }
+
     async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
@@ -3149,6 +3226,29 @@ function createNoteDetector(options = {}) {
 
         const notes = hw.getNotes();
         const chords = hw.getChords();
+
+        // Timing-free verify target. Run it AFTER snapshotting t / notes /
+        // chords above so the awaited scoreChord IPC (bridge path) can't shift
+        // the chart-scoring playhead by a frame. It's a yield point, so a
+        // notedetect:verify listener may disable detection or switch songs
+        // synchronously — re-validate the session before we score the chart
+        // below, or we'd book stale-session judgments against the old chart.
+        if (_verifyTarget) {
+            const vgen = sessionGen;
+            const vtarget = _verifyTarget;
+            const vsig = _ndChartSignature();
+            await _runVerifyTarget(frameBuffer);
+            // Abort the chart-scoring below if anything a notedetect:verify
+            // listener could touch synchronously changed during the dispatch:
+            // the session (sessionGen), the chart (signature — a song/
+            // arrangement switch doesn't bump sessionGen), or the verify
+            // target itself (a listener calling setVerifyTarget). Otherwise
+            // we'd score the pre-await t/notes/chords snapshot under changed
+            // state and could book a stale judgment for the previous step.
+            if (!enabled || vgen !== sessionGen
+                || _verifyTarget !== vtarget || _ndChartSignature() !== vsig) return;
+        }
+
         const tolerance = timingTolerance;
         const centsTolerance = pitchTolerance;
 
@@ -7187,6 +7287,29 @@ function createNoteDetector(options = {}) {
         disable,
         destroy,
         isEnabled: () => enabled,
+        // Register (or clear, with null) a note set to verify against the live
+        // audio every frame, independent of the chart playhead. Emits
+        // notedetect:verify { isHit, score, ... } on a hit. Lets a frozen-
+        // playhead consumer (Step Mode) ask "is the expected note ringing
+        // now?" using the chart-aware verifier without the timing gate that
+        // makes notedetect:hit unsuitable there (#468 / #630). `notes` is an
+        // array of { s, f, ho?, po?, b?, sl?, hm? }.
+        setVerifyTarget: (notes) => {
+            if (!Array.isArray(notes)) { _verifyTarget = null; return; }
+            // Filter to well-formed positions and store a private copy so a
+            // caller mutating its array can't later break the gate's
+            // "null or non-empty sanitized array" invariant.
+            const clean = notes
+                .filter(n => n
+                    && Number.isInteger(n.s) && n.s >= 0
+                    && Number.isInteger(n.f) && n.f >= 0)
+                .map(n => ({
+                    s: n.s, f: n.f,
+                    ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+                }));
+            _verifyTarget = clean.length ? clean : null;
+        },
+        getVerifyTarget: () => (_verifyTarget ? _verifyTarget.map(n => ({ ...n })) : null),
         getStats: () => ({
             hits, misses, streak, bestStreak,
             accuracy: (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0,
