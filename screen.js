@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.10.0';
+const _ND_VERSION = '1.11.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -1299,6 +1299,12 @@ function createNoteDetector(options = {}) {
     // in the gear popover. Persisted in localStorage alongside the
     // other settings.
     let tuningMode = false;
+    // Auto-record every play (default singleton only) so each take is
+    // captured for later analysis — the teaching-tool goal — without the
+    // user arming anything. Off by default — opt in via Settings. The manual Arm /
+    // Arm-(training) dev surfaces stay behind tuningMode and override
+    // this (we only auto-arm when nothing is already armed for training).
+    let autoRecord = false;
     let missMarkerDuration = 2.0;
     let hitGlowDuration = 0.5;
     let inputGain = 1.0;
@@ -1375,6 +1381,7 @@ function createNoteDetector(options = {}) {
             if (s.showPitchErrors !== undefined) showPitchErrors = !!s.showPitchErrors;
             if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
             if (s.tuningMode !== undefined) tuningMode = !!s.tuningMode;
+            if (s.autoRecord !== undefined) autoRecord = !!s.autoRecord;
             // Persisted on/off preference. Absence keeps the default
             // (true), so fresh installs get Detect on out of the box.
             if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
@@ -1851,6 +1858,7 @@ function createNoteDetector(options = {}) {
                 showPitchErrors,
                 edgeFlash: edgeFlashEnabled,
                 tuningMode,
+                autoRecord,
                 detectEnabled: detectPreference,
                 missMarkerDuration,
                 hitGlowDuration,
@@ -5724,6 +5732,12 @@ function createNoteDetector(options = {}) {
         _syncChartStateFromHw();
         _chartStateBindEvents();
 
+        // Auto-record every play (default singleton only; no-op otherwise).
+        // Bound here, with the other enable-time song listeners, so it's
+        // only live while detection is — capture taps the detector graph,
+        // and the vm tests (which can't enable()) never register it.
+        _bindAutoRecord();
+
         resetScoring();
 
         // Queue the audio acquisition through the shared chain so
@@ -5837,6 +5851,7 @@ function createNoteDetector(options = {}) {
         _endOfSongUnbindEvents();
         _chartStateUnbindEvents();
         _recUnbindEvents();
+        _unbindAutoRecord();
         _liveUnbindEvents();
         // Discard any unsaved recording state — destroying the instance
         // shouldn't write a half-captured WAV (or fire off an upload).
@@ -6951,6 +6966,82 @@ function createNoteDetector(options = {}) {
         _recSubscribed = false;
     }
 
+    // ── Auto-record every play ────────────────────────────────────────
+    // Capture every play for later analysis (the teaching-tool goal),
+    // not just deliberate dev/tuning takes. On song:loaded, arm the
+    // upcoming play so it rides the existing capture + song:ended
+    // auto-save path — no manual Arm. Gated to:
+    //   • the default singleton (isDefault) — so split-screen panels
+    //     don't each save their own WAV, and the test instances
+    //     (always isDefault:false) never bind an extra song:ended
+    //     listener that would break the listener-count assertions;
+    //   • `autoRecord` being on (user opt-out) and `detectPreference`
+    //     (Detect on — capture taps the detector's input graph, so an
+    //     armed-without-Detect take captures nothing).
+    // A song stopped mid-play doesn't emit song:ended (stopAudio), so a
+    // prior take can still be armed when the next song loads. Flush it
+    // first — save if it caught audio, else discard — so two songs never
+    // bleed into one WAV. saveRecordingNow() encodes the WAV
+    // synchronously before its await and only unbinds in its finally, so
+    // we must await it before re-arming or the new take loses its
+    // listeners. A deliberate training take (_recArmedForTraining) is
+    // left untouched.
+    let _autoRecOnLoaded = null, _autoRecOnPause = null, _autoRecOnPlay = null;
+    // Minimum captured seconds before a pause auto-saves — so a brief
+    // pause mid-song (tweaking a setting, then resuming) doesn't spew a
+    // string of tiny fragment WAVs.
+    const _AUTO_REC_MIN_PAUSE_SAVE_S = 3;
+    function _bindAutoRecord() {
+        if (!isDefault || _autoRecOnLoaded) return;
+        if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        // New song loaded → flush any take stranded by a stop (no
+        // song:ended) so two songs don't bleed into one WAV, then arm
+        // the upcoming play.
+        _autoRecOnLoaded = async () => {
+            if (!autoRecord || !detectPreference) return;
+            if (_recArmedForTraining) return;
+            if (_recArmed) {
+                if (_recChunks.length > 0) { try { await saveRecordingNow(); } catch (_) {} }
+                else { discardRecording(); }
+            }
+            armRecording();
+        };
+        // Pause = "done with this take" for the short-take workflow
+        // (play a bit, stop, harness it). Save it — saveRecordingNow()
+        // disarms; the next song:play re-arms a fresh take. Gated on a
+        // minimum length so a resume-after-a-blip doesn't spam fragments.
+        _autoRecOnPause = () => {
+            if (!autoRecord || _recArmedForTraining || !_recArmed) return;
+            const secs = _recTotalSamples / Math.max(1, _recSampleRate);
+            if (_recChunks.length > 0 && secs >= _AUTO_REC_MIN_PAUSE_SAVE_S) {
+                saveRecordingNow().catch(() => {});
+            }
+        };
+        // Re-arm on play when nothing's armed — covers resume after a
+        // pause-save, and a play not preceded by a fresh song:loaded.
+        // armRecording() binds its own _recOnPlay AFTER this play event
+        // already fired, so set _recSongPlaying here or the first frames
+        // of the resumed take wouldn't be captured.
+        _autoRecOnPlay = () => {
+            if (!autoRecord || !detectPreference || _recArmedForTraining || _recArmed) return;
+            armRecording();
+            _recSongPlaying = true;
+        };
+        try {
+            window.slopsmith.on('song:loaded', _autoRecOnLoaded);
+            window.slopsmith.on('song:pause',  _autoRecOnPause);
+            window.slopsmith.on('song:play',   _autoRecOnPlay);
+        } catch (_) { _unbindAutoRecord(); }
+    }
+    function _unbindAutoRecord() {
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_autoRecOnLoaded) { try { window.slopsmith.off('song:loaded', _autoRecOnLoaded); } catch (_) {} }
+            if (_autoRecOnPause)  { try { window.slopsmith.off('song:pause',  _autoRecOnPause); } catch (_) {} }
+            if (_autoRecOnPlay)   { try { window.slopsmith.off('song:play',   _autoRecOnPlay); } catch (_) {} }
+        }
+        _autoRecOnLoaded = _autoRecOnPause = _autoRecOnPlay = null;
+    }
+
     // Live-streaming event bindings — only active while tuning mode is
     // on. Mints a fresh session id on song:play so every take produces
     // its own `live_<id>.jsonl` file server-side; clears it on song:end
@@ -7339,6 +7430,17 @@ function createNoteDetector(options = {}) {
             if (tuningMode) _liveBindEvents(); else _liveUnbindEvents();
             saveSettings();
         },
+        // Auto-record-every-play opt-out. The song:loaded listener reads
+        // `autoRecord` at fire time, so flipping the flag is enough — no
+        // rebind. An in-progress auto-take is left to finish/save on its
+        // own song:ended.
+        isAutoRecord: () => autoRecord,
+        setAutoRecord: (v) => {
+            const next = !!v;
+            if (next === autoRecord) return;
+            autoRecord = next;
+            saveSettings();
+        },
         // Reference-recording capture for the headless harness. Arms
         // the next song-play to capture the detector's input audio,
         // auto-saves on song:ended. POSTs the WAV to the plugin's
@@ -7423,6 +7525,11 @@ function createNoteDetector(options = {}) {
         _bindChartStateEvents: _chartStateBindEvents,
         _unbindChartStateEvents: _chartStateUnbindEvents,
         _syncChartStateFromHw: _syncChartStateFromHw,
+        // Auto-record test hooks — same rationale. Production binds from
+        // enableImpl() / unbinds from destroy(); tests drive them without
+        // the audio pipeline to assert the song:loaded auto-arm.
+        _bindAutoRecord: _bindAutoRecord,
+        _unbindAutoRecord: _unbindAutoRecord,
         _getChartState: () => ({
             arrangement: currentArrangement,
             stringCount: currentStringCount,

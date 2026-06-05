@@ -49,6 +49,23 @@
         </p>
     </div>
 
+    <!-- Auto-record toggle. A normal user setting (not advanced): every
+         play is captured to static/note_detect_recordings/ for later
+         analysis. On by default. Persisted via the plugin's
+         saveSettings(). -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4 mb-4">
+        <label class="flex items-start gap-3 cursor-pointer select-none">
+            <input type="checkbox" id="nd-auto-record"
+                   class="mt-0.5 rounded border-gray-600 bg-dark-700 text-accent focus:ring-accent/40">
+            <span class="text-sm text-gray-300">
+                Auto-record every play
+                <span class="block text-[11px] text-gray-500 leading-relaxed mt-1">
+                    Off by default. Turn on to capture each play (when Detect is on) to a WAV in <code>static/note_detect_recordings/</code> so it can be replayed through the harness or analysed later — no need to arm anything.
+                </span>
+            </span>
+        </label>
+    </div>
+
     <!-- Tuning-mode toggle. Lives here (where the panels it gates also
          live) so the user doesn't have to bounce between the gear
          popover and this page just to reveal developer surfaces.
@@ -675,6 +692,12 @@
         // the Reference Recording + Diagnostic panels stay hidden. The
         // checkbox state is sourced from the plugin singleton (not the
         // DOM) so it stays in sync if some other surface flips the flag.
+        // Auto-record toggle — always visible (not gated by tuning mode).
+        const autoRec   = !!(nd && typeof nd.isAutoRecord === 'function' && nd.isAutoRecord());
+        const autoRecCb = _q('nd-auto-record');
+        if (autoRecCb && autoRecCb.checked !== autoRec) autoRecCb.checked = autoRec;
+        if (autoRecCb) autoRecCb.disabled = !nd;
+
         const tuning = !!(nd && typeof nd.isTuningMode === 'function' && nd.isTuningMode());
         const cb     = _q('nd-tuning-mode');
         const panels = _q('nd-tuning-panels');
@@ -825,6 +848,16 @@
             const nd = window.noteDetect;
             if (nd && typeof nd.setTuningMode === 'function') nd.setTuningMode(tuneCb.checked);
             render();
+        };
+    }
+
+    // Auto-record toggle — capture every play. State sourced from the
+    // plugin singleton so it stays in sync if another surface flips it.
+    const autoRecCb = _q('nd-auto-record');
+    if (autoRecCb) {
+        autoRecCb.onchange = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.setAutoRecord === 'function') nd.setAutoRecord(autoRecCb.checked);
         };
     }
 
