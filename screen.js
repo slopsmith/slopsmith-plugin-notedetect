@@ -1674,6 +1674,17 @@ function createNoteDetector(options = {}) {
     // array of {s, f, ...technique flags} or null. When set, every frame
     // scores it against the live audio and emits notedetect:verify on a hit.
     let _verifyTarget = null;
+    // Strong chart fingerprint captured when the target was registered. A
+    // (string, fret) only maps to a pitch under a specific arrangement +
+    // tuning + capo, so a target is meaningless once the chart changes. We
+    // bind the target to this fingerprint and drop it on mismatch, so a
+    // song/arrangement switch can never emit notedetect:verify for the wrong
+    // chart (independent of whether the consumer remembers to clear it).
+    let _verifyTargetSig = null;
+    function _ndVerifyChartSig() {
+        return currentArrangement + '|' + currentStringCount + '|'
+            + tuningOffsets.slice(0, currentStringCount).join(',') + '|' + capo;
+    }
     // Last chord constraint result — shown in HUD when no single note is detected.
     // Reset on song change via resetScoring(). `lastChordTime` is the
     // chart timestamp of the chord that produced these readings; the HUD
@@ -3172,6 +3183,14 @@ function createNoteDetector(options = {}) {
     async function _runVerifyTarget(frameBuffer) {
         const target = _verifyTarget;
         if (!target || !target.length) return;
+        // The target only makes sense on the chart it was registered for —
+        // drop it outright if the arrangement/tuning/capo changed, so a stale
+        // target can never score (or emit verify) against a different chart.
+        if (_verifyTargetSig !== _ndVerifyChartSig()) {
+            _verifyTarget = null;
+            _verifyTargetSig = null;
+            return;
+        }
         // Same arrangement-aware harmonic-comb verify window the single-note
         // path uses. Passing the user's tight pitch_tolerance_cents straight
         // into the DSP scorer rejects ~90% of correctly-played notes (a
@@ -3183,7 +3202,6 @@ function createNoteDetector(options = {}) {
             if (!bridgeDesktop || !bridgeDesktop.audio
                 || typeof bridgeDesktop.audio.scoreChord !== 'function') return;
             const gen = sessionGen;
-            const sig = _ndChartSignature();
             try {
                 result = await bridgeDesktop.audio.scoreChord({
                     arrangement: currentArrangement,
@@ -3200,12 +3218,11 @@ function createNoteDetector(options = {}) {
                 });
             } catch (e) { return; }
             if (!enabled || gen !== sessionGen) return;
-            // The IPC round-trip yields; if the consumer cleared or replaced
-            // the target, or a song/arrangement switch changed the chart
-            // (neither bumps sessionGen), this result is for a stale note —
-            // drop it so we don't fire verify for the wrong step.
-            if (_verifyTarget !== target) return;
-            if (_ndChartSignature() !== sig) return;
+            // The IPC round-trip yields; if the consumer cleared/replaced the
+            // target, or the chart (arrangement/tuning/capo) changed during it,
+            // this result is for a stale note — drop it so we don't fire verify
+            // for the wrong step.
+            if (_verifyTarget !== target || _verifyTargetSig !== _ndVerifyChartSig()) return;
         } else {
             if (!frameBuffer) return;
             const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
@@ -7305,7 +7322,7 @@ function createNoteDetector(options = {}) {
         // makes notedetect:hit unsuitable there (#468 / #630). `notes` is an
         // array of { s, f, ho?, po?, b?, sl?, hm? }.
         setVerifyTarget: (notes) => {
-            if (!Array.isArray(notes)) { _verifyTarget = null; return; }
+            if (!Array.isArray(notes)) { _verifyTarget = null; _verifyTargetSig = null; return; }
             // Filter to well-formed positions and store a private copy so a
             // caller mutating its array can't later break the gate's
             // "null or non-empty sanitized array" invariant.
@@ -7318,6 +7335,8 @@ function createNoteDetector(options = {}) {
                     ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
                 }));
             _verifyTarget = clean.length ? clean : null;
+            // Bind the target to the chart it was registered on.
+            _verifyTargetSig = _verifyTarget ? _ndVerifyChartSig() : null;
         },
         getVerifyTarget: () => (_verifyTarget ? _verifyTarget.map(n => ({ ...n })) : null),
         getStats: () => ({
