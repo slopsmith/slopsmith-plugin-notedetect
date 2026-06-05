@@ -11,3 +11,4 @@ __pycache__/
 # example fixtures file tracked as a template; ignore the real ones.
 tools/regression-fixtures.json
 tools/regression-baseline.json
+.headless/
