@@ -1696,6 +1696,11 @@ function createNoteDetector(options = {}) {
     let detectInterval = null;
     let levelRaf = null;
     let bridgeLevelTimer = null;  // setInterval for the desktop-bridge level meter
+    // Capability latch: true once we confirm the bridge engine has no
+    // getLevels, so the sustain glow can fall back to a fixed alpha. Distinct
+    // from `!bridgeLevelTimer` (which is also true mid-startup/after teardown);
+    // defaults false so we level-gate until the capability is actually known.
+    let bridgeLevelsUnavailable = false;
     let hudInterval = null;
     let missCheckInterval = null;
     let gcInterval = null;
@@ -1969,6 +1974,52 @@ function createNoteDetector(options = {}) {
                                 }
                                 await _ndDrainEngineVerdicts();
                                 if (!enabled || gen !== sessionGen) return;
+                                // Live monophonic pitch for provisional on-strike
+                                // gem feedback (see noteStateFor). The engine's
+                                // final verdict only lands after a note's sustain
+                                // window closes — often after the highway culls the
+                                // gem — so polling the live detector here lets a
+                                // struck note light immediately. One extra IPC per
+                                // tick alongside the verdict drain.
+                                //
+                                // Use getRawPitch, NOT getPitchDetection: it reads
+                                // the POST-noise-gate signal and returns midiNote
+                                // -1 the moment the string stops ringing (gate
+                                // closes), so the 'active' glow extinguishes when
+                                // the player mutes. getPitchDetection holds the
+                                // note through its decay, which kept muted sustains
+                                // lit. Fall back to getPitchDetection only if the
+                                // addon predates getRawPitch.
+                                try {
+                                    const lp = (typeof desktop.audio.getRawPitch === 'function')
+                                        ? await desktop.audio.getRawPitch()
+                                        : await desktop.audio.getPitchDetection();
+                                    if (!enabled || gen !== sessionGen) return;
+                                    if (lp && typeof lp.midiNote === 'number' && lp.midiNote >= 0
+                                        && typeof lp.confidence === 'number'
+                                        // Strict `>` to match _sustainStillHeld's
+                                        // gate — a confidence landing exactly on
+                                        // the threshold must not store a pitch the
+                                        // hold logic would then ignore (flicker).
+                                        && lp.confidence > detectionConfidenceMin) {
+                                        detectedMidi = lp.midiNote;
+                                        detectedConfidence = lp.confidence;
+                                    } else {
+                                        detectedMidi = -1;
+                                        detectedConfidence = 0;
+                                    }
+                                } catch (_) {
+                                    // Clear on failure, don't keep-last: the sustain
+                                    // glow is driven from detectedMidi, and
+                                    // _sustainStillHeld refreshes its grace window
+                                    // every render. Holding a stale pitch across
+                                    // repeated IPC failures would keep a muted note
+                                    // glowing indefinitely. Clearing still lets
+                                    // NOTE_SUS_GRACE_MS bridge a one-off hiccup, then
+                                    // expire if the failures persist.
+                                    detectedMidi = -1;
+                                    detectedConfidence = 0;
+                                }
                                 _diagDetector = {
                                     desktop_bridge: true,
                                     ml: bridgeMlActive,
@@ -2349,9 +2400,18 @@ function createNoteDetector(options = {}) {
         // Bail before installing the timer if the engine doesn't expose
         // getLevels — otherwise we'd run a no-op poll forever, leak the
         // interval, and never surface the missing capability.
-        if (!desktop || !desktop.audio || typeof desktop.audio.getLevels !== 'function') {
+        if (!desktop || !desktop.audio) {
+            // Bridge/audio not ready yet — a timing state, NOT a capability
+            // verdict. Don't latch unavailable here, or a pre-init call would
+            // wrongly force fixed full glow; leave the latch for a confirmed
+            // missing getLevels below.
             return;
         }
+        if (typeof desktop.audio.getLevels !== 'function') {
+            bridgeLevelsUnavailable = true;
+            return;
+        }
+        bridgeLevelsUnavailable = false;
         // In-flight guard — if an IPC `getLevels()` round-trip takes
         // longer than the 50 ms timer, queueing further calls would
         // build up a backlog and process stale readings out-of-order.
@@ -2625,6 +2685,44 @@ function createNoteDetector(options = {}) {
     // rate mismatch (see _susActiveUntil).
     const NOTE_SUS_GRACE_MS = 250;
 
+    // Provisional on-strike feedback (slopsmith#254 follow-up). On the desktop
+    // engine-verifier path the authoritative verdict for a note only lands after
+    // its sustain window elapses (~sus + 0.1 s), which is usually AFTER the
+    // highway has culled the gem — so a struck *sustained* note would otherwise
+    // never light. While a note has no verdict yet, if it's at/near the strike
+    // line and the live monophonic detector currently hears its pitch, glow it
+    // now; the engine verdict reconciles HUD totals later. Lead/tail tolerances
+    // bracket the note's [chartTime, chartTime+sus] window in the visual clock.
+    const NOTE_LIVE_LEAD = 0.12;
+    const NOTE_LIVE_TAIL = 0.12;
+
+    // Sustain glow brightness follows the live input level: a held note lights
+    // only while the string is ringing above NOTE_GLOW_LEVEL_THRESHOLD, and its
+    // alpha scales with level up to NOTE_GLOW_REF_LEVEL (full glow). Below the
+    // threshold the string is treated as silenced and the gem stops glowing, so
+    // the glow fades naturally as the note decays and drops when muted. All
+    // three are tunable to taste.
+    const NOTE_GLOW_LEVEL_THRESHOLD = 0.015; // input level (0..1) = "still ringing" (just above the ~0.008 noise floor)
+    const NOTE_GLOW_REF_LEVEL       = 0.25; // level mapped to full glow
+    const NOTE_GLOW_MIN_ALPHA       = 0.30; // floor so a quiet-but-ringing note stays visible
+
+    // Live-level → sustain-glow alpha. Returns 0 when the string isn't ringing
+    // above the threshold (the caller then leaves the gem un-lit).
+    function _ndSustainGlowAlpha() {
+        // Fixed-glow fallback for bridge builds whose engine lacks getLevels:
+        // startBridgeLevelMeter() bails (latching bridgeLevelsUnavailable), so
+        // inputLevel never moves off 0 and a level-gated glow would never light
+        // at all. Preserve the pre-level-metering behaviour (full glow) so
+        // sustained notes still show as active on those builds. Keyed on the
+        // capability latch — not `!bridgeLevelTimer`, which is also true during
+        // startup/teardown and would wrongly force full glow then.
+        if (usingDesktopBridge && bridgeLevelsUnavailable) return 1;
+        if (!(inputLevel > NOTE_GLOW_LEVEL_THRESHOLD)) return 0;
+        const span = NOTE_GLOW_REF_LEVEL - NOTE_GLOW_LEVEL_THRESHOLD;
+        const a = span > 0 ? (inputLevel - NOTE_GLOW_LEVEL_THRESHOLD) / span : 1;
+        return Math.max(NOTE_GLOW_MIN_ALPHA, Math.min(1, a));
+    }
+
     // Registered via highway.setNoteStateProvider(). The active renderer
     // calls this per visible chart note / chord-note. Returns null (render
     // normally), or { state, alpha } where state ∈ {'active','hit','miss'}:
@@ -2638,7 +2736,22 @@ function createNoteDetector(options = {}) {
         if (!enabled || !note || !Number.isFinite(chartTime)) return null;
         const key = noteKey(note, chartTime);
         const j = noteResults.get(key);
-        if (!j) return null;  // not judged yet — render normally
+        if (!j) {
+            // No verdict yet — provisional live glow so a struck note (esp. a
+            // long sustain whose engine verdict lands after the gem is culled)
+            // lights immediately. Only while the note straddles the strike line
+            // AND the live detector hears its pitch (see NOTE_LIVE_LEAD above).
+            const songTLive = ((hw && hw.getTime) ? hw.getTime() : 0)
+                + ((hw && hw.getAvOffset) ? hw.getAvOffset() / 1000 : 0);
+            const susLive = +note.sus || 0;
+            if (songTLive >= chartTime - NOTE_LIVE_LEAD
+                && songTLive <= chartTime + susLive + NOTE_LIVE_TAIL
+                && _sustainStillHeld(key, note)) {
+                const a = _ndSustainGlowAlpha();
+                if (a > 0) return { state: 'active', alpha: a, live: true };
+            }
+            return null;  // not judged / not ringing above threshold — render normally
+        }
 
         // Renderer clock for the visual age / TTL math — `getTime() +
         // avOffset` is the same basis `drawOverlay()` uses for its slide-
@@ -2663,10 +2776,13 @@ function createNoteDetector(options = {}) {
 
         if (j.hit) {
             const sus = +note.sus || 0;
-            // Sustained note still inside its ring window AND currently
-            // being played on-pitch → hold it at full glow.
+            // Sustained note still inside its ring window AND still audibly
+            // ringing on-pitch → hold it lit, brightness tracking the live
+            // input level. Below the level threshold, fall through to the
+            // post-strike hit fade (the note has decayed / been muted).
             if (sus > 0.05 && songT < chartTime + sus + 0.05 && _sustainStillHeld(key, note)) {
-                return { state: 'active', alpha: 1 };
+                const a = _ndSustainGlowAlpha();
+                if (a > 0) return { state: 'active', alpha: a, live: true };
             }
             // Otherwise: brief post-strike glow that fades out over
             // hitGlowDuration (measured from when the verdict landed).
