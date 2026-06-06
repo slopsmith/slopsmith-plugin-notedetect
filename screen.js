@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.11.1';
+const _ND_VERSION = '1.12.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -209,7 +209,18 @@ const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, h
 // detection resolution — it only halves the input-side buffering
 // latency (1024/48000 ≈ 21 ms vs 2048/48000 ≈ 43 ms). Matches the
 // headless harness's default --frame-size.
-const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size
+const _ND_FRAME_SIZE = 1024;       // ScriptProcessor buffer size (hard fallback)
+// Valid ScriptProcessor buffer sizes; the persisted `frameSize` setting is
+// clamped to this set on load. EMPIRICAL CORRECTION to the note above: the
+// callback chunk size DOES affect bass recall — harness on a real take gives
+// 1024→27%, 2048→77%, 4096→68%. The 4096-sample accumulation does NOT fully
+// compensate for a too-short callback granularity on low fundamentals, so the
+// per-instance default is 2048, not _ND_FRAME_SIZE.
+const _ND_VALID_FRAME_SIZES = [256, 512, 1024, 2048, 4096, 8192, 16384];
+function _ndClampFrameSize(v) {
+    v = Number(v);
+    return _ND_VALID_FRAME_SIZES.includes(v) ? v : 2048;
+}
 
 // Pitch window the DSP band-energy scorer uses to VERIFY a single note
 // (confirm the expected pitch is what is ringing, vs. a neighbouring
@@ -1305,6 +1316,15 @@ function createNoteDetector(options = {}) {
     // Arm-(training) dev surfaces stay behind tuningMode and override
     // this (we only auto-arm when nothing is already armed for training).
     let autoRecord = false;
+    // Detection frame size — the ScriptProcessor buffer fed to the
+    // detector each callback. 1024 (~21 ms @48k) is too short to resolve a
+    // low-bass fundamental (low-E period ~24 ms), so the detector silently
+    // drops most bass notes; 2048 (~43 ms) nearly triples bass recall
+    // (harness-measured 27%→77% on a real take) for an imperceptible
+    // latency cost. Persisted + tunable so downstream bass-accuracy work is
+    // configuration, not a code fork. Clamped to a valid ScriptProcessor
+    // buffer size on load.
+    let frameSize = 2048;
     let missMarkerDuration = 2.0;
     let hitGlowDuration = 0.5;
     let inputGain = 1.0;
@@ -1382,6 +1402,7 @@ function createNoteDetector(options = {}) {
             if (s.edgeFlash !== undefined) edgeFlashEnabled = !!s.edgeFlash;
             if (s.tuningMode !== undefined) tuningMode = !!s.tuningMode;
             if (s.autoRecord !== undefined) autoRecord = !!s.autoRecord;
+            if (s.frameSize !== undefined) frameSize = _ndClampFrameSize(s.frameSize);
             // Persisted on/off preference. Absence keeps the default
             // (true), so fresh installs get Detect on out of the box.
             if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
@@ -1859,6 +1880,7 @@ function createNoteDetector(options = {}) {
                 edgeFlash: edgeFlashEnabled,
                 tuningMode,
                 autoRecord,
+                frameSize,
                 detectEnabled: detectPreference,
                 missMarkerDuration,
                 hitGlowDuration,
@@ -2207,7 +2229,7 @@ function createNoteDetector(options = {}) {
             levelAnalyser.smoothingTimeConstant = 0.8;
             gainNode.connect(levelAnalyser);
 
-            const processor = audioCtx.createScriptProcessor(_ND_FRAME_SIZE, 1, 1);
+            const processor = audioCtx.createScriptProcessor(frameSize, 1, 1);
             worklet = processor;
             accumBuffer = new Float32Array(0);
             pendingBuffer = null;
@@ -7499,7 +7521,7 @@ function createNoteDetector(options = {}) {
                 baseLatency:   Number.isFinite(audioCtx.baseLatency)   ? audioCtx.baseLatency   : null,
                 outputLatency: Number.isFinite(audioCtx.outputLatency) ? audioCtx.outputLatency : null,
                 sampleRate:    audioCtx.sampleRate,
-                frameSize:     _ND_FRAME_SIZE,
+                frameSize:     frameSize,
                 // Effective single-note analysis window: bass widens this from
                 // the YIN floor to span ~2 periods of the lowest detectable
                 // fundamental at the device rate (see _ndMinAnalysisSamples), so
