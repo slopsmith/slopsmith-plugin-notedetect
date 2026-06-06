@@ -1,7 +1,7 @@
 {
   "id": "note_detect",
   "name": "Note Detection",
-  "version": "1.11.1",
+  "version": "1.12.0",
   "private": false,
   "script": "screen.js",
   "settings": { "html": "settings.html" },
