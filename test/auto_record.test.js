@@ -89,6 +89,37 @@ test('song:play re-arms when nothing is armed (resume after a pause-save)', () =
     det.destroy();
 });
 
+test('a failed auto-save preserves the take — neither song:loaded nor song:play re-arms over it', async () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector({ isDefault: true });
+    det.setAutoRecord(true); // opt in (default is off)
+    det._bindAutoRecord();
+
+    // Arm a take and give it captured audio (no live audio in the vm, so
+    // inject a frame directly).
+    core.slopsmith._fire('song:play', {});
+    assert.equal(det.getRecordingState().armed, true, 'play armed a take');
+    det._injectRecChunkForTest();
+    assert.equal(det.getRecordingState().chunks, 1, 'take has captured audio');
+
+    // song:loaded tries to flush the stranded take. saveRecordingNow()
+    // fails here (no fetch in the vm), returns null and KEEPS the buffer.
+    // The handler must NOT re-arm — armRecording() would wipe the take.
+    core.slopsmith._fire('song:loaded', { filename: 'next.psarc' });
+    await new Promise((r) => setTimeout(r, 0)); // drain the async handler
+    let st = det.getRecordingState();
+    assert.equal(st.armed, false, 'not re-armed after a failed save');
+    assert.equal(st.chunks, 1, 'failed take preserved for retry');
+    assert.ok(st.lastError, 'save failure recorded');
+
+    // A subsequent play must also leave the preserved take intact.
+    core.slopsmith._fire('song:play', {});
+    st = det.getRecordingState();
+    assert.equal(st.armed, false, 'play did not re-arm over the preserved take');
+    assert.equal(st.chunks, 1, 'preserved take still intact after play');
+    det.destroy();
+});
+
 test('a second song:loaded with nothing captured re-arms without throwing', () => {
     const core = loadDetectionCore();
     const det = core.createNoteDetector({ isDefault: true });
