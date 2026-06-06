@@ -1638,6 +1638,12 @@ function createNoteDetector(options = {}) {
     // splitscreen with N detecting panels doesn't pop N modals.
     let endOfSongSubscribed = false;
     let endOfSongOnEndedFn = null;
+    // song:loaded re-arm subscription (default singleton). Bound from
+    // enableImpl() — i.e. once the user has turned Detect on at least once —
+    // and survives the per-song silent-disable just like endOfSong/drill, so
+    // it can flip Detect back on for the next song. See _reArmOnSongLoaded.
+    let reArmSubscribed = false;
+    let reArmOnLoadedFn = null;
     // Bounds at iteration start; if slopsmith.getLoop() returns
     // different bounds mid-drill (user picked another saved loop or
     // edited A/B) we clear iterations because they're no longer
@@ -5549,6 +5555,50 @@ function createNoteDetector(options = {}) {
         endOfSongOnEndedFn = null;
     }
 
+    // Re-arm Detect across song changes. The playSong wrapper silent-disables
+    // every instance on a song switch and tries to re-enable the singleton, but
+    // it does so right after origPlaySong() resolves — BEFORE the new song's
+    // chart/highway is ready — so enable() can bail at the resolveHw() guard and
+    // leave Detect off (users then had to re-press it every song). song:loaded
+    // fires once the chart IS ready (highway.js emits it after the WS load), on
+    // every load path (modern or legacy window.playSong), so it's the reliable
+    // moment to honour the standing preference. Default singleton only; no-op if
+    // the user turned Detect off (wantsDetect false) or it's already on.
+    function _reArmOnSongLoaded() {
+        if (!isDefault) return;
+        if (enabled) return;
+        if (!detectPreference) return;
+        enable().catch((e) => {
+            console.warn('[note_detect] auto re-arm on song:loaded failed:',
+                e && e.message ? e.message : e);
+        });
+    }
+
+    function _reArmBindEvents() {
+        if (reArmSubscribed) return;
+        if (!isDefault) return;
+        if (!window.slopsmith
+            || typeof window.slopsmith.on !== 'function'
+            || typeof window.slopsmith.off !== 'function') return;
+        const fn = _reArmOnSongLoaded;
+        try {
+            window.slopsmith.on('song:loaded', fn);
+        } catch (e) {
+            return;
+        }
+        reArmOnLoadedFn = fn;
+        reArmSubscribed = true;
+    }
+
+    function _reArmUnbindEvents() {
+        if (!reArmSubscribed) return;
+        if (window.slopsmith && typeof window.slopsmith.off === 'function' && reArmOnLoadedFn) {
+            try { window.slopsmith.off('song:loaded', reArmOnLoadedFn); } catch (e) {}
+        }
+        reArmSubscribed = false;
+        reArmOnLoadedFn = null;
+    }
+
     // Render the drill HUD panel — current iteration header (live
     // counter + accuracy) plus the last 5 completed iterations with
     // best/worst highlighting. Hides itself entirely when drill is
@@ -5709,6 +5759,10 @@ function createNoteDetector(options = {}) {
         // surfaces the end-of-song summary modal. Idempotent and
         // self-gated (handler bails when not enabled / not default).
         _endOfSongBindEvents();
+        // Bind the song:loaded re-arm so Detect survives song switches. Like
+        // the endOfSong/drill bindings it persists across the per-song silent-
+        // disable and is only torn down by destroy(); idempotent + default-only.
+        _reArmBindEvents();
         // Sync drill state once at enable so a user enabling detection
         // while a loop is already active starts counting iterations
         // from the very next judgment, not after the first HUD tick.
@@ -5835,6 +5889,7 @@ function createNoteDetector(options = {}) {
         // on re-enable); destroy is the right teardown point.
         _drillUnbindEvents();
         _endOfSongUnbindEvents();
+        _reArmUnbindEvents();
         _chartStateUnbindEvents();
         _recUnbindEvents();
         _liveUnbindEvents();
