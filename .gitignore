@@ -12,3 +12,4 @@ __pycache__/
 tools/regression-fixtures.json
 tools/regression-baseline.json
 .headless/
+.agent-shell/
