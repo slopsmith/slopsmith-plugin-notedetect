@@ -5070,15 +5070,103 @@ function createNoteDetector(options = {}) {
         return Math.round(ratio * 100) + '%';
     }
 
+    // ── Musician-facing display helpers (copy only — no detection changes) ──
+    function _ndMusicianRejectHint(reason) {
+        const hints = {
+            NO_VERDICT: 'No detection at note time',
+            SILENCE_GATE: 'Input too quiet when the note struck',
+            STRING_VERIFY_FAIL: 'Something was heard but did not verify',
+            CHORD_RATIO_FAIL: 'Not enough strings heard for the chord',
+            TIMING_FAIL: 'Played outside the timing window',
+            PITCH_FAIL: 'Pitch was outside the allowed window',
+            RETIRE_NO_MATCH: 'No match before the note ended',
+            UNKNOWN: 'Could not verify this note',
+        };
+        return hints[reason] || hints.UNKNOWN;
+    }
+
+    function _ndFormatMusicianRejectLine(r) {
+        if (!r || typeof r !== 'object') return '—';
+        const parts = [_ndMusicianRejectHint(r.reason)];
+        if (Number.isFinite(r.hitStrings) && Number.isFinite(r.totalStrings)) {
+            parts.push(`${r.hitStrings} of ${r.totalStrings} strings heard`);
+        } else if (Number.isInteger(r.string) && Number.isInteger(r.fret)) {
+            parts.push(`string ${r.string + 1}, fret ${r.fret}`);
+        }
+        const strikePeak = Number.isFinite(r.strikePeakPct)
+            ? r.strikePeakPct
+            : (Number.isFinite(r.inputPeakPct) ? r.inputPeakPct : null);
+        if (Number.isFinite(strikePeak)) {
+            parts.push(`signal at strike ${strikePeak}%`);
+        }
+        if (Number.isFinite(r.timingErrorMs)) {
+            const te = Math.round(r.timingErrorMs);
+            parts.push(te >= 0 ? `${te} ms late` : `${Math.abs(te)} ms early`);
+        }
+        return parts.join(' · ');
+    }
+
+    function _ndHealthHearingForPanel() {
+        const line = _ndHealthDetectedLine();
+        if (line !== '—') return line;
+        if (!enabled) {
+            return 'Nothing yet — turn Detect on, then play a note or chord';
+        }
+        return 'Nothing yet — play a note or chord (stays blank when input is quiet)';
+    }
+
+    function _calWizardNoiseStatusDisplay(status) {
+        if (status === 'good') return 'Good — quiet room (under 5%)';
+        if (status === 'elevated') return 'Elevated — some background noise (5–15%)';
+        if (status === 'too_noisy') return 'Too noisy — over 15%; lower gain or quiet the room';
+        return status || '—';
+    }
+
+    function _calWizardSignalStatusDisplay(status) {
+        if (status === 'good') return 'Good — strong enough for detection';
+        if (status === 'too_low') return 'Too low — play louder or raise input gain';
+        if (status === 'too_hot') return 'Too hot — risk of clipping; lower input gain';
+        return status || '—';
+    }
+
+    function _calLabDominantFailLabel(fail) {
+        if (fail === 'SNR') return 'signal clarity';
+        if (fail === 'FUND') return 'fundamental';
+        if (fail === 'PITCH') return 'pitch';
+        return fail || '—';
+    }
+
+    function _calLabGateChipsHtml(tick) {
+        if (!tick || typeof tick !== 'object') return '';
+        const chip = (label, ok) => {
+            const cls = ok ? 'text-green-300/90' : 'text-amber-200/90';
+            const mark = ok ? '✓' : '✗';
+            return `<span class="${cls}">${label}${mark}</span>`;
+        };
+        const snrOk = !!tick.passedSnr || (tick.gatePassCount >= 1 && !(tick.failedGateMask & 1));
+        const fundOk = !!tick.passedFundamental || (tick.gatePassCount >= 2 && !(tick.failedGateMask & 2));
+        const pitchOk = !!tick.passedPitch || tick.gatePassCount === 3;
+        if (tick.passedSnr === undefined && tick.gatePassCount != null) {
+            return `<span class="text-[9px] font-mono flex gap-1.5">`
+                + chip('Clarity', (tick.failedGateMask & 1) === 0 && tick.gatePassCount >= 1)
+                + chip('Fund.', (tick.failedGateMask & 2) === 0 && tick.gatePassCount >= 2)
+                + chip('Pitch', tick.gatePassCount === 3)
+                + '</span>';
+        }
+        return `<span class="text-[9px] font-mono flex gap-1.5">`
+            + chip('Clarity', snrOk) + chip('Fund.', fundOk) + chip('Pitch', pitchOk)
+            + '</span>';
+    }
+
     function _ndDominantMissReason(breakdown, totalMisses) {
         if (!breakdown || !totalMisses || totalMisses <= 0) return null;
         const labels = {
-            pure: 'pure (no pitch heard)',
-            chordPartial: 'chord partial',
-            early: 'timing early',
-            late: 'timing late',
-            sharp: 'pitch sharp',
-            flat: 'pitch flat',
+            pure: 'no note heard',
+            chordPartial: 'partial chord',
+            early: 'played too early',
+            late: 'played too late',
+            sharp: 'pitch too sharp',
+            flat: 'pitch too flat',
         };
         let bestKey = null;
         let bestVal = 0;
@@ -5120,7 +5208,7 @@ function createNoteDetector(options = {}) {
             }
         }
         if (Number.isFinite(median) && Math.abs(median) >= 20) {
-            return 'Timing median is off — open Settings → Note Detection for A/V sync help.';
+            return 'Timing median is off — try the Calibration Wizard timing step or adjust chart sync (A/V offset) in main Settings.';
         }
         return null;
     }
@@ -5196,27 +5284,27 @@ function createNoteDetector(options = {}) {
             `Input: ${_ndHealthInputChannelLabel()}`
             + (sr ? ` · ${sr} Hz` : '')
             + (selectedDeviceId ? '' : ' · default device'));
-        set('.nd-health-hearing', `Hearing: ${_ndHealthDetectedLine()}`);
+        set('.nd-health-hearing', `Now hearing: ${_ndHealthHearingForPanel()}`);
         set('.nd-health-session',
             total > 0
                 ? `This song: ${hitsN} hits · ${missesN} misses · ${_ndFormatPercent(summary.accuracy)}`
                 : 'This song: Not enough data yet');
         set('.nd-health-top-miss',
             dom
-                ? `Top miss type: ${dom.label} (${dom.count})`
-                : (missesN > 0 ? 'Top miss type: —' : 'Top miss type: none yet'));
+                ? `Most common miss: ${dom.label} (${dom.count})`
+                : (missesN > 0 ? 'Most common miss: —' : 'Most common miss: none yet'));
         const timingMed = teHits.median;
         set('.nd-health-align',
-            `Alignment: A/V ${_ndFormatMs(avMs)} · latency ${Math.round(latencyOffset * 1000)} ms`
+            `Sync: chart/video offset ${_ndFormatMs(avMs)} · detection delay ${Math.round(latencyOffset * 1000)} ms`
             + (Number.isFinite(timingMed)
-                ? ` · your timing (hits) ${_ndFormatMs(timingMed)}`
-                : ' · your timing (hits): Not enough hits'));
+                ? ` · your hits average ${_ndFormatMs(timingMed)} vs chart`
+                : ' · your hits: not enough data yet'));
         set('.nd-health-level', `Input level: ${levelNote}`);
         let rejectLines = '—';
         try {
             const recent = _ndVerifierRejects.slice(-3).reverse();
             if (recent.length > 0) {
-                rejectLines = recent.map(_ndFormatVerifierRejectLine).join('\n');
+                rejectLines = recent.map(_ndFormatMusicianRejectLine).join('\n');
             }
         } catch (_) { /* read-only */ }
         set('.nd-health-rejects', rejectLines);
@@ -5437,8 +5525,7 @@ function createNoteDetector(options = {}) {
                 captured: true,
                 at: Date.now(),
             };
-            const label = wiz.noise.status === 'good' ? 'Good'
-                : wiz.noise.status === 'elevated' ? 'Elevated' : 'Too noisy';
+            const label = _calWizardNoiseStatusDisplay(wiz.noise.status);
             _calWizardSetAutoStatus(
                 `<span class="text-green-300/90">Captured:</span> avg ${avg}% · peak ${peak}% · <span class="font-semibold">${label}</span>`);
         } else if (kind === 'signal') {
@@ -5450,9 +5537,7 @@ function createNoteDetector(options = {}) {
                 captured: true,
                 at: Date.now(),
             };
-            const label = wiz.signal.status === 'good' ? 'Good'
-                : wiz.signal.status === 'too_low' ? 'Too low'
-                    : wiz.signal.status === 'too_hot' ? 'Too hot' : 'Unknown';
+            const label = _calWizardSignalStatusDisplay(wiz.signal.status);
             let extra = '';
             const gRec = _calWizardRecommendInputGain(wiz.signal.status, inputGain, avg);
             if (gRec) extra = `<div class="text-gray-400 mt-1">Suggested input gain: ${gRec.value}x</div>`;
@@ -6080,8 +6165,8 @@ function createNoteDetector(options = {}) {
         const heard = _calWizardEl.querySelector('.nd-cal-heard');
         if (heard) {
             heard.textContent = snap.heardConfidencePct != null
-                ? `Heard: ${snap.heardNote} · ${snap.heardConfidencePct}% conf`
-                : `Heard: ${snap.hearingLine}`;
+                ? `Now hearing: ${snap.heardNote} · ${snap.heardConfidencePct}% confidence`
+                : `Now hearing: ${snap.hearingLine === '—' ? 'nothing yet — play a note' : snap.hearingLine}`;
         }
         const medEl = _calWizardEl.querySelector('.nd-cal-timing-median');
         if (medEl) {
@@ -6090,8 +6175,8 @@ function createNoteDetector(options = {}) {
             const m = t && Number.isFinite(t.medianMs) ? t.medianMs : snap.timingMedianMs;
             const n = t && t.sampleCount ? t.sampleCount : 0;
             medEl.textContent = Number.isFinite(m)
-                ? `Timing median (hits): ${_ndFormatMs(m)} · ${n} samples`
-                : `Timing median (hits): Not enough hits yet (${n} samples).`;
+                ? `Your average timing vs chart: ${_ndFormatMs(m)} · ${n} hit samples`
+                : `Your average timing vs chart: not enough hits yet (${n} samples)`;
         }
     }
 
@@ -6151,9 +6236,10 @@ function createNoteDetector(options = {}) {
         let html = '';
         if (step === 0) {
             html = `
-                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Calibration Wizard</strong> sets up the system.</p>
-                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Technique Assessment</strong> analyzes the player — use that tool for bends, harmonics, and technique diagnostics.</p>
-                <p class="text-gray-400 text-[10px] mb-2">This wizard may recommend safe audio settings (input gain, latency offset). It does <strong>not</strong> change pitch tolerance, timing tolerance, chord leniency, harmonic SNR, or scoring thresholds.</p>`;
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Calibration Wizard</strong> sets up your audio input, levels, and timing.</p>
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Technique Assessment</strong> (separate tool) checks how well specific playing techniques verify — bends, harmonics, palm mutes, and more.</p>
+                <p class="text-gray-400 text-[10px] mb-2">This wizard may recommend <strong>input gain</strong> and <strong>detection delay (latency offset)</strong> only. It does not change scoring strictness, pitch windows, or detection thresholds.</p>
+                <p class="text-gray-400 text-[10px]">Tip: turn <strong>Detect</strong> on before starting step 1.</p>`;
         } else if (step === 1) {
             const engineOk = snap.enabled && (usingDesktopBridge || audioCtx);
             const probeBusy = wiz.channelProbeRunning;
@@ -6172,7 +6258,7 @@ function createNoteDetector(options = {}) {
                     : '');
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Confirm your audio input before tuning and level checks.</p>
+                <p class="text-gray-300 text-xs mb-2">Confirm which input channel Slopsmith is listening to. Strum while auto-detect runs.</p>
                 <div class="text-[11px] text-gray-300 font-mono space-y-1 mb-2">
                     <div>Device: ${_calWizardDeviceLabel()}</div>
                     <div>Channel: ${snap.channel || '—'}</div>
@@ -6183,13 +6269,16 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-auto-channel w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${probeBusy ? ' opacity-60 cursor-not-allowed' : ''}"${probeBusy ? ' disabled' : ''}>${probeBusy ? 'Detecting...' : 'Auto-detect Channel'}</button>
                 <div class="nd-cal-channel-probe-status text-[11px] text-gray-400 mb-2 min-h-[1.5rem]">${probeBusy
                     ? '<span class="text-cyan-300/90">Testing Mono Mix (1 of 3)…</span>'
-                    : 'Tests Mono Mix, Ch 1, and Ch 2 on the desktop audio engine.'}</div>
+                    : 'Tests Mono Mix, Ch 1 (dry), and Ch 2 (wet) on the desktop audio engine.'}</div>
                 ${probeResultHtml}
-                <p class="text-[10px] text-gray-500">Sets the native Audio Engine input channel. The Note Detect channel dropdown applies to browser fallback only.</p>`;
+                <p class="text-[10px] text-gray-500 mb-1"><strong class="text-gray-400">Desktop:</strong> this step sets the native audio engine channel (saved automatically when a winner is found).</p>
+                <p class="text-[10px] text-gray-500">The <strong>Input Channel</strong> dropdown below only applies to browser microphone fallback — not desktop audio.</p>
+                <p class="text-[10px] text-amber-200/80">If stuck: check USB cable, interface gain, turn Detect on, and strum loudly during the test.</p>`;
         } else if (step === 2) {
             html = `
                 <p class="text-gray-300 text-xs mb-2">Tune your guitar using the bottom <strong class="text-gray-200">Tuner</strong> panel.</p>
-                <p class="text-[10px] text-gray-500 mb-2">Open Tuner hides this wizard so you can use the tuner and song controls. Tap Return to Wizard when done.</p>
+                <p class="text-[10px] text-gray-500 mb-2">Open Tuner hides this wizard so you can use the tuner. Tap <strong>Return to Calibration Wizard</strong> when done.</p>
+                <p class="text-[10px] text-amber-200/80">If notes miss often later: retune here before continuing.</p>
                 <button type="button" class="nd-cal-open-tuner w-full mb-2 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200">Open Tuner</button>
                 <div class="nd-cal-tuner-open-status text-[11px] mb-2 min-h-[1.5rem]"></div>
                 <button type="button" class="nd-cal-tuned w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white">I'm Tuned — Continue</button>`;
@@ -6197,22 +6286,24 @@ function createNoteDetector(options = {}) {
             const nDone = wiz.noise && wiz.noise.captured;
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Mute all strings. The wizard will listen automatically — no need to click while playing.</p>
+                <p class="text-gray-300 text-xs mb-2">Mute all strings and rest your hands on the strings. The wizard listens automatically after a short countdown.</p>
                 <div class="nd-cal-live-level text-cyan-300/90 text-xs font-mono mb-2">Live: —</div>
                 <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 min-h-[2rem]">${nDone
-                    ? `Captured: avg ${wiz.noise.avgPct}% · peak ${wiz.noise.peakPct}% · ${wiz.noise.status}`
-                    : 'Ready to measure noise floor.'}</div>
-                <button type="button" class="nd-cal-start-noise w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${nDone ? 'Retry Noise Capture' : 'Start Noise Capture'}</button>`;
+                    ? `Captured: avg ${wiz.noise.avgPct}% · peak ${wiz.noise.peakPct}% · ${_calWizardNoiseStatusDisplay(wiz.noise.status)}`
+                    : 'Ready to measure room noise.'}</div>
+                <button type="button" class="nd-cal-start-noise w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${nDone ? 'Retry Noise Capture' : 'Start Noise Capture'}</button>
+                <p class="text-[10px] text-gray-500">If <strong>Too noisy</strong>: lower input gain, move away from amps/fans, or try the dry (Ch 1) input.</p>`;
         } else if (step === 4) {
             const sDone = wiz.signal && wiz.signal.captured;
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Play your <strong class="text-gray-200">open low E</strong> loudly when prompted. Listening starts automatically after the countdown.</p>
+                <p class="text-gray-300 text-xs mb-2">Play your <strong class="text-gray-200">open low E</strong> at normal playing volume when prompted. Listening starts after the countdown.</p>
                 <div class="nd-cal-live-level text-cyan-300/90 text-xs font-mono mb-2">Live: —</div>
                 <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 min-h-[2rem]">${sDone
-                    ? `Captured: avg ${wiz.signal.avgPct}% · peak ${wiz.signal.peakPct}% · ${wiz.signal.status}`
-                    : 'Ready to measure signal level.'}</div>
-                <button type="button" class="nd-cal-start-signal w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${sDone ? 'Retry Signal Capture' : 'Start Signal Capture'}</button>`;
+                    ? `Captured: avg ${wiz.signal.avgPct}% · peak ${wiz.signal.peakPct}% · ${_calWizardSignalStatusDisplay(wiz.signal.status)}`
+                    : 'Ready to measure your playing level.'}</div>
+                <button type="button" class="nd-cal-start-signal w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${sDone ? 'Retry Signal Capture' : 'Start Signal Capture'}</button>
+                <p class="text-[10px] text-gray-500">If <strong>Too low</strong>: raise interface gain or play closer to the mic/DI. If <strong>Too hot</strong>: lower gain to avoid clipping.</p>`;
         } else if (step === 5) {
             const noteRows = _CAL_WIZARD_NOTE_CHECKS.map((spec) => {
                 const r = wiz.notes[spec.id];
@@ -6225,12 +6316,13 @@ function createNoteDetector(options = {}) {
             }).join('');
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2">Basic note detection — not Technique Assessment. Play each string when prompted.</p>
-                <div class="nd-cal-heard text-cyan-300/90 text-[10px] font-mono mb-2">Heard: —</div>
+                <p class="text-gray-300 text-xs mb-2">Quick check that Slopsmith hears open strings. This is simpler than Technique Assessment — just confirms basic detection works.</p>
+                <div class="nd-cal-heard text-cyan-300/90 text-[10px] font-mono mb-2">Now hearing: —</div>
                 <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 min-h-[1.5rem]">—</div>
                 <div class="mb-2">${noteRows}</div>
                 <button type="button" class="nd-cal-check-note w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-1" data-note="lowE">Check Low E</button>
-                <button type="button" class="nd-cal-check-note w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200" data-note="openA">Check Open A</button>`;
+                <button type="button" class="nd-cal-check-note w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200" data-note="openA">Check Open A</button>
+                <p class="text-[10px] text-gray-500">If a check fails: retune, confirm the right input channel, raise gain slightly, and try the other channel (dry vs wet).</p>`;
         } else if (step === 6) {
             const t = wiz.timing;
             const liveMed = snap.timingMedianMs;
@@ -6238,9 +6330,11 @@ function createNoteDetector(options = {}) {
                 ? snap.diagnostic.timing_error_ms_hits.count : 0;
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play part of a song first</strong> (Detect on, chart notes scoring hits), then return here and capture timing. This wizard stays open — use Settings or minimize if you need to start playback first.</p>
-                <div class="nd-cal-timing-median text-gray-300 text-xs mb-2">Timing median (hits): —</div>
-                <p class="text-[10px] text-gray-500 mb-2">Live session: ${Number.isFinite(liveMed) ? _ndFormatMs(liveMed) : 'no median'} · ${liveN} hit samples</p>
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play part of a song first</strong> with Detect on so hits are scored. Then return here and capture timing. You can start playback behind this wizard — it stays open.</p>
+                <div class="nd-cal-timing-median text-gray-300 text-xs mb-2">Your average timing vs chart: —</div>
+                <p class="text-[10px] text-gray-500 mb-2">Live session: ${Number.isFinite(liveMed) ? _ndFormatMs(liveMed) + ' average' : 'not enough hits yet'} · ${liveN} hit samples</p>
+                <p class="text-[10px] text-gray-500 mb-2"><strong class="text-gray-400">Chart/video offset</strong> (main Settings) moves notes on screen. <strong class="text-gray-400">Detection delay</strong> (latency offset) moves when your playing is judged — this step helps tune detection delay.</p>
+                <p class="text-[10px] text-amber-200/80">Mostly late? Detection delay may need increasing. Mostly early? Try lowering it.</p>
                 <button type="button" class="nd-cal-reset-timing w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Reset Timing Samples</button>
                 <button type="button" class="nd-cal-capture-timing w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">Capture Timing Snapshot</button>
                 ${t && t.captured ? `<p class="text-[10px] text-green-300/90">Stored: ${_ndFormatMs(t.medianMs)} · ${t.sampleCount} samples</p>` : ''}`;
@@ -6807,7 +6901,7 @@ function createNoteDetector(options = {}) {
         const live = _calLabEl.querySelector('.nd-cal-lab-live');
         if (live) {
             live.textContent = 'Live: ' + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct)
-                + (_calLabCanProbe() ? ' · probe ready' : ' · enable Detect + desktop audio for probes');
+                + (_calLabCanProbe() ? ' · ready to capture' : ' · turn Detect on (desktop) to capture');
         }
     }
 
@@ -6833,9 +6927,9 @@ function createNoteDetector(options = {}) {
         const stepId = steps[step] ? steps[step].id : 'intro';
 
         if (stepId === 'intro') {
-            html += `<p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Calibration Wizard</strong> sets up the system. <strong class="text-gray-200">Technique Assessment</strong> analyzes the player.</p>
-                <p class="text-gray-300 text-xs mb-2">This tool measures playing techniques — picked notes, hammer-ons, pull-offs, power chords, harmonics, bends, and sustain — using same-tick harmonic comb probes (SNR, fundamental, pitch gates).</p>
-                <p class="text-gray-400 text-[10px]">Read-only. Technique Assessment does not change settings automatically.</p>`;
+            html += `<p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Calibration Wizard</strong> sets up audio input and levels. <strong class="text-gray-200">Technique Assessment</strong> (this tool) checks how well your playing verifies.</p>
+                <p class="text-gray-300 text-xs mb-2">Each capture checks three things: <strong class="text-gray-200">signal clarity</strong> (harmonic strength), <strong class="text-gray-200">fundamental</strong> (root pitch present), and <strong class="text-gray-200">pitch</strong> (in tune with the chart). A ratio of 1.0 means clarity meets the detector threshold.</p>
+                <p class="text-gray-400 text-[10px]">Read-only — this tool reports diagnostics only and does not change any settings.</p>`;
         } else if (stepId === 'noise') {
             html += `<p class="text-gray-300 text-xs mb-2">Mute all strings. Capture noise floor.</p>
                 <button type="button" class="nd-cal-lab-cap-noise w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Capture Noise</button>
@@ -6852,10 +6946,13 @@ function createNoteDetector(options = {}) {
                 const caps = (st[store] && st[store][s]) || [];
                 const sum = _calLabSummarizeCaptures(caps);
                 const med = sum.medianSnrRatio != null ? sum.medianSnrRatio.toFixed(2) : '—';
-                html += `<div class="flex items-center justify-between gap-2 py-1 border-b border-gray-700/50">
-                    <span class="text-gray-300 font-mono text-xs">${label} (s${s} f${fret}) · ${caps.length}/${_CAL_LAB_MIN_CAPTURES} · med SNR ${med}</span>
-                    <button type="button" class="nd-cal-lab-cap-str px-2 py-0.5 rounded text-[10px] bg-dark-600 text-gray-300" data-store="${store}" data-s="${s}" data-f="${fret}">Capture</button>
-                </div>`;
+                const lastCap = caps.length ? caps[caps.length - 1] : null;
+                const chips = _calLabGateChipsHtml(lastCap);
+                html += `<div class="flex flex-col gap-0.5 py-1 border-b border-gray-700/50">
+                    <div class="flex items-center justify-between gap-2">
+                        <span class="text-gray-300 font-mono text-xs">${label} (s${s} f${fret}) · ${caps.length}/${_CAL_LAB_MIN_CAPTURES} · clarity ${med}</span>
+                        <button type="button" class="nd-cal-lab-cap-str px-2 py-0.5 rounded text-[10px] bg-dark-600 text-gray-300" data-store="${store}" data-s="${s}" data-f="${fret}">Capture</button>
+                    </div>${chips ? `<div>${chips}</div>` : ''}</div>`;
             }
         } else if (stepId === 'picked') {
             html += `<p class="text-gray-300 text-xs mb-2">Pick single notes (e.g. 12th fret). Capture while playing.</p>
@@ -6874,7 +6971,8 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-lab-cap-pwr w-full py-2 bg-dark-600 rounded text-xs mb-2">Capture power chord</button>
                 <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'powerChord')}</div>`;
         } else if (stepId === 'palmMute') {
-            html += `<p class="text-gray-300 text-xs mb-2">Palm-muted chugs on low E. Chart has no palm-mute flag — probe uses picked context.</p>
+            html += `<p class="text-gray-300 text-xs mb-2">Palm-muted chugs on low E.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">Note: charts do not flag palm mutes yet — this probe uses a picked-note context. Results show how muted playing verifies, not chart palm-mute scoring.</p>
                 <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="palmMute" data-s="0" data-f="0">Capture palm mute</button>
                 <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'palmMute')}</div>`;
         } else if (stepId === 'naturalHarmonic') {
@@ -6882,15 +6980,18 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="naturalHarmonic" data-s="0" data-f="12" data-hm="1">Capture natural harmonic</button>
                 <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'naturalHarmonic')}</div>`;
         } else if (stepId === 'pinchHarmonic') {
-            html += `<p class="text-gray-300 text-xs mb-2">Pinch harmonic (any string). Native chart has no pinch flag — probe uses picked note context.</p>
+            html += `<p class="text-gray-300 text-xs mb-2">Pinch harmonic on any string.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">Note: charts do not flag pinch harmonics yet — this probe uses picked-note context.</p>
                 <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="pinchHarmonic" data-s="2" data-f="7">Capture pinch harmonic</button>
                 <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'pinchHarmonic')}</div>`;
         } else if (stepId === 'halfBend') {
             html += `<p class="text-gray-300 text-xs mb-2">Half bend at 7th fret G string. Capture mid-bend and release.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">Half and whole bends use the same detector probe — labels distinguish your technique, not separate detector modes.</p>
                 <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="halfBend" data-s="3" data-f="7" data-b="1">Capture half bend</button>
                 <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'halfBend')}</div>`;
         } else if (stepId === 'wholeBend') {
             html += `<p class="text-gray-300 text-xs mb-2">Whole-step bend at 7th fret G string.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">Same probe as half bends — compare results as labeled captures, not distinct modes.</p>
                 <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="wholeBend" data-s="3" data-f="7" data-b="1">Capture whole bend</button>
                 <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'wholeBend')}</div>`;
         } else if (stepId === 'sustain') {
@@ -6902,7 +7003,7 @@ function createNoteDetector(options = {}) {
             const recHtml = (rep.recommendations || []).map((t) => `<li class="text-amber-200/90">${t}</li>`).join('');
             html += `<p class="text-gray-300 text-xs mb-2">Technique Assessment report — informational only; no settings are changed automatically.</p>
                 <ul class="text-[11px] list-disc pl-4 mb-3 space-y-0.5">${recHtml}</ul>
-                <button type="button" class="nd-cal-lab-dl w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2">Download calibration_report.json</button>
+                <button type="button" class="nd-cal-lab-dl w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2">Download technique assessment report (JSON)</button>
                 <pre class="text-[9px] text-gray-500 max-h-32 overflow-auto whitespace-pre-wrap">${_calLabReportPreview(rep)}</pre>`;
         }
 
@@ -6913,15 +7014,22 @@ function createNoteDetector(options = {}) {
 
     function _calLabFormatTechSum(st, key) {
         let sum;
+        let lastCap = null;
         if (key === 'sustain' && (st.sustainSeries || []).length) {
             sum = _calLabSummarizeSustainSeries(st.sustainSeries);
+            const s = st.sustainSeries[st.sustainSeries.length - 1];
+            if (s) lastCap = { gatePassCount: s.gatePassCount, failedGateMask: s.failedGateMask };
         } else {
-            sum = _calLabSummarizeCaptures((st.techniqueCaptures && st.techniqueCaptures[key]) || []);
+            const caps = (st.techniqueCaptures && st.techniqueCaptures[key]) || [];
+            sum = _calLabSummarizeCaptures(caps);
+            lastCap = caps.length ? caps[caps.length - 1] : null;
         }
-        if (!sum.n) return 'No captures yet.';
+        if (!sum.n) return 'No captures yet — press Capture while playing.';
         const med = Number.isFinite(sum.medianSnrRatio) ? sum.medianSnrRatio.toFixed(2) : '—';
         const unit = key === 'sustain' ? 'samples' : 'captures';
-        return `${sum.n} ${unit} · med SNR ratio ${med} · dominant fail: ${sum.dominantFailure || '—'}`;
+        const weak = _calLabDominantFailLabel(sum.dominantFailure);
+        const chips = _calLabGateChipsHtml(lastCap);
+        return `${sum.n} ${unit} · clarity ratio ${med} (1.0 = at threshold) · weakest: ${weak}${chips ? ' · ' : ''}${chips}`;
     }
 
     function _calLabReportPreview(rep) {
@@ -6931,7 +7039,7 @@ function createNoteDetector(options = {}) {
                 if (!t.summary || !t.summary.n) continue;
                 const med = Number.isFinite(t.summary.medianSnrRatio)
                     ? t.summary.medianSnrRatio.toFixed(2) : '—';
-                lines.push(`${t.label}: n=${t.summary.n} medSNR=${med} dom=${t.summary.dominantFailure || '—'}`);
+                lines.push(`${t.label}: ${t.summary.n} captures · clarity ${med} · weakest: ${_calLabDominantFailLabel(t.summary.dominantFailure)}`);
             }
             return lines.slice(0, 12).join('\n') || '(empty)';
         } catch (_) { return ''; }
@@ -7190,10 +7298,10 @@ function createNoteDetector(options = {}) {
                 <div class="nd-health-top-miss text-gray-400 mb-1">—</div>
                 <div class="nd-health-align text-gray-400 mb-1">—</div>
                 <div class="nd-health-level text-gray-400 mb-1">—</div>
-                <div class="text-gray-200 text-[10px] font-semibold uppercase tracking-wider mt-2 mb-1">Last verifier rejects</div>
-                <div class="nd-health-rejects text-gray-400 font-mono text-[10px] whitespace-pre-line leading-snug mb-1">—</div>
+                <div class="text-gray-200 text-[10px] font-semibold uppercase tracking-wider mt-2 mb-1">Recent notes that did not verify</div>
+                <div class="nd-health-rejects text-gray-400 text-[10px] whitespace-pre-line leading-snug mb-1">—</div>
                 <div class="nd-health-hint text-amber-200/90 mt-2 pt-2 border-t border-gray-700/80">—</div>
-                <div class="text-[10px] text-gray-500 mt-1 leading-tight">Read-only. For calibration, open Settings → Note Detection.</div>
+                <div class="text-[10px] text-gray-500 mt-1 leading-tight">Read-only. Use the buttons below to run Calibration Wizard or Technique Assessment (gear icon next to Detect).</div>
                 <button type="button" class="nd-cal-wizard-open w-full mt-2 py-2 bg-dark-600 hover:bg-dark-500 border border-gray-700 rounded-lg text-xs text-gray-200 transition">
                     Run Calibration Wizard
                 </button>
