@@ -338,6 +338,71 @@ test('setVerifyTarget ctx: a non-finite tuning entry maps to 0 in place (no rein
     await flushPendingAsync();
 });
 
+test('setVerifyTarget transition: ctx1 -> ctx2 re-scores against the new ctx', async () => {
+    const env = verifyCtxSandbox();
+    const det = env.core.createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+    const detectTick = await findDetectTick(env);
+
+    det.setVerifyTarget([{ s: 1, f: 3 }], { arrangement: 'bass', tuning: [0, 0, 0, 0], stringCount: 4 });
+    assert.notEqual(det.getVerifyTarget(), null, 'target set with ctx1');
+
+    det.setVerifyTarget([{ s: 2, f: 5 }], { arrangement: 'bass', tuning: [-2, -2, -2, -2], stringCount: 4 });
+    assert.deepEqual([...det.getVerifyContext().offsets], [-2, -2, -2, -2], 'new ctx applied');
+
+    await detectTick();
+    await flushPendingAsync();
+    const req = env.scoreChordRequests[env.scoreChordRequests.length - 1];
+    assert.deepEqual([...req.offsets], [-2, -2, -2, -2], 'scoreChord uses ctx2, not ctx1');
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
+test('setVerifyTarget transition: ctx -> no-ctx clears the override (back to chart-coupled)', async () => {
+    const env = verifyCtxSandbox();
+    const det = env.core.createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+    await findDetectTick(env);
+
+    det.setVerifyTarget([{ s: 1, f: 3 }], { arrangement: 'bass', tuning: [-2, 0, 0, 0], stringCount: 4 });
+    assert.notEqual(det.getVerifyContext(), null, 'ctx override active');
+
+    det.setVerifyTarget([{ s: 0, f: 5 }]);   // no ctx → host-coupled
+    assert.equal(det.getVerifyContext(), null, 'override cleared');
+    assert.notEqual(det.getVerifyTarget(), null, 'the new (host-coupled) target is set');
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
+test('setVerifyTarget transition: no-ctx -> ctx adopts the override', async () => {
+    const env = verifyCtxSandbox();
+    const det = env.core.createNoteDetector({ isDefault: false });
+    await det.enable();
+    await flushPendingAsync();
+    const detectTick = await findDetectTick(env);
+
+    det.setVerifyTarget([{ s: 0, f: 5 }]);   // host-coupled first
+    assert.equal(det.getVerifyContext(), null, 'starts host-coupled');
+
+    det.setVerifyTarget([{ s: 1, f: 3 }], { arrangement: 'bass', openMidis: [23, 28, 33, 38, 43] });
+    const rb = det.getVerifyContext();
+    assert.equal(rb.arrangement, 'bass', 'override adopted');
+    assert.equal(rb.stringCount, 5);
+
+    await detectTick();
+    await flushPendingAsync();
+    const req = env.scoreChordRequests[env.scoreChordRequests.length - 1];
+    assert.equal(req.arrangement, 'bass', 'scoreChord now uses the override');
+    assert.equal(req.stringCount, 5);
+
+    det.destroy();
+    await flushPendingAsync();
+});
+
 test('setVerifyTarget without ctx: legacy chart-coupling is preserved (dropped on song-switch)', async () => {
     const env = verifyCtxSandbox();
     const det = env.core.createNoteDetector({ isDefault: false });
