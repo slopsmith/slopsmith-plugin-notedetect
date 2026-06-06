@@ -5923,7 +5923,10 @@ function createNoteDetector(options = {}) {
         // (not only on destroy): its handler arms/saves takes, so it must
         // not stay live while Detect is off. Re-enable rebinds it.
         _unbindAutoRecord();
-        _calUnbindEvents();
+        // NOTE: deliberately do NOT unbind auto-calibrate here. The host
+        // disable()s detection at song-end (sometimes BEFORE the plugin's
+        // song:ended handler runs), so unbinding on disable would drop the
+        // calibrate trigger. Self-gated + once-per-play; torn down in destroy().
         if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
         if (gcInterval) { clearInterval(gcInterval); gcInterval = null; }
         for (const tid of flashTimeouts) clearTimeout(tid);
@@ -7165,13 +7168,23 @@ function createNoteDetector(options = {}) {
     // enableImpl() / unbound in disable()+destroy(), so the audio-less vm
     // tests never register these listeners (keeps listener-count contracts).
     function _ndRunAutoCalibrate() {
-        if (!autoCalibrate || !isDefault || _calDoneThisPlay) return;
-        if (typeof window.setAvOffsetMs !== 'function') return;
+        const reason = _ndRunAutoCalibrateInner();
+        // TEMP diagnostic beacon: surface the calibrate outcome in the server
+        // access log (no new endpoint) so a real play reveals why it no-ops,
+        // without asking the user to read a browser console. Remove once green.
+        try { fetch('/api/version?nd_cal=' + encodeURIComponent(String(reason)).slice(0, 180)); } catch (_) {}
+        return reason;
+    }
+    function _ndRunAutoCalibrateInner() {
+        if (!autoCalibrate) return 'autoCalibrate off';
+        if (!isDefault) return 'not default';
+        if (_calDoneThisPlay) return 'already done this play';
+        if (typeof window.setAvOffsetMs !== 'function') return 'no window.setAvOffsetMs';
         const notes = (hw && hw.getNotes) ? hw.getNotes() : null;
-        if (!notes || !notes.length) return;
+        if (!notes || !notes.length) return 'no notes';
         const geom = { arrangement: currentArrangement, stringCount: currentStringCount, offsets: tuningOffsets, capo };
         const r = _ndCalibrateOffsetMs(_calDetections, notes, geom, timingHitThreshold, pitchTolerance, {});
-        if (!r) return;
+        if (!r) return `sweep null (dets=${_calDetections.length}, notes=${notes.length}, arr=${currentArrangement}/${currentStringCount}, win=${timingHitThreshold}, tol=${pitchTolerance})`;
         _calDoneThisPlay = true;
         _lastAvCalibration = r;
         try {
@@ -7180,17 +7193,22 @@ function createNoteDetector(options = {}) {
             if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
                 window.slopsmith.emit('notedetect:calibrated', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
             }
-        } catch (_) {}
+        } catch (e) { return 'setAvOffsetMs threw: ' + (e && e.message || e); }
+        return 'OK ' + JSON.stringify(r);
     }
-    let _calOnLoaded = null, _calOnEnded = null, _calSubscribed = false;
+    let _calOnLoaded = null, _calOnEnded = null, _calOnPause = null, _calSubscribed = false;
     function _calBindEvents() {
         if (!isDefault || _calSubscribed) return;
         if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
         _calOnLoaded = () => { _calDetections = []; _calDoneThisPlay = false; _lastAvCalibration = null; };
         _calOnEnded  = () => { _ndRunAutoCalibrate(); };
+        // Also fire on pause — the host may end a take via pause (or stop)
+        // rather than a clean song:ended; once-per-play guards re-runs.
+        _calOnPause  = () => { _ndRunAutoCalibrate(); };
         try {
             window.slopsmith.on('song:loaded', _calOnLoaded);
             window.slopsmith.on('song:ended',  _calOnEnded);
+            window.slopsmith.on('song:pause',  _calOnPause);
             _calSubscribed = true;
         } catch (_) { _calUnbindEvents(); }
     }
@@ -7198,8 +7216,9 @@ function createNoteDetector(options = {}) {
         if (window.slopsmith && typeof window.slopsmith.off === 'function') {
             if (_calOnLoaded) { try { window.slopsmith.off('song:loaded', _calOnLoaded); } catch (_) {} }
             if (_calOnEnded)  { try { window.slopsmith.off('song:ended',  _calOnEnded); } catch (_) {} }
+            if (_calOnPause)  { try { window.slopsmith.off('song:pause',  _calOnPause); } catch (_) {} }
         }
-        _calOnLoaded = _calOnEnded = null;
+        _calOnLoaded = _calOnEnded = _calOnPause = null;
         _calSubscribed = false;
     }
 
@@ -7611,6 +7630,11 @@ function createNoteDetector(options = {}) {
             saveSettings();
         },
         getLastCalibration: () => _lastAvCalibration,
+        // Debug hooks: detection-log state + a manual calibrate trigger, so a
+        // headless run can see whether the log fills and why calibrate no-ops.
+        _calDebug: () => ({ detections: _calDetections.length, subscribed: _calSubscribed, autoCalibrate, isDefault, notes: (hw && hw.getNotes) ? (hw.getNotes() || []).length : -1 }),
+        _calDetectionsDump: () => _calDetections.slice(),
+        _runAutoCalibrate: () => _ndRunAutoCalibrate(),
         // Test hook: run the offset sweep on a supplied detection log + notes
         // without the audio pipeline. Production calls _ndRunAutoCalibrate().
         _calibrateOffsetMs: (dets, notes, geom, winS, tolC, opts) =>
