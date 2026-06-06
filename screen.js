@@ -317,6 +317,103 @@ function _ndStandardMidiFor(arrangement, stringCount) {
     return _ND_TUNING_GUITAR_6;
 }
 
+// Stable fingerprint of the tuning context a verify target is scored under.
+// A (string, fret) only maps to a pitch under a specific arrangement + string
+// count + per-string offsets + capo, so a target is meaningless once that
+// context changes. Used to bind a verify target to its context and drop it on
+// mismatch. Pure — takes the context explicitly so the host-chart binding and
+// a caller-supplied override (setVerifyTarget's ctx) share one definition.
+function _ndVerifySigFor(arrangement, stringCount, offsets, capo) {
+    return arrangement + '|' + stringCount + '|'
+        + offsets.slice(0, stringCount).join(',') + '|' + capo;
+}
+
+// Sanitize a caller-supplied verify context (setVerifyTarget's 2nd arg) into a
+// coherent { arrangement, stringCount, offsets, capo }, or null when no usable
+// context object was passed (→ score against the host song's live tuning, the
+// back-compat Step Mode behavior). Lets a non-chart consumer (contained
+// playback: SlopScale, Chord Sprint) verify against the player's real
+// instrument instead of whatever song the host highway happens to have loaded.
+//
+// The per-string tuning may be given two ways (checked in this order):
+//   • `openMidis`: ABSOLUTE open-string MIDI per string (e.g. [40,45,50,55,59,
+//     64] for standard guitar) — what a non-chart consumer naturally holds.
+//     Converted here to standard-tuning offsets. These are the REAL sounding
+//     open pitches (any capo is already baked in), so the openMidis path
+//     forces capo 0 — applying ctx.capo on top would transpose twice.
+//   • `tuning` / `offsets`: per-string semitone OFFSETS from standard tuning
+//     (the chart convention, matching the instance's tuningOffsets). `offsets`
+//     is also accepted so getVerifyContext() output round-trips back in. This
+//     path honors ctx.capo.
+// Either array is read BY STRING INDEX — a non-finite entry maps to 0 in place,
+// never reindexed, so one bad string can't shift the others' pitch mapping.
+//
+// `arrangement` is optional: when omitted and absolute openMidis were given,
+// it's inferred as whichever of bass/guitar the pitches sit closest to (so a
+// 5-string bass isn't mis-scored — and mis-parameterized — as a guitar);
+// otherwise it defaults to guitar.
+function _ndSanitizeVerifyCtx(ctx) {
+    if (!ctx || typeof ctx !== 'object') return null;
+    const rawOpen = Array.isArray(ctx.openMidis) ? ctx.openMidis : null;
+    const rawOff = Array.isArray(ctx.tuning) ? ctx.tuning
+        : (Array.isArray(ctx.offsets) ? ctx.offsets : null);
+    // String count: explicit wins; else the source array length; else (no
+    // array) the arrangement default.
+    const srcLen = (rawOpen && rawOpen.length) || (rawOff && rawOff.length) || 0;
+    const explicitArr = (ctx.arrangement != null)
+        ? _ndArrangementKindFromName(ctx.arrangement) : null;
+    let stringCount = Number.isInteger(ctx.stringCount) && ctx.stringCount > 0
+        ? ctx.stringCount
+        : (srcLen || ((explicitArr || 'guitar') === 'bass' ? 4 : 6));
+    stringCount = Math.max(1, Math.min(8, stringCount));
+    // Arrangement: explicit wins; else infer from absolute pitches; else guitar.
+    const arrangement = explicitArr
+        || (rawOpen ? _ndInferArrangementFromOpenMidis(rawOpen, stringCount) : 'guitar');
+    // Clamp to the arrangement's supported tuning-table range so the scorer's
+    // standard base always covers every string — _ndStandardMidiFor only models
+    // bass 4/5 and guitar 6/7/8, and a higher count would index an undefined
+    // base (NaN pitch, never verifies). 6-string bass is out of scope here.
+    stringCount = Math.min(stringCount, arrangement === 'bass' ? 5 : 8);
+    const offsets = [];
+    let capo;
+    if (rawOpen) {
+        // Absolute open MIDI → offsets from this arrangement's standard tuning.
+        const base = _ndStandardMidiFor(arrangement, stringCount);
+        for (let s = 0; s < stringCount; s++) {
+            const m = rawOpen[s];
+            offsets.push(Number.isFinite(m) && Number.isFinite(base[s])
+                ? Math.round(m - base[s]) : 0);
+        }
+        // openMidis already encode the real (capoed) open pitches.
+        capo = 0;
+    } else {
+        // Offsets convention. Read by string index, non-finite → 0.
+        for (let s = 0; s < stringCount; s++) {
+            const v = rawOff ? rawOff[s] : 0;
+            offsets.push(Number.isFinite(v) ? Math.trunc(v) : 0);
+        }
+        capo = Number.isInteger(ctx.capo) && ctx.capo >= 0 ? ctx.capo : 0;
+    }
+    return { arrangement, stringCount, offsets, capo };
+}
+
+// Pick the arrangement (bass/guitar) whose standard tuning a set of absolute
+// open-string MIDI values sits closest to — used to infer arrangement when a
+// caller supplies openMidis without naming one. A non-finite/out-of-range
+// string contributes a fixed penalty so partial data still resolves sanely.
+function _ndInferArrangementFromOpenMidis(openMidis, stringCount) {
+    const totalDistance = (arrangement) => {
+        const base = _ndStandardMidiFor(arrangement, stringCount);
+        let sum = 0;
+        for (let s = 0; s < stringCount; s++) {
+            const m = openMidis[s];
+            sum += (Number.isFinite(m) && Number.isFinite(base[s])) ? Math.abs(m - base[s]) : 12;
+        }
+        return sum;
+    };
+    return totalDistance('bass') < totalDistance('guitar') ? 'bass' : 'guitar';
+}
+
 // ── Pure mapping helpers ───────────────────────────────────────────────────
 // All take state (arrangement, stringCount, offsets, capo) as explicit args
 // so they remain safe to call across multiple instances with different
@@ -1674,16 +1771,35 @@ function createNoteDetector(options = {}) {
     // array of {s, f, ...technique flags} or null. When set, every frame
     // scores it against the live audio and emits notedetect:verify on a hit.
     let _verifyTarget = null;
-    // Strong chart fingerprint captured when the target was registered. A
-    // (string, fret) only maps to a pitch under a specific arrangement +
-    // tuning + capo, so a target is meaningless once the chart changes. We
-    // bind the target to this fingerprint and drop it on mismatch, so a
-    // song/arrangement switch can never emit notedetect:verify for the wrong
-    // chart (independent of whether the consumer remembers to clear it).
+    // Optional caller-supplied tuning context for the verify target
+    // ({ arrangement, stringCount, offsets, capo }), or null to score against
+    // the host song's live tuning. Lets a non-chart consumer (contained
+    // playback) verify against the player's real instrument rather than the
+    // loaded chart — see _ndSanitizeVerifyCtx.
+    let _verifyTargetCtx = null;
+    // Strong fingerprint of the tuning context captured when the target was
+    // registered. A (string, fret) only maps to a pitch under a specific
+    // arrangement + tuning + capo, so a target is meaningless once that
+    // context changes. We bind the target to this fingerprint and drop it on
+    // mismatch, so a song/arrangement switch can never emit notedetect:verify
+    // for the wrong context (independent of whether the consumer remembers to
+    // clear it). When _verifyTargetCtx is set the fingerprint comes from the
+    // override, so a host song-switch underneath does NOT drop the target.
     let _verifyTargetSig = null;
-    function _ndVerifyChartSig() {
-        return currentArrangement + '|' + currentStringCount + '|'
-            + tuningOffsets.slice(0, currentStringCount).join(',') + '|' + capo;
+    // The tuning context the verify target is scored under: the caller's
+    // override when one was supplied, else the host song's live state.
+    function _ndVerifyActiveCtx() {
+        if (_verifyTargetCtx) return _verifyTargetCtx;
+        return {
+            arrangement: currentArrangement,
+            stringCount: currentStringCount,
+            offsets: tuningOffsets,
+            capo,
+        };
+    }
+    function _ndVerifyActiveSig() {
+        const c = _ndVerifyActiveCtx();
+        return _ndVerifySigFor(c.arrangement, c.stringCount, c.offsets, c.capo);
     }
     // Last chord constraint result — shown in HUD when no single note is detected.
     // Reset on song change via resetScoring(). `lastChordTime` is the
@@ -3186,17 +3302,22 @@ function createNoteDetector(options = {}) {
         // The target only makes sense on the chart it was registered for —
         // drop it outright if the arrangement/tuning/capo changed, so a stale
         // target can never score (or emit verify) against a different chart.
-        if (_verifyTargetSig !== _ndVerifyChartSig()) {
+        if (_verifyTargetSig !== _ndVerifyActiveSig()) {
             _verifyTarget = null;
             _verifyTargetSig = null;
+            _verifyTargetCtx = null;
             return;
         }
+        // Tuning context the target is scored under: the caller's override
+        // when one was registered (contained playback verifying against the
+        // player's real instrument), else the host song's live state.
+        const ctx = _ndVerifyActiveCtx();
         // Same arrangement-aware harmonic-comb verify window the single-note
         // path uses. Passing the user's tight pitch_tolerance_cents straight
         // into the DSP scorer rejects ~90% of correctly-played notes (a
         // spectral peak is far coarser than a ±10-cent gate), so use the
         // deliberately-generous verify window instead.
-        const verifyParams = _ndVerifyParamsFor(currentArrangement);
+        const verifyParams = _ndVerifyParamsFor(ctx.arrangement);
         let result;
         if (usingDesktopBridge) {
             if (!bridgeDesktop || !bridgeDesktop.audio
@@ -3204,10 +3325,10 @@ function createNoteDetector(options = {}) {
             const gen = sessionGen;
             try {
                 result = await bridgeDesktop.audio.scoreChord({
-                    arrangement: currentArrangement,
-                    stringCount: currentStringCount,
-                    offsets: tuningOffsets.slice(0, currentStringCount),
-                    capo,
+                    arrangement: ctx.arrangement,
+                    stringCount: ctx.stringCount,
+                    offsets: ctx.offsets.slice(0, ctx.stringCount),
+                    capo: ctx.capo,
                     pitchCheckCents: verifyParams.pitchCheckCents,
                     minHitRatio: _ND_VERIFY_MIN_HIT_RATIO,
                     bypassMl: true,               // force the DSP scorer, not the ML path
@@ -3219,16 +3340,16 @@ function createNoteDetector(options = {}) {
             } catch (e) { return; }
             if (!enabled || gen !== sessionGen) return;
             // The IPC round-trip yields; if the consumer cleared/replaced the
-            // target, or the chart (arrangement/tuning/capo) changed during it,
-            // this result is for a stale note — drop it so we don't fire verify
-            // for the wrong step.
-            if (_verifyTarget !== target || _verifyTargetSig !== _ndVerifyChartSig()) return;
+            // target, or its tuning context changed during it, this result is
+            // for a stale note — drop it so we don't fire verify for the
+            // wrong step.
+            if (_verifyTarget !== target || _verifyTargetSig !== _ndVerifyActiveSig()) return;
         } else {
             if (!frameBuffer) return;
             const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
             result = _ndScoreChord(
                 frameBuffer, sr, target,
-                currentArrangement, currentStringCount, tuningOffsets, capo,
+                ctx.arrangement, ctx.stringCount, ctx.offsets, ctx.capo,
                 verifyParams.pitchCheckCents, _ND_VERIFY_MIN_HIT_RATIO
             );
         }
@@ -7321,8 +7442,22 @@ function createNoteDetector(options = {}) {
         // now?" using the chart-aware verifier without the timing gate that
         // makes notedetect:hit unsuitable there (#468 / #630). `notes` is an
         // array of { s, f, ho?, po?, b?, sl?, hm? }.
-        setVerifyTarget: (notes) => {
-            if (!Array.isArray(notes)) { _verifyTarget = null; _verifyTargetSig = null; return; }
+        //
+        // Optional `ctx` overrides the tuning the target is scored under. Give
+        // the per-string tuning as either `openMidis` (absolute open-string
+        // MIDI) or `tuning`/`offsets` (semitone offsets from standard), plus
+        // optional `arrangement` / `capo` / `stringCount` — see
+        // _ndSanitizeVerifyCtx. Pass it so a non-chart consumer (contained
+        // playback — SlopScale, Chord Sprint) scores against the player's real
+        // instrument instead of the host's loaded song; the target then
+        // survives host song-switches and is only dropped when the ctx itself
+        // changes. Omit ctx (or pass null) to keep the chart-coupled behavior
+        // (Step Mode).
+        setVerifyTarget: (notes, ctx) => {
+            if (!Array.isArray(notes)) {
+                _verifyTarget = null; _verifyTargetSig = null; _verifyTargetCtx = null;
+                return;
+            }
             // Filter to well-formed positions and store a private copy so a
             // caller mutating its array can't later break the gate's
             // "null or non-empty sanitized array" invariant.
@@ -7334,11 +7469,30 @@ function createNoteDetector(options = {}) {
                     s: n.s, f: n.f,
                     ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
                 }));
-            _verifyTarget = clean.length ? clean : null;
-            // Bind the target to the chart it was registered on.
-            _verifyTargetSig = _verifyTarget ? _ndVerifyChartSig() : null;
+            let cleanNotes = clean.length ? clean : null;
+            // A ctx only makes sense alongside a live target.
+            const vctx = cleanNotes ? _ndSanitizeVerifyCtx(ctx) : null;
+            if (cleanNotes && vctx) {
+                // Drop notes referencing strings the override's tuning can't
+                // represent (e.g. an out-of-table 6-string-bass string left
+                // over after the ctx clamp), so the target never carries a
+                // string that maps to a NaN pitch and silently never verifies.
+                cleanNotes = cleanNotes.filter(n => n.s < vctx.stringCount);
+                if (!cleanNotes.length) cleanNotes = null;
+            }
+            _verifyTarget = cleanNotes;
+            _verifyTargetCtx = cleanNotes ? vctx : null;
+            // Bind the target to the context it was registered under (the
+            // override when supplied, else the host chart).
+            _verifyTargetSig = cleanNotes ? _ndVerifyActiveSig() : null;
         },
         getVerifyTarget: () => (_verifyTarget ? _verifyTarget.map(n => ({ ...n })) : null),
+        // The caller-supplied tuning context the current verify target is
+        // scored under, or null when it tracks the host song's live tuning.
+        getVerifyContext: () => (_verifyTargetCtx
+            ? { arrangement: _verifyTargetCtx.arrangement, stringCount: _verifyTargetCtx.stringCount,
+                offsets: _verifyTargetCtx.offsets.slice(), capo: _verifyTargetCtx.capo }
+            : null),
         getStats: () => ({
             hits, misses, streak, bestStreak,
             accuracy: (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0,
