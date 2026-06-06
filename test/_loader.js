@@ -173,6 +173,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_ndYinDetect', '_ndHpsDetect', '_ndFreqToMidi',
         '_ndMidiFromStringFret', '_ndMidiToStringFret',
         '_ndResolveDisplayFingering', '_ndNearestOctaveCents',
+        '_ndCalibrateOffsetMs',
         '_ndStringBandHz', '_ndBandEnergy',
         '_ndConstraintCheckString', '_ndScoreChord',
         '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
@@ -291,6 +292,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
                 })),
             };
         },
+        calibrateOffsetMs: sandbox._ndCalibrateOffsetMs,
         createNoteDetector: sandbox.createNoteDetector,
         // Drill-mode tests: expose the slopsmith stub so tests can
         // drive synthetic `loop:restart` etc. and toggle the loop
