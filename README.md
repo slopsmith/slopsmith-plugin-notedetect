@@ -52,6 +52,15 @@ Click the gear icon when detection is active to access:
 - **Input Gain** — amplify weak signals
 - **Chord Leniency** — fraction of a chord's strings that must ring for the chord to count as a hit (default 60%, range 25–100%)
 
+On the **Settings → Note Detection** page (not the gear popover):
+
+- **Auto-record every play** — on by default. Each play with detection enabled is captured to a WAV in `static/note_detect_recordings/` (auto-saved on song-end or pause) so you can replay it through the headless harness or analyse it later — no manual arming. Turn off to stop saving recordings.
+- **Auto-calibrate A/V offset** — on by default. After each play, the detections are swept for the audio/video offset that matches the most chart notes, and that offset is applied automatically — compensating the detector's real-time processing latency so you never hand-set the A/V slider. One play is usually enough to converge.
+
+Advanced (persisted setting, no dedicated control yet — set via `window.noteDetect.applySettings` / localStorage):
+
+- **`frameSize`** — the audio-callback buffer fed to the detector, in samples (default **2048**). 1024 (~21 ms) is too short to resolve a low-bass fundamental (a low-E period is ~24 ms), so the detector silently drops most bass notes; 2048 (~43 ms) roughly triples bass recall for an imperceptible latency cost. Lower toward 1024 for guitar-only minimum input latency.
+
 All settings are persisted in localStorage across sessions.
 
 ## Scoring

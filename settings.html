@@ -66,6 +66,23 @@
         </label>
     </div>
 
+    <!-- Auto-calibrate A/V offset. On by default. Each play's detections are
+         swept on song-end for the offset that matches the most chart notes,
+         then applied via setAvOffsetMs — compensates the detector's real-time
+         latency so the user never hand-sets the A/V slider. -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4 mb-4">
+        <label class="flex items-start gap-3 cursor-pointer select-none">
+            <input type="checkbox" id="nd-auto-calibrate"
+                   class="mt-0.5 rounded border-gray-600 bg-dark-700 text-accent focus:ring-accent/40">
+            <span class="text-sm text-gray-300">
+                Auto-calibrate A/V offset
+                <span class="block text-[11px] text-gray-500 leading-relaxed mt-1">
+                    On by default. After each play, picks the audio/video offset that matches the most chart notes and applies it automatically — no hand-setting the A/V slider. One play is usually enough to converge.
+                </span>
+            </span>
+        </label>
+    </div>
+
     <!-- Tuning-mode toggle. Lives here (where the panels it gates also
          live) so the user doesn't have to bounce between the gear
          popover and this page just to reveal developer surfaces.
@@ -698,6 +715,12 @@
         if (autoRecCb && autoRecCb.checked !== autoRec) autoRecCb.checked = autoRec;
         if (autoRecCb) autoRecCb.disabled = !nd;
 
+        // Auto-calibrate toggle — always visible.
+        const autoCal   = !!(nd && typeof nd.isAutoCalibrate === 'function' && nd.isAutoCalibrate());
+        const autoCalCb = _q('nd-auto-calibrate');
+        if (autoCalCb && autoCalCb.checked !== autoCal) autoCalCb.checked = autoCal;
+        if (autoCalCb) autoCalCb.disabled = !nd;
+
         const tuning = !!(nd && typeof nd.isTuningMode === 'function' && nd.isTuningMode());
         const cb     = _q('nd-tuning-mode');
         const panels = _q('nd-tuning-panels');
@@ -858,6 +881,15 @@
         autoRecCb.onchange = () => {
             const nd = window.noteDetect;
             if (nd && typeof nd.setAutoRecord === 'function') nd.setAutoRecord(autoRecCb.checked);
+        };
+    }
+
+    // Auto-calibrate toggle — auto-derive the A/V offset each play.
+    const autoCalCb = _q('nd-auto-calibrate');
+    if (autoCalCb) {
+        autoCalCb.onchange = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.setAutoCalibrate === 'function') nd.setAutoCalibrate(autoCalCb.checked);
         };
     }
 
