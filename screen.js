@@ -7809,15 +7809,9 @@ function createNoteDetector(options = {}) {
     // detection log + the once-guard reset on song:loaded. Bound from
     // enableImpl() / unbound in disable()+destroy(), so the audio-less vm
     // tests never register these listeners (keeps listener-count contracts).
+    // Returns a short reason string (for the test/debug hook); the listeners
+    // ignore it. The success path sets _lastAvCalibration + applies the offset.
     function _ndRunAutoCalibrate() {
-        const reason = _ndRunAutoCalibrateInner();
-        // TEMP diagnostic beacon: surface the calibrate outcome in the server
-        // access log (no new endpoint) so a real play reveals why it no-ops,
-        // without asking the user to read a browser console. Remove once green.
-        try { fetch('/api/version?nd_cal=' + encodeURIComponent(String(reason)).slice(0, 180)); } catch (_) {}
-        return reason;
-    }
-    function _ndRunAutoCalibrateInner() {
         if (!autoCalibrate) return 'autoCalibrate off';
         if (!isDefault) return 'not default';
         if (_calDoneThisPlay) return 'already done this play';
