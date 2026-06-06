@@ -590,6 +590,56 @@ function _ndMinAnalysisSamples(arrangement, sampleRate) {
     return Math.max(_ND_MIN_YIN_SAMPLES, need);
 }
 
+// ── A/V auto-calibration ──────────────────────────────────────────────
+// The harness objective made concrete in-app. Given offset-free detections
+// (`{ bt, m }`: bt = hw.getTime() − latencyOffset, m = detected MIDI) logged
+// across a play, and the chart notes, sweep candidate A/V offsets and return
+// the one (ms) that matches the MOST chart notes within the hit window — then
+// refine by the mean residual so matched detections sit centered in their
+// windows. Maximizing matched-notes (recall) is robust even from a bad start,
+// unlike shifting by the median timing error of whatever hits you already have
+// (which collapses when the offset is far off). Pure + exported for tests;
+// returns null when there isn't enough evidence to decide.
+function _ndCalibrateOffsetMs(detections, chartNotes, geom, hitWindowS, pitchTolCents, opts) {
+    opts = opts || {};
+    const loMs = (opts.loMs != null) ? opts.loMs : -250;
+    const hiMs = (opts.hiMs != null) ? opts.hiMs : 250;
+    const stepMs = opts.stepMs || 10;
+    const minMatched = (opts.minMatched != null) ? opts.minMatched : 12;
+    if (!Array.isArray(detections) || !Array.isArray(chartNotes)) return null;
+    if (detections.length < minMatched || chartNotes.length < minMatched) return null;
+    // Expected MIDI + time per single chart note (skip chord-only / unfingered).
+    const exp = [];
+    for (const n of chartNotes) {
+        const t = (n.time != null) ? n.time : n.t;
+        if (t == null || n.s == null || n.f == null) continue;
+        const em = _ndMidiFromStringFret(n.s, n.f, geom.arrangement, geom.stringCount, geom.offsets, geom.capo);
+        if (Number.isFinite(em)) exp.push({ t, em });
+    }
+    if (exp.length < minMatched) return null;
+    const dets = detections.slice().sort((a, b) => a.bt - b.bt);
+    let best = null;
+    for (let ms = loMs; ms <= hiMs; ms += stepMs) {
+        const off = ms / 1000;
+        let matched = 0, residSum = 0;
+        for (const note of exp) {
+            for (let i = 0; i < dets.length; i++) {
+                const dt = dets[i].bt + off - note.t;
+                if (dt < -hitWindowS) continue;
+                if (dt > hitWindowS) break;            // dets sorted by bt → past the window
+                if (Math.abs(_ndNearestOctaveCents(dets[i].m, note.em)) <= pitchTolCents) {
+                    matched++; residSum += dt; break;
+                }
+            }
+        }
+        if (!best || matched > best.matched) best = { ms, matched, resid: matched ? residSum / matched : 0 };
+    }
+    if (!best || best.matched < minMatched) return null;
+    // Refine: shift so matched detections center in their windows (sub-grid).
+    const refinedMs = Math.round(best.ms - best.resid * 1000);
+    return { offsetMs: Math.max(-1000, Math.min(1000, refinedMs)), matched: best.matched, total: exp.length };
+}
+
 // In-place radix-2 Cooley-Tukey on interleaved {re, im} pairs.
 // `data` has length 2*N (N real/imag pairs). `direction` is +1 for
 // forward (standard DFT sign: exp(-i·2π·k·n/N)) and -1 for inverse. No
@@ -1325,6 +1375,11 @@ function createNoteDetector(options = {}) {
     // configuration, not a code fork. Clamped to a valid ScriptProcessor
     // buffer size on load.
     let frameSize = 2048;
+    // Auto-calibrate the A/V offset from each play: log offset-free detections,
+    // then on song-end sweep for the offset that maximizes matched notes (the
+    // harness objective) and apply it via window.setAvOffsetMs — so the user
+    // never hand-sets the latency number. Persisted/tunable like the others.
+    let autoCalibrate = true;
     let missMarkerDuration = 2.0;
     let hitGlowDuration = 0.5;
     let inputGain = 1.0;
@@ -1403,6 +1458,7 @@ function createNoteDetector(options = {}) {
             if (s.tuningMode !== undefined) tuningMode = !!s.tuningMode;
             if (s.autoRecord !== undefined) autoRecord = !!s.autoRecord;
             if (s.frameSize !== undefined) frameSize = _ndClampFrameSize(s.frameSize);
+            if (s.autoCalibrate !== undefined) autoCalibrate = !!s.autoCalibrate;
             // Persisted on/off preference. Absence keeps the default
             // (true), so fresh installs get Detect on out of the box.
             if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
@@ -1501,6 +1557,12 @@ function createNoteDetector(options = {}) {
     // a signal that responds linearly to A/V offset, which is what the
     // auto-calibrate button keys off of.
     const _diagTimingErrorsHits = [];
+    // A/V auto-calibration: offset-free detections logged across a play
+    // ({ bt: hw.getTime()-latencyOffset, m: detectedMidi }); swept on song-end.
+    let _calDetections = [];
+    const _CAL_MAX = 8000;          // ~ caps memory on a long take
+    let _calDoneThisPlay = false;   // calibrate at most once per play
+    let _lastAvCalibration = null;  // { offsetMs, matched, total } for the UI
     const _diagPitchErrors  = [];   // cents,        sign = positive sharp / negative flat
     // Per-judgment event capture for the downloadable JSON. Capped at a
     // size that keeps the JSON small enough to share via copy-paste.
@@ -1881,6 +1943,7 @@ function createNoteDetector(options = {}) {
                 tuningMode,
                 autoRecord,
                 frameSize,
+                autoCalibrate,
                 detectEnabled: detectPreference,
                 missMarkerDuration,
                 hitGlowDuration,
@@ -3172,6 +3235,13 @@ function createNoteDetector(options = {}) {
     async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
+        // A/V auto-calibration tap: log the detection offset-free (everything
+        // except av-offset) so a post-play sweep can re-match at any candidate
+        // offset. Gated on the setting + the default singleton so split panels
+        // and disabled-setting users don't accumulate.
+        if (autoCalibrate && isDefault && detectedMidi >= 0 && _calDetections.length < _CAL_MAX) {
+            _calDetections.push({ bt: hw.getTime() - latencyOffset, m: detectedMidi });
+        }
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
         // raw audio buffer and doesn't need a confident monophonic pitch.
         // The single-note path below is gated on detectedMidi >= 0 and
@@ -5828,6 +5898,9 @@ function createNoteDetector(options = {}) {
         // vm tests can't enable(), so they never register it, keeping the
         // listener-count contracts intact.
         _bindAutoRecord();
+        // A/V auto-calibrate (default singleton only; no-op otherwise) — same
+        // enable-time lifecycle as auto-record.
+        _calBindEvents();
         return true;
     }
 
@@ -5850,6 +5923,7 @@ function createNoteDetector(options = {}) {
         // (not only on destroy): its handler arms/saves takes, so it must
         // not stay live while Detect is off. Re-enable rebinds it.
         _unbindAutoRecord();
+        _calUnbindEvents();
         if (missCheckInterval) { clearInterval(missCheckInterval); missCheckInterval = null; }
         if (gcInterval) { clearInterval(gcInterval); gcInterval = null; }
         for (const tid of flashTimeouts) clearTimeout(tid);
@@ -5881,6 +5955,7 @@ function createNoteDetector(options = {}) {
         _chartStateUnbindEvents();
         _recUnbindEvents();
         _unbindAutoRecord();
+        _calUnbindEvents();
         _liveUnbindEvents();
         // Discard any unsaved recording state — destroying the instance
         // shouldn't write a half-captured WAV (or fire off an upload).
@@ -7083,6 +7158,51 @@ function createNoteDetector(options = {}) {
         _autoRecOnLoaded = _autoRecOnPause = _autoRecOnPlay = null;
     }
 
+    // ── A/V auto-calibrate lifecycle ──────────────────────────────────
+    // On song-end, sweep the play's offset-free detections for the av-offset
+    // that maximizes matched notes and apply it. At most once per play; the
+    // detection log + the once-guard reset on song:loaded. Bound from
+    // enableImpl() / unbound in disable()+destroy(), so the audio-less vm
+    // tests never register these listeners (keeps listener-count contracts).
+    function _ndRunAutoCalibrate() {
+        if (!autoCalibrate || !isDefault || _calDoneThisPlay) return;
+        if (typeof window.setAvOffsetMs !== 'function') return;
+        const notes = (hw && hw.getNotes) ? hw.getNotes() : null;
+        if (!notes || !notes.length) return;
+        const geom = { arrangement: currentArrangement, stringCount: currentStringCount, offsets: tuningOffsets, capo };
+        const r = _ndCalibrateOffsetMs(_calDetections, notes, geom, timingHitThreshold, pitchTolerance, {});
+        if (!r) return;
+        _calDoneThisPlay = true;
+        _lastAvCalibration = r;
+        try {
+            window.setAvOffsetMs(r.offsetMs);
+            console.log(`[note_detect] A/V auto-calibrated to ${r.offsetMs} ms (${r.matched}/${r.total} notes matched)`);
+            if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+                window.slopsmith.emit('notedetect:calibrated', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
+            }
+        } catch (_) {}
+    }
+    let _calOnLoaded = null, _calOnEnded = null, _calSubscribed = false;
+    function _calBindEvents() {
+        if (!isDefault || _calSubscribed) return;
+        if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
+        _calOnLoaded = () => { _calDetections = []; _calDoneThisPlay = false; _lastAvCalibration = null; };
+        _calOnEnded  = () => { _ndRunAutoCalibrate(); };
+        try {
+            window.slopsmith.on('song:loaded', _calOnLoaded);
+            window.slopsmith.on('song:ended',  _calOnEnded);
+            _calSubscribed = true;
+        } catch (_) { _calUnbindEvents(); }
+    }
+    function _calUnbindEvents() {
+        if (window.slopsmith && typeof window.slopsmith.off === 'function') {
+            if (_calOnLoaded) { try { window.slopsmith.off('song:loaded', _calOnLoaded); } catch (_) {} }
+            if (_calOnEnded)  { try { window.slopsmith.off('song:ended',  _calOnEnded); } catch (_) {} }
+        }
+        _calOnLoaded = _calOnEnded = null;
+        _calSubscribed = false;
+    }
+
     // Live-streaming event bindings — only active while tuning mode is
     // on. Mints a fresh session id on song:play so every take produces
     // its own `live_<id>.jsonl` file server-side; clears it on song:end
@@ -7482,6 +7602,19 @@ function createNoteDetector(options = {}) {
             autoRecord = next;
             saveSettings();
         },
+        // A/V auto-calibrate opt-out + last result for the Settings UI.
+        isAutoCalibrate: () => autoCalibrate,
+        setAutoCalibrate: (v) => {
+            const next = !!v;
+            if (next === autoCalibrate) return;
+            autoCalibrate = next;
+            saveSettings();
+        },
+        getLastCalibration: () => _lastAvCalibration,
+        // Test hook: run the offset sweep on a supplied detection log + notes
+        // without the audio pipeline. Production calls _ndRunAutoCalibrate().
+        _calibrateOffsetMs: (dets, notes, geom, winS, tolC, opts) =>
+            _ndCalibrateOffsetMs(dets, notes, geom, winS, tolC, opts),
         // Reference-recording capture for the headless harness. Arms
         // the next song-play to capture the detector's input audio,
         // auto-saves on song:ended. POSTs the WAV to the plugin's
