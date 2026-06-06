@@ -199,7 +199,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.11.0';
+const _ND_VERSION = '1.11.1';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -7008,8 +7008,17 @@ function createNoteDetector(options = {}) {
             if (!autoRecord || !detectPreference) return;
             if (_recArmedForTraining) return;
             if (_recArmed) {
-                if (_recChunks.length > 0) { try { await saveRecordingNow(); } catch (_) {} }
-                else { discardRecording(); }
+                if (_recChunks.length > 0) {
+                    // saveRecordingNow() returns null and KEEPS _recChunks
+                    // on upload failure so the take can be retried via the
+                    // Save button. armRecording() below clears _recChunks /
+                    // _recLastSaveError, so a failed save here would silently
+                    // destroy the stranded take — bail and leave it intact.
+                    const saved = await saveRecordingNow().catch(() => null);
+                    if (!saved && _recChunks.length > 0) return;
+                } else {
+                    discardRecording();
+                }
             }
             armRecording();
         };
@@ -7030,7 +7039,10 @@ function createNoteDetector(options = {}) {
         // already fired, so set _recSongPlaying here or the first frames
         // of the resumed take wouldn't be captured.
         _autoRecOnPlay = () => {
-            if (!autoRecord || !detectPreference || _recArmedForTraining || _recArmed) return;
+            // _recChunks.length > 0 with nothing armed means a save failed and
+            // the take is preserved for retry; don't re-arm over it (armRecording
+            // would wipe the buffer and the error).
+            if (!autoRecord || !detectPreference || _recArmedForTraining || _recArmed || _recChunks.length > 0) return;
             armRecording();
             _recSongPlaying = true;
         };
@@ -7537,6 +7549,16 @@ function createNoteDetector(options = {}) {
         // the audio pipeline to assert the song:loaded auto-arm.
         _bindAutoRecord: _bindAutoRecord,
         _unbindAutoRecord: _unbindAutoRecord,
+        // The capture callback that pushes into _recChunks needs a live
+        // AudioContext the vm lacks, so tests can't get a non-empty buffer
+        // the normal way. Inject one frame so the failed-save-preservation
+        // path is testable (saveRecordingNow returns null + keeps the buffer;
+        // the auto handlers must not re-arm over it). Production never calls this.
+        _injectRecChunkForTest: (n = 128) => {
+            const frame = new Float32Array(n);
+            _recChunks.push(frame);
+            _recTotalSamples += frame.length;
+        },
         _getChartState: () => ({
             arrangement: currentArrangement,
             stringCount: currentStringCount,
