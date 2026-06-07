@@ -156,12 +156,9 @@
 // lastChordScore / lastChordHit / lastChordTotal are reset with the rest of
 // scoring state in resetScoring().
 //
-// ── CHANGE 7: YIN temporal AC averaging (Rocksmith-informed) ─────────────
+// ── CHANGE 7: YIN temporal AC averaging ─────────────
 //
 // _ndYinDetect previously peak-picked a single CMND frame per detection tick.
-// Rocksmith 2014's note detector (reverse-engineered from the Mac depot build,
-// Oct 2016 manifest) averages 10 consecutive autocorrelation frames before
-// committing to a pitch — this is its primary stability mechanism.
 //
 // Implementation: a module-level ring buffer (_ndYinAcHistory, 10 slots of
 // Float32Array) accumulates CMND frames. Each call to _ndYinDetect stores the
@@ -664,7 +661,7 @@ function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
         yinBuffer[tau] *= tau / runningSum; // cumulative mean normalized
     }
 
-    // ── Temporal AC averaging (Rocksmith-informed) ────────────────────
+    // ── Temporal AC averaging ────────────────────
     // Instead of peak-picking a single CMND frame, we maintain a ring
     // buffer of the last _ND_YIN_AC_HISTORY_FRAMES frames and average
     // them before finding the minimum. This is the primary stability
@@ -864,11 +861,7 @@ let _ndHpsScratch = null;
 let _ndHpsScratchSize = 0;
 
 // YIN autocorrelation history — ring buffer of the last N cumulative-mean-
-// normalised difference arrays, one per _ndYinDetect call. Averaging across
-// frames before peak-picking is the primary accuracy mechanism in Rocksmith's
-// note detector (it averages 10 AC frames before committing to a pitch). It
-// removes single-frame noise spikes and stabilises detection on decaying notes
-// and string transitions.
+// normalised difference arrays, one per _ndYinDetect call. 
 //
 // Only the difference array (length halfLen) is stored, not the full buffer,
 // so the memory cost is N × (maxHalfLen × 4 bytes). At 48 kHz, halfLen ≤
