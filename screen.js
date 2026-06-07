@@ -186,6 +186,43 @@
 //     if pitch changes are slow to register after a note change.
 //
 //
+// ── CHANGE 8: Spectral whitening (power compression) ─────────────────
+//
+// _ndFftMagnitude now applies mag^α (α = 0.33) to every bin before
+// returning. This compresses the dynamic range of the magnitude spectrum
+// so quieter strings in a chord are not swamped by the loudest one —
+// the primary motivation for the RS precision-mode `vpowf` pass.
+// All callers (HPS, _ndBandEnergy chord scorer) benefit automatically.
+// α is exposed as _ND_SPECTRAL_WHITENING_ALPHA; tune toward 0.5 if
+// noise-floor artefacts become audible, toward 0.25 for more aggressive
+// levelling.
+//
+// ── CHANGE 9: Harmonic subtraction ───────────────────────────────────
+//
+// After spectral whitening, _ndFftMagnitude runs 3 iterative harmonic-
+// subtraction passes. Each pass finds the strongest spectral peak in the
+// guitar/bass range (30–5000 Hz), subtracts a fraction of its amplitude
+// at harmonics 2–5 (decaying as 0.5/(h-1)), clamps to zero, then zeros
+// the peak so the next pass targets the next strongest fundamental.
+// This reduces cross-string harmonic bleed in _ndBandEnergy — a low-E
+// string's 2nd harmonic landing in the A-string's band was inflating
+// chord hit rates with false positives.
+// Constants: _ND_HARMONIC_SUB_PASSES=3, _ND_HARMONIC_COUNT=5,
+// _ND_HARMONIC_SUB_FACTOR=0.5. All three are tunable — increase passes
+// for denser voicings, reduce SUB_FACTOR if over-subtraction causes
+// missed strings on clean single-note playing.
+//
+// ── CHANGE 10: Harmonic detection — check at partial frequency ────────
+//
+// Previously hm-flagged notes used energy-only at the fundamental (which
+// is suppressed for harmonics). _ndScoreChord now shifts the effective
+// fret +12 semitones for hm notes so _ndConstraintCheckString centres
+// its band-energy check on the 2x partial (the dominant audible pitch).
+// pitchCheckCents is widened to 150 for harmonics to tolerate intonation
+// variation on the partial. Pinch (hp) and natural harmonics both use
+// the 2x partial; 3x (7th-fret natural, +19 semitones) is a known
+// future refinement.
+//
 // ── Module-level shared state ──────────────────────────────────────────────
 //
 // Shared state anchored on `window` so multiple evaluations of this
@@ -634,6 +671,10 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
 // window needs to be longer than the input — at 48 kHz a 30 Hz period is
 // ~1600 samples, so halfLen must exceed that, i.e. buffer must exceed ~3200.
 const _ND_MIN_DETECTABLE_HZ = 30;
+const _ND_SPECTRAL_WHITENING_ALPHA = 0.33;
+const _ND_HARMONIC_SUB_PASSES = 3;
+const _ND_HARMONIC_COUNT = 5;       // harmonics to subtract per pass
+const _ND_HARMONIC_SUB_FACTOR = 0.5; // fraction of peak amplitude to remove per harmonic
 
 function _ndYinDetect(buffer, sampleRate, minFreqHz = _ND_MIN_DETECTABLE_HZ) {
     const threshold = 0.15;
@@ -912,6 +953,61 @@ function _ndFftMagnitude(buffer, sampleRate) {
         const im = interleaved[2 * k + 1];
         magnitudes[k] = Math.sqrt(re * re + im * im);
     }
+
+    // ── Spectral whitening (power compression) ────────────────────────
+    // Apply mag^α to each bin before returning. α < 1 compresses the
+    // dynamic range of the spectrum so quieter strings in a chord aren't
+    // drowned out by the loudest one. α = 1 is a no-op (raw magnitudes);
+    // α = 0.33 approximates the cube-root compression RS uses. Values
+    // between 0.25–0.5 work well in practice — lower boosts weak strings
+    // more aggressively but can amplify noise floor artefacts.
+    // Applied here so ALL callers (HPS, band-energy chord scorer) benefit
+    // from the same whitened spectrum without each having to implement it.
+    
+for (let k = 0; k < halfBins; k++) {
+        magnitudes[k] = Math.pow(magnitudes[k], _ND_SPECTRAL_WHITENING_ALPHA);
+    }
+
+    // ── Harmonic subtraction ──────────────────────────────────────────
+    // Iteratively find the strongest spectral peak and subtract its
+    // harmonic series, reducing cross-string bleed in _ndBandEnergy.
+    // A string's harmonics fall into neighbouring strings' frequency
+    // bands and inflate their band-energy readings — on a 6-string chord
+    // the low E's 2nd harmonic lands squarely in the A-string band and
+    // can produce a false hit. Subtracting the harmonic series of each
+    // dominant peak before band-energy scoring collapses those impostor
+    // contributions back toward zero.
+    //
+    // RS uses 3 subtraction passes with a -0.5 interpolated falloff
+    // per harmonic and clamps to zero (no negative magnitudes). We
+    // mirror that here: 3 passes, each finding the current peak bin
+    // and subtracting 1/h of its amplitude at the h-th harmonic.
+    // The harmonic amplitude decays as 1/h (natural for most guitar
+    // tones); the 0.5 factor prevents over-subtraction on the first
+    // harmonic which often carries real energy from an adjacent string.
+
+    for (let pass = 0; pass < _ND_HARMONIC_SUB_PASSES; pass++) {
+        // Find the strongest remaining bin in the guitar/bass frequency range.
+        const minBin = Math.max(1, Math.floor(30 / (sampleRate / fftSize)));
+        const maxBin = Math.min(halfBins - 1, Math.floor(5000 / (sampleRate / fftSize)));
+        let peakBin = minBin;
+        let peakVal = magnitudes[minBin];
+        for (let k = minBin + 1; k <= maxBin; k++) {
+            if (magnitudes[k] > peakVal) { peakVal = magnitudes[k]; peakBin = k; }
+        }
+        if (peakVal <= 0) break;
+        // Subtract harmonics of this peak.
+        for (let h = 2; h <= _ND_HARMONIC_COUNT; h++) {
+            const hBin = peakBin * h;
+            if (hBin >= halfBins) break;
+            const subtractAmt = peakVal * _ND_HARMONIC_SUB_FACTOR / (h - 1);
+            magnitudes[hBin] = Math.max(0, magnitudes[hBin] - subtractAmt);
+        }
+        // Zero the peak itself after subtraction so the next pass finds
+        // the next strongest fundamental, not the same one again.
+        magnitudes[peakBin] = 0;
+    }
+
     return { magnitudes, binHz: sampleRate / fftSize, fftSize };
 }
 
@@ -1177,13 +1273,23 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
             cents = Math.max(cents, 100);
         }
         if (cn.hm) {
-            // Harmonic: energy-only check (pitch check at fundamental is unreliable)
-            cents = 0;
+            // Harmonic: check at the harmonic partial frequency rather
+            // than the suppressed fundamental. Pinch and natural 12th-fret
+            // harmonics both sound at 2x (one octave up = +12 semitones).
+            // Natural 7th-fret harmonics sound at 3x (+19 semitones) but
+            // are less common in charts; we default to 2x for all hm notes
+            // and widen the pitch window to 150 cents to tolerate intonation
+            // variation on the harmonic partial.
+            cents = 150;
         }
+        // For harmonic notes, shift the effective fret up 12 semitones
+        // so the band-energy check centres on the 2x partial, not the
+        // suppressed fundamental.
+        const effectiveFret = (cn.hm) ? cn.f + 12 : cn.f;
 
         const check = _ndConstraintCheckString(
             buffer, sampleRate,
-            cn.s, cn.f, arrangement, stringCount, offsets, capo,
+            cn.s, effectiveFret, arrangement, stringCount, offsets, capo,
             cents, energyThreshold, spectrum, totalEnergy
         );
         results.push({ s: cn.s, f: cn.f, ...check });
