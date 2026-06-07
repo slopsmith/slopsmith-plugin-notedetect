@@ -13154,40 +13154,83 @@ function createNoteDetector(options = {}) {
         _liveSessionId = null;
     }
 
-    // ── Diagnostic basic-guitar sloppak — post-play report (read-only) ──
-    // Recognises the generated technique-assessment diagnostic track and
-    // maps existing _diagEvents into beginner-friendly categories. Does
-    // NOT change scoring, thresholds, or settings.
-    const _DIAG_BASIC_GUITAR_MATCH_TOL_S = 0.075;
-    const _DIAG_BASIC_GUITAR_CHART = [
-        { t: 4,  category: 'openLow',      label: 'Open low string',  chord: false, s: 0, f: 0 },
-        { t: 8,  category: 'openNext',     label: 'Open next string', chord: false, s: 1, f: 0 },
-        { t: 12, category: 'fretted',      label: 'Fretted note',     chord: false, s: 0, f: 5 },
-        { t: 16, category: 'powerChords',  label: 'Power chord',      chord: true },
-        { t: 20, category: 'powerChords',  label: 'Power chord',      chord: true },
-        { t: 24, category: 'powerChords',  label: 'Power chord',      chord: true },
-        { t: 28, category: 'powerChords',  label: 'Power chord',      chord: true },
-        { t: 32, category: 'repeatCheck',  label: 'Repeat open low',  chord: false, s: 0, f: 0 },
-        { t: 36, category: 'repeatCheck',  label: 'Repeat fretted',   chord: false, s: 0, f: 5 },
-        { t: 40, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
-        { t: 44, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
-        { t: 48, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+    // ── Diagnostic track catalog — post-play report (read-only) ───────
+    // Catalog + report profiles let multiple diagnostic sloppaks share one
+    // detection/report path. Does NOT change scoring, thresholds, or settings.
+    const _DIAGNOSTIC_TRACK_CATALOG = [
+        {
+            id: 'basic-guitar-6',
+            title: 'Slopsmith Diagnostic — Basic Guitar',
+            artist: 'Slopsmith',
+            arrangement: 'Diagnostic Guitar',
+            filenameIncludes: 'slopsmith-diagnostic-basic-guitar.sloppak',
+            instrument: 'guitar',
+            stringCount: 6,
+            reportProfile: 'basic-guitar-v1',
+            description: 'Checks timing, open strings, fretted notes, and power chords.',
+        },
     ];
 
-    function _isDiagnosticBasicGuitarSession() {
+    const _DIAGNOSTIC_REPORT_PROFILES = {
+        'basic-guitar-v1': {
+            matchTolS: 0.075,
+            powerChordCategoryId: 'powerChords',
+            expectedChordStrings: 2,
+            displayOrder: ['openLow', 'openNext', 'fretted', 'powerChords', 'repeatCheck'],
+            singleHitMissCategories: ['openLow', 'openNext', 'fretted'],
+            events: [
+                { t: 4,  category: 'openLow',      label: 'Open low string',  chord: false, s: 0, f: 0 },
+                { t: 8,  category: 'openNext',     label: 'Open next string', chord: false, s: 1, f: 0 },
+                { t: 12, category: 'fretted',      label: 'Fretted note',     chord: false, s: 0, f: 5 },
+                { t: 16, category: 'powerChords',  label: 'Power chord',      chord: true },
+                { t: 20, category: 'powerChords',  label: 'Power chord',      chord: true },
+                { t: 24, category: 'powerChords',  label: 'Power chord',      chord: true },
+                { t: 28, category: 'powerChords',  label: 'Power chord',      chord: true },
+                { t: 32, category: 'repeatCheck',  label: 'Repeat open low',  chord: false, s: 0, f: 0 },
+                { t: 36, category: 'repeatCheck',  label: 'Repeat fretted',   chord: false, s: 0, f: 5 },
+                { t: 40, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+                { t: 44, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+                { t: 48, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+            ],
+            categories: {
+                openLow:     { label: 'Open low string' },
+                openNext:    { label: 'Open next string' },
+                fretted:     { label: 'Fretted note' },
+                powerChords: { label: 'Power chords' },
+                repeatCheck: { label: 'Repeat check' },
+            },
+        },
+    };
+
+    function _getDiagnosticTrackForSession() {
         const fn = (_ndShared.currentFilename || '').toLowerCase();
-        if (fn.includes('slopsmith-diagnostic-basic-guitar.sloppak')) return true;
         const currentHw = resolveHw();
         const info = (currentHw && currentHw.getSongInfo) ? currentHw.getSongInfo() : {};
-        return info.title === 'Slopsmith Diagnostic — Basic Guitar'
-            && info.artist === 'Slopsmith'
-            && info.arrangement === 'Diagnostic Guitar';
+        for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
+            if (track.filenameIncludes
+                && fn.includes(String(track.filenameIncludes).toLowerCase())) {
+                return track;
+            }
+        }
+        for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
+            if (info.title === track.title
+                && info.artist === track.artist
+                && info.arrangement === track.arrangement) {
+                return track;
+            }
+        }
+        return null;
     }
 
-    function _diagBasicGuitarMatchEvent(events, spec) {
+    function _isDiagnosticBasicGuitarSession() {
+        const track = _getDiagnosticTrackForSession();
+        return !!(track && track.id === 'basic-guitar-6');
+    }
+
+    function _diagMatchProfileEvent(events, spec, matchTolS) {
         for (const ev of events) {
             if (!ev || !Number.isFinite(ev.t)) continue;
-            if (Math.abs(ev.t - spec.t) > _DIAG_BASIC_GUITAR_MATCH_TOL_S) continue;
+            if (Math.abs(ev.t - spec.t) > matchTolS) continue;
             if (!!ev.chord !== !!spec.chord) continue;
             if (!spec.chord) {
                 if (ev.s !== spec.s || ev.f !== spec.f) continue;
@@ -13197,11 +13240,13 @@ function createNoteDetector(options = {}) {
         return null;
     }
 
-    function _buildDiagnosticBasicGuitarPlayReport() {
+    function _buildDiagnosticPlayReportFromProfile(profile, reportProfileId) {
         const events = _diagEvents.slice();
+        const chartEvents = profile.events || [];
+        const matchTolS = profile.matchTolS != null ? profile.matchTolS : 0.075;
         let matchedCount = 0;
-        for (const spec of _DIAG_BASIC_GUITAR_CHART) {
-            if (_diagBasicGuitarMatchEvent(events, spec)) matchedCount++;
+        for (const spec of chartEvents) {
+            if (_diagMatchProfileEvent(events, spec, matchTolS)) matchedCount++;
         }
         if (matchedCount === 0) return null;
 
@@ -13213,19 +13258,16 @@ function createNoteDetector(options = {}) {
             bestStreak,
         };
 
-        const categoryMeta = {
-            openLow:      { label: 'Open low string' },
-            openNext:     { label: 'Open next string' },
-            fretted:      { label: 'Fretted note' },
-            powerChords:  { label: 'Power chords' },
-            repeatCheck:  { label: 'Repeat check' },
-        };
-
+        const categoryMeta = profile.categories || {};
         const categories = {};
         let hasPartialPowerChords = false;
+        const powerChordCategoryId = profile.powerChordCategoryId || 'powerChords';
+        const expectedChordStrings = profile.expectedChordStrings != null
+            ? profile.expectedChordStrings
+            : 2;
 
         for (const catId of Object.keys(categoryMeta)) {
-            const specs = _DIAG_BASIC_GUITAR_CHART.filter((s) => s.category === catId);
+            const specs = chartEvents.filter((s) => s.category === catId);
             let attempts = 0;
             let catHits = 0;
             let catMisses = 0;
@@ -13233,14 +13275,14 @@ function createNoteDetector(options = {}) {
             const chordAttempts = [];
 
             for (const spec of specs) {
-                const ev = _diagBasicGuitarMatchEvent(events, spec);
+                const ev = _diagMatchProfileEvent(events, spec, matchTolS);
                 if (!ev) continue;
                 attempts++;
                 if (ev.hit) catHits++; else catMisses++;
                 if (Number.isFinite(ev.te)) timingErrors.push(ev.te);
                 if (spec.chord) {
                     const hs = Number.isFinite(ev.hs) ? ev.hs : null;
-                    const tt = Number.isFinite(ev.tt) ? ev.tt : 2;
+                    const tt = Number.isFinite(ev.tt) ? ev.tt : expectedChordStrings;
                     chordAttempts.push({ t: ev.t, hit: !!ev.hit, hs, tt });
                     if (hs != null && hs < tt) hasPartialPowerChords = true;
                 }
@@ -13260,7 +13302,7 @@ function createNoteDetector(options = {}) {
                     : null,
             };
 
-            if (catId === 'powerChords' && chordAttempts.length) {
+            if (catId === powerChordCategoryId && chordAttempts.length) {
                 const heard = chordAttempts.filter((c) => c.hs != null);
                 const avgHeard = heard.length
                     ? heard.reduce((sum, c) => sum + c.hs, 0) / heard.length
@@ -13268,9 +13310,11 @@ function createNoteDetector(options = {}) {
                 cat.chordHits = catHits;
                 cat.chordMisses = catMisses;
                 cat.avgStringsHeard = avgHeard;
-                cat.expectedStrings = 2;
+                cat.expectedStrings = expectedChordStrings;
                 cat.perAttempt = chordAttempts.map((c) => {
-                    const heardTxt = c.hs != null ? `heard ${c.hs} of ${c.tt} strings` : 'strings heard unknown';
+                    const heardTxt = c.hs != null
+                        ? `heard ${c.hs} of ${c.tt} strings`
+                        : 'strings heard unknown';
                     return { t: c.t, hit: c.hit, heardTxt };
                 });
             }
@@ -13281,6 +13325,7 @@ function createNoteDetector(options = {}) {
         if (!Object.keys(categories).length) return null;
 
         return {
+            reportProfile: reportProfileId,
             overall,
             categories,
             matchedCount,
@@ -13296,27 +13341,52 @@ function createNoteDetector(options = {}) {
         };
     }
 
-    function _diagBasicGuitarHitMissHtml(hit) {
+    function _buildDiagnosticPlayReport(track) {
+        if (!track || !track.reportProfile) return null;
+        const profile = _DIAGNOSTIC_REPORT_PROFILES[track.reportProfile];
+        if (!profile) return null;
+        if (track.reportProfile === 'basic-guitar-v1') {
+            return _buildDiagnosticPlayReportFromProfile(profile, track.reportProfile);
+        }
+        return null;
+    }
+
+    function _buildDiagnosticBasicGuitarPlayReport() {
+        const track = _getDiagnosticTrackForSession();
+        if (!track || track.reportProfile !== 'basic-guitar-v1') return null;
+        return _buildDiagnosticPlayReport(track);
+    }
+
+    function _diagPlayReportHitMissHtml(hit) {
         return hit
             ? '<span class="text-green-400">Hit</span>'
             : '<span class="text-red-400">Miss</span>';
     }
 
-    function _renderDiagnosticBasicGuitarPlayHtml(report) {
+    function _renderDiagnosticPlayHtml(report, reportProfileId) {
         if (!report || !report.categories) return '';
+        if (reportProfileId === 'basic-guitar-v1') {
+            return _renderDiagnosticBasicGuitarPlayHtml(report);
+        }
+        return '';
+    }
+
+    function _renderDiagnosticBasicGuitarPlayHtml(report) {
+        const profile = _DIAGNOSTIC_REPORT_PROFILES['basic-guitar-v1'];
+        if (!report || !report.categories || !profile) return '';
         const cats = report.categories;
         let rows = '';
 
-        for (const id of ['openLow', 'openNext', 'fretted']) {
+        for (const id of (profile.singleHitMissCategories || [])) {
             const c = cats[id];
             if (!c || !c.attempts) continue;
             rows += `<div class="flex justify-between gap-2 mb-1">`
                 + `<span class="text-gray-300">${c.label}</span>`
-                + _diagBasicGuitarHitMissHtml(c.hits > 0)
+                + _diagPlayReportHitMissHtml(c.hits > 0)
                 + `</div>`;
         }
 
-        const pwr = cats.powerChords;
+        const pwr = cats[profile.powerChordCategoryId || 'powerChords'];
         if (pwr && pwr.attempts) {
             let pwrDetail = '';
             if (pwr.avgStringsHeard != null) {
@@ -13451,11 +13521,15 @@ function createNoteDetector(options = {}) {
         }
 
         let diagnosticPlayHtml = '';
-        if (_isDiagnosticBasicGuitarSession()) {
-            const playReport = _buildDiagnosticBasicGuitarPlayReport();
-            if (playReport) {
-                diagnosticPlayHtml = _renderDiagnosticBasicGuitarPlayHtml(playReport);
-            }
+        const diagnosticTrack = _getDiagnosticTrackForSession();
+        const diagnosticReport = diagnosticTrack
+            ? _buildDiagnosticPlayReport(diagnosticTrack)
+            : null;
+        if (diagnosticReport) {
+            diagnosticPlayHtml = _renderDiagnosticPlayHtml(
+                diagnosticReport,
+                diagnosticTrack.reportProfile,
+            );
         }
 
         const overlay = document.createElement('div');
