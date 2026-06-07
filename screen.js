@@ -5131,8 +5131,8 @@ function createNoteDetector(options = {}) {
 
     function _calLabDominantFailLabel(fail) {
         if (fail === 'SNR') return 'signal clarity';
-        if (fail === 'FUND') return 'fundamental';
-        if (fail === 'PITCH') return 'pitch';
+        if (fail === 'FUND') return 'main note';
+        if (fail === 'PITCH') return 'tuning match';
         return fail || '—';
     }
 
@@ -5149,12 +5149,12 @@ function createNoteDetector(options = {}) {
         if (tick.passedSnr === undefined && tick.gatePassCount != null) {
             return `<span class="text-[9px] font-mono flex gap-1.5">`
                 + chip('Clarity', (tick.failedGateMask & 1) === 0 && tick.gatePassCount >= 1)
-                + chip('Fund.', (tick.failedGateMask & 2) === 0 && tick.gatePassCount >= 2)
-                + chip('Pitch', tick.gatePassCount === 3)
+                + chip('Main note', (tick.failedGateMask & 2) === 0 && tick.gatePassCount >= 2)
+                + chip('Tuning', tick.gatePassCount === 3)
                 + '</span>';
         }
         return `<span class="text-[9px] font-mono flex gap-1.5">`
-            + chip('Clarity', snrOk) + chip('Fund.', fundOk) + chip('Pitch', pitchOk)
+            + chip('Clarity', snrOk) + chip('Main note', fundOk) + chip('Tuning', pitchOk)
             + '</span>';
     }
 
@@ -7291,6 +7291,530 @@ function createNoteDetector(options = {}) {
     const _CAL_LAB_FAIL = { SNR: 1, FUND: 2, PITCH: 4 };
     const _CAL_LAB_SCHEMA = 'note_detect.calibration_report.v1';
     const _CAL_LAB_MIN_CAPTURES = 3;
+    const _CAL_LAB_POWER_CHORD_NOTES = [
+        { s: 0, f: 0, role: 'root' },
+        { s: 1, f: 2, role: 'fifth' },
+    ];
+    const _CAL_LAB_ADVANCED_ONLY_STEP_IDS = new Set([
+        'picked', 'hammerOn', 'pullOff', 'palmMute',
+        'naturalHarmonic', 'pinchHarmonic', 'halfBend', 'wholeBend', 'sustain',
+    ]);
+    const _CAL_LAB_BASIC_OPEN_ROWS = [
+        { s: 0, f: 0, prompt: 'Play the thickest string open', btn: 'Capture thickest string' },
+        { s: 1, f: 0, prompt: 'Play the next string open', btn: 'Capture next string' },
+    ];
+    const _CAL_LAB_BASIC_FRET_ROWS = [
+        { s: 0, f: 5, prompt: 'Play the thickest string at the 5th fret', btn: 'Capture thickest string, 5th fret' },
+    ];
+    const _CAL_LAB_AUTO_NOISE_MS = 1800;
+    const _CAL_LAB_AUTO_SIGNAL_MS = 2000;
+    const _CAL_LAB_AUTO_PROBE_LISTEN_MS = 7000;
+    const _CAL_LAB_AUTO_PROBE_INTERVAL_MS = 600;
+    const _CAL_LAB_AUTO_PWR_LISTEN_MS = 8000;
+    const _CAL_LAB_AUTO_PWR_INTERVAL_MS = 700;
+
+    function _calLabDefaultAutoRun() {
+        return {
+            active: false,
+            phase: 'idle',
+            stepId: null,
+            subIndex: 0,
+            status: null,
+            timerId: null,
+            intervalId: null,
+            inFlight: false,
+            capturesThisRun: 0,
+            startedAt: 0,
+            listenEndsAt: 0,
+            sessionId: 0,
+        };
+    }
+
+    function _calLabEnsureAutoRun(st) {
+        if (!st.autoRun) st.autoRun = _calLabDefaultAutoRun();
+        return st.autoRun;
+    }
+
+    function _calLabStopAutoCapture(reason) {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = st.autoRun;
+        if (!ar) return;
+        if (ar.timerId != null) {
+            clearTimeout(ar.timerId);
+            ar.timerId = null;
+        }
+        if (ar.intervalId != null) {
+            clearInterval(ar.intervalId);
+            ar.intervalId = null;
+        }
+        ar.inFlight = false;
+        if (ar.phase === 'countdown' || ar.phase === 'listening') {
+            ar.phase = 'idle';
+        }
+        ar.active = false;
+        if (reason) ar.status = reason;
+    }
+
+    function _calLabSetAutoStatus(html) {
+        if (!_calLabEl) return;
+        const el = _calLabEl.querySelector('.nd-cal-lab-auto-status');
+        if (el) el.innerHTML = html;
+    }
+
+    function _calLabIsAutoBusy(st) {
+        const ar = st && st.autoRun;
+        return !!(ar && ar.active && (ar.phase === 'countdown' || ar.phase === 'listening'));
+    }
+
+    function _calLabBeginCountdownThen(seconds, label, callback) {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = _calLabEnsureAutoRun(st);
+        if (ar.timerId != null) clearTimeout(ar.timerId);
+        ar.active = true;
+        ar.phase = 'countdown';
+        let left = seconds;
+        const tick = () => {
+            if (!_calLabState || _calLabState !== st || !ar.active) return;
+            const n = left > 0 ? String(left) : 'Go!';
+            _calLabSetAutoStatus(
+                `<p class="text-gray-200 text-sm mb-1">${label}</p>`
+                + `<p class="text-2xl font-bold text-white text-center py-2">${n}</p>`);
+            if (left <= 0) {
+                ar.timerId = null;
+                ar.phase = 'listening';
+                callback();
+                return;
+            }
+            left -= 1;
+            ar.timerId = setTimeout(tick, 1000);
+        };
+        tick();
+    }
+
+    function _calLabAvgLevelSamples(samples) {
+        if (!samples || !samples.length) return { avg: null, peak: null };
+        let sum = 0;
+        let maxPeak = 0;
+        for (const s of samples) {
+            sum += s.level;
+            if (s.peak > maxPeak) maxPeak = s.peak;
+        }
+        return { avg: Math.round(sum / samples.length), peak: maxPeak };
+    }
+
+    function _calLabRunLevelSampler(durationMs, onDone) {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = _calLabEnsureAutoRun(st);
+        const sessionId = ar.sessionId;
+        const samples = [];
+        const started = Date.now();
+        ar.startedAt = started;
+        ar.listenEndsAt = started + durationMs;
+        if (ar.intervalId != null) clearInterval(ar.intervalId);
+        if (ar.timerId != null) clearTimeout(ar.timerId);
+        let finished = false;
+        const finish = () => {
+            if (finished) return;
+            finished = true;
+            if (ar.intervalId != null) {
+                clearInterval(ar.intervalId);
+                ar.intervalId = null;
+            }
+            if (ar.timerId != null) {
+                clearTimeout(ar.timerId);
+                ar.timerId = null;
+            }
+            ar.inFlight = false;
+            onDone(samples, sessionId);
+        };
+        const tick = () => {
+            if (!_calLabState || _calLabState !== st || ar.sessionId !== sessionId || !ar.active) return;
+            const snap = getCalibrationSnapshot();
+            samples.push({ level: snap.inputLevelPct, peak: snap.inputPeakPct, t: Date.now() });
+            const elapsed = Date.now() - started;
+            _calLabSetAutoStatus(
+                `<span class="text-cyan-300/90">Listening…</span> ${Math.round(elapsed / 1000)}s · `
+                + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct));
+            if (elapsed >= durationMs) finish();
+        };
+        tick();
+        ar.intervalId = setInterval(tick, 120);
+        ar.timerId = setTimeout(finish, durationMs + 250);
+    }
+
+    function _calLabProbeCountForStep(st, opts) {
+        const { store, noteDef, technique, multiNotes } = opts;
+        if (multiNotes) {
+            return ((st.techniqueCaptures && st.techniqueCaptures[technique]) || []).length;
+        }
+        const caps = (st[store] && st[store][noteDef.s]) || [];
+        return caps.length;
+    }
+
+    function _calLabStoreProbeCapture(st, opts, cap) {
+        if (!cap || !cap.ok) return false;
+        const { store, noteDef, technique, multiNotes } = opts;
+        if (multiNotes) {
+            if (!st.techniqueCaptures) st.techniqueCaptures = {};
+            if (!st.techniqueCaptures[technique]) st.techniqueCaptures[technique] = [];
+            st.techniqueCaptures[technique].push(cap);
+            return true;
+        }
+        if (!st[store]) st[store] = {};
+        if (!st[store][noteDef.s]) st[store][noteDef.s] = [];
+        st[store][noteDef.s].push(cap);
+        return true;
+    }
+
+    function _calLabRunProbeListenWindow(opts) {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = _calLabEnsureAutoRun(st);
+        const sessionId = ar.sessionId;
+        const listenMs = opts.listenMs || _CAL_LAB_AUTO_PROBE_LISTEN_MS;
+        const intervalMs = opts.intervalMs || _CAL_LAB_AUTO_PROBE_INTERVAL_MS;
+        const minCaptures = opts.minCaptures || _CAL_LAB_MIN_CAPTURES;
+        ar.phase = 'listening';
+        ar.active = true;
+        ar.startedAt = Date.now();
+        ar.listenEndsAt = ar.startedAt + listenMs;
+        ar.capturesThisRun = 0;
+
+        let ended = false;
+        const endWindow = (reason) => {
+            if (ended) return;
+            ended = true;
+            if (ar.intervalId != null) {
+                clearInterval(ar.intervalId);
+                ar.intervalId = null;
+            }
+            if (ar.timerId != null) {
+                clearTimeout(ar.timerId);
+                ar.timerId = null;
+            }
+            ar.inFlight = false;
+            ar.active = false;
+            ar.phase = reason === 'stop' ? 'idle' : 'done';
+            if (opts.onComplete) opts.onComplete(reason);
+        };
+
+        const tryCapture = async () => {
+            if (!_calLabState || _calLabState !== st || ar.sessionId !== sessionId || !ar.active) return;
+            if (ar.inFlight || Date.now() >= ar.listenEndsAt) return;
+            ar.inFlight = true;
+            let cap;
+            try {
+                if (opts.multiNotes) {
+                    cap = await _calLabCaptureMulti(opts.multiNotes, opts.technique);
+                } else {
+                    cap = await _calLabCaptureProbe(opts.noteDef, opts.technique || opts.store);
+                }
+            } catch (_) {
+                cap = null;
+            }
+            ar.inFlight = false;
+            if (!_calLabState || _calLabState !== st || ar.sessionId !== sessionId) return;
+            if (_calLabStoreProbeCapture(st, opts, cap)) {
+                ar.capturesThisRun = _calLabProbeCountForStep(st, opts);
+            }
+            const count = _calLabProbeCountForStep(st, opts);
+            const shortLabel = opts.shortLabel || opts.label || 'check';
+            _calLabSetAutoStatus(
+                `<span class="text-cyan-300/90">${shortLabel}</span> — ${count} of ${minCaptures} captures`);
+            if (opts.onProgress) opts.onProgress(count);
+            if (count >= minCaptures) endWindow('enough');
+        };
+
+        const tick = () => {
+            if (!_calLabState || _calLabState !== st || ar.sessionId !== sessionId || !ar.active) return;
+            if (Date.now() >= ar.listenEndsAt) {
+                endWindow('timeout');
+                return;
+            }
+            tryCapture();
+        };
+
+        const count = _calLabProbeCountForStep(st, opts);
+        _calLabSetAutoStatus(
+            `<span class="text-cyan-300/90">${opts.shortLabel || opts.label}</span> — ${count} of ${minCaptures} captures`);
+        tick();
+        ar.intervalId = setInterval(tick, intervalMs);
+        ar.timerId = setTimeout(() => endWindow('timeout'), listenMs + 300);
+    }
+
+    function _calLabBasicAutoControlsHtml(stepKey, startLabel, busy, showRetry) {
+        const hideStart = busy ? 'hidden' : '';
+        const hideStop = busy ? '' : 'hidden';
+        const hideRetry = showRetry && !busy ? '' : 'hidden';
+        return `<div class="nd-cal-lab-auto-controls flex flex-col gap-2 mb-2">
+            <button type="button" class="nd-cal-lab-auto-start ${hideStart} w-full py-2.5 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white" data-auto-step="${stepKey}">${startLabel}</button>
+            <button type="button" class="nd-cal-lab-auto-retry ${hideRetry} w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200" data-auto-step="${stepKey}">Retry</button>
+            <button type="button" class="nd-cal-lab-auto-stop ${hideStop} w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-amber-200/90" data-auto-step="${stepKey}">Stop</button>
+        </div>`;
+    }
+
+    function _calLabUpdateBasicAutoButtons() {
+        if (!_calLabEl || !_calLabState) return;
+        const busy = _calLabIsAutoBusy(_calLabState);
+        const start = _calLabEl.querySelector('.nd-cal-lab-auto-start');
+        const retry = _calLabEl.querySelector('.nd-cal-lab-auto-retry');
+        const stop = _calLabEl.querySelector('.nd-cal-lab-auto-stop');
+        if (start) start.classList.toggle('hidden', busy);
+        if (stop) stop.classList.toggle('hidden', !busy);
+        if (retry) {
+            const done = _calLabState.autoRun && _calLabState.autoRun.phase === 'done';
+            retry.classList.toggle('hidden', busy || !done);
+        }
+        const nextBtn = _calLabEl.querySelector('.nd-cal-lab-next');
+        if (nextBtn) nextBtn.disabled = busy;
+    }
+
+    function _calLabClearBasicOpenCaptures(st) {
+        st.openCaptures = {};
+    }
+
+    function _calLabClearBasicFretCaptures(st) {
+        st.fretCaptures = {};
+    }
+
+    function _calLabClearBasicPowerCaptures(st) {
+        if (!st.techniqueCaptures) st.techniqueCaptures = {};
+        st.techniqueCaptures.powerChord = [];
+    }
+
+    function _calLabStartNoiseAuto() {
+        const st = _calLabState;
+        if (!st) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'noise';
+        ar.sessionId = Date.now();
+        ar.active = true;
+        _calLabBeginCountdownThen(3, 'Get ready: mute all strings', () => {
+            _calLabSetAutoStatus('<span class="text-cyan-300/90">Listening for room noise…</span>');
+            _calLabRunLevelSampler(_CAL_LAB_AUTO_NOISE_MS, (samples, sessionId) => {
+                if (!_calLabState || _calLabState.autoRun.sessionId !== sessionId) return;
+                const { avg, peak } = _calLabAvgLevelSamples(samples);
+                if (!Number.isFinite(avg)) {
+                    st.autoRun.phase = 'error';
+                    st.autoRun.active = false;
+                    _calLabSetAutoStatus('<span class="text-amber-200/90">No samples — turn Detect on and retry.</span>');
+                    _calLabUpdateBasicAutoButtons();
+                    return;
+                }
+                st.noiseLevelPct = avg;
+                st.noisePeakPct = peak;
+                st.autoRun.phase = 'done';
+                st.autoRun.active = false;
+                const resultEl = _calLabEl && _calLabEl.querySelector('.nd-cal-lab-auto-result');
+                if (resultEl) {
+                    resultEl.textContent = calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct);
+                }
+                _calLabSetAutoStatus(
+                    `<span class="text-green-300/90">Noise check complete:</span> `
+                    + calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct));
+                _calLabUpdateBasicAutoButtons();
+            });
+        });
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabStartSignalAuto() {
+        const st = _calLabState;
+        if (!st) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'signal';
+        ar.sessionId = Date.now();
+        ar.active = true;
+        _calLabBeginCountdownThen(3, 'Get ready: play the thickest string loudly', () => {
+            _calLabSetAutoStatus('<span class="text-cyan-300/90">Listening for playing level…</span>');
+            _calLabRunLevelSampler(_CAL_LAB_AUTO_SIGNAL_MS, (samples, sessionId) => {
+                if (!_calLabState || _calLabState.autoRun.sessionId !== sessionId) return;
+                const { avg, peak } = _calLabAvgLevelSamples(samples);
+                if (!Number.isFinite(avg)) {
+                    st.autoRun.phase = 'error';
+                    st.autoRun.active = false;
+                    _calLabSetAutoStatus('<span class="text-amber-200/90">No samples — turn Detect on and retry.</span>');
+                    _calLabUpdateBasicAutoButtons();
+                    return;
+                }
+                st.signalLevelPct = avg;
+                st.signalPeakPct = peak;
+                st.autoRun.phase = 'done';
+                st.autoRun.active = false;
+                const resultEl = _calLabEl && _calLabEl.querySelector('.nd-cal-lab-auto-result');
+                if (resultEl) {
+                    resultEl.textContent = calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct);
+                }
+                _calLabSetAutoStatus(
+                    `<span class="text-green-300/90">Signal check complete:</span> `
+                    + calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct));
+                _calLabUpdateBasicAutoButtons();
+            });
+        });
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabRunOpenSubPrompt() {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = _calLabEnsureAutoRun(st);
+        const rows = _CAL_LAB_BASIC_OPEN_ROWS;
+        if (ar.subIndex >= rows.length) {
+            ar.phase = 'done';
+            ar.active = false;
+            _calLabSetAutoStatus('<span class="text-green-300/90">Open-string check complete.</span>');
+            _calLabUpdateBasicAutoButtons();
+            renderCalibrationLab();
+            return;
+        }
+        const row = rows[ar.subIndex];
+        const shortLabel = ar.subIndex === 0 ? 'Checking thickest string open' : 'Checking next string open';
+        _calLabBeginCountdownThen(3, `Get ready: ${row.prompt}`, () => {
+            _calLabRunProbeListenWindow({
+                store: 'openCaptures',
+                noteDef: { s: row.s, f: row.f },
+                technique: 'openCaptures',
+                label: row.prompt,
+                shortLabel,
+                listenMs: _CAL_LAB_AUTO_PROBE_LISTEN_MS,
+                intervalMs: _CAL_LAB_AUTO_PROBE_INTERVAL_MS,
+                minCaptures: _CAL_LAB_MIN_CAPTURES,
+                onComplete: () => {
+                    if (!_calLabState) return;
+                    ar.subIndex += 1;
+                    if (ar.subIndex < rows.length) {
+                        _calLabRunOpenSubPrompt();
+                    } else {
+                        ar.phase = 'done';
+                        ar.active = false;
+                        _calLabSetAutoStatus('<span class="text-green-300/90">Open-string check complete.</span>');
+                        _calLabUpdateBasicAutoButtons();
+                        renderCalibrationLab();
+                    }
+                },
+            });
+        });
+    }
+
+    function _calLabStartOpenAuto(clearFirst) {
+        const st = _calLabState;
+        if (!st) return;
+        if (!_calLabCanProbe()) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on (desktop) first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        if (clearFirst) _calLabClearBasicOpenCaptures(st);
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'open';
+        ar.sessionId = Date.now();
+        ar.subIndex = 0;
+        ar.active = true;
+        _calLabRunOpenSubPrompt();
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabStartFretAuto(clearFirst) {
+        const st = _calLabState;
+        if (!st) return;
+        if (!_calLabCanProbe()) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on (desktop) first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        if (clearFirst) _calLabClearBasicFretCaptures(st);
+        const row = _CAL_LAB_BASIC_FRET_ROWS[0];
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'fret5';
+        ar.sessionId = Date.now();
+        ar.subIndex = 0;
+        ar.active = true;
+        _calLabBeginCountdownThen(3, `Get ready: ${row.prompt}`, () => {
+            _calLabRunProbeListenWindow({
+                store: 'fretCaptures',
+                noteDef: { s: row.s, f: row.f },
+                technique: 'fretCaptures',
+                label: row.prompt,
+                shortLabel: 'Checking thickest string, 5th fret',
+                listenMs: _CAL_LAB_AUTO_PROBE_LISTEN_MS,
+                intervalMs: _CAL_LAB_AUTO_PROBE_INTERVAL_MS,
+                minCaptures: _CAL_LAB_MIN_CAPTURES,
+                onComplete: () => {
+                    if (!_calLabState) return;
+                    ar.phase = 'done';
+                    ar.active = false;
+                    _calLabSetAutoStatus('<span class="text-green-300/90">Fretted-note check complete.</span>');
+                    _calLabUpdateBasicAutoButtons();
+                    renderCalibrationLab();
+                },
+            });
+        });
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabStartPowerChordAuto(clearFirst) {
+        const st = _calLabState;
+        if (!st) return;
+        if (!_calLabCanProbe()) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on (desktop) first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        if (clearFirst) _calLabClearBasicPowerCaptures(st);
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'powerChord';
+        ar.sessionId = Date.now();
+        ar.active = true;
+        _calLabBeginCountdownThen(3, 'Get ready: play a power chord (thickest open + next string 2nd fret)', () => {
+            _calLabRunProbeListenWindow({
+                multiNotes: [{ s: 0, f: 0 }, { s: 1, f: 2 }],
+                technique: 'powerChord',
+                label: 'Play a power chord: thickest string open + next string 2nd fret',
+                shortLabel: 'Power chord check',
+                listenMs: _CAL_LAB_AUTO_PWR_LISTEN_MS,
+                intervalMs: _CAL_LAB_AUTO_PWR_INTERVAL_MS,
+                minCaptures: _CAL_LAB_MIN_CAPTURES,
+                onProgress: () => {
+                    const diagEl = _calLabEl && _calLabEl.querySelector('.nd-cal-lab-pwr-diag-live');
+                    if (diagEl) diagEl.textContent = _calLabPowerChordSimpleDiagnosis(st);
+                },
+                onComplete: () => {
+                    if (!_calLabState) return;
+                    ar.phase = 'done';
+                    ar.active = false;
+                    _calLabSetAutoStatus(
+                        `<span class="text-green-300/90">Power chord check complete.</span> `
+                        + _calLabPowerChordSimpleDiagnosis(st));
+                    _calLabUpdateBasicAutoButtons();
+                    renderCalibrationLab();
+                },
+            });
+        });
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabRetryBasicAuto(stepKey) {
+        if (stepKey === 'noise') _calLabStartNoiseAuto();
+        else if (stepKey === 'signal') _calLabStartSignalAuto();
+        else if (stepKey === 'open') _calLabStartOpenAuto(true);
+        else if (stepKey === 'fret5') _calLabStartFretAuto(true);
+        else if (stepKey === 'powerChord') _calLabStartPowerChordAuto(true);
+    }
 
     function _calLabEffectivePitchTol(chartPitch, flags) {
         let cents = chartPitch;
@@ -7347,6 +7871,282 @@ function createNoteDetector(options = {}) {
         if (mask & _CAL_LAB_FAIL.FUND) p.push('fundamental');
         if (mask & _CAL_LAB_FAIL.PITCH) p.push('pitch');
         return p.length ? p.join('+') : 'none';
+    }
+
+    function _calLabPowerChordDisplayString(stringIndex) {
+        return currentStringCount - stringIndex;
+    }
+
+    function _calLabPowerChordNoteMeta(stringIndex, fret) {
+        const def = _CAL_LAB_POWER_CHORD_NOTES.find((n) => n.s === stringIndex && n.f === fret);
+        const disp = _calLabPowerChordDisplayString(stringIndex);
+        let label;
+        if (def && def.role === 'root') label = 'thickest string (root)';
+        else if (def && def.role === 'fifth') label = 'next string (fifth)';
+        else label = `String ${disp}`;
+        let expectedNote = '—';
+        try {
+            const midi = _ndMidiFromStringFret(
+                stringIndex, fret, currentArrangement, currentStringCount, tuningOffsets, capo);
+            if (Number.isFinite(midi)) expectedNote = _ndMidiToName(midi);
+        } catch (_) { /* read-only */ }
+        return {
+            label,
+            role: def ? def.role : null,
+            expectedNote,
+            string: stringIndex,
+            fret,
+        };
+    }
+
+    function _calLabPowerChordNotePass(noteTick) {
+        return !!(noteTick && (noteTick.hit || noteTick.gatePassCount === 3));
+    }
+
+    function _calLabPowerChordHeardNote(noteTick) {
+        if (!noteTick || !Number.isFinite(noteTick.centsError)) return '—';
+        try {
+            const expectedMidi = _ndMidiFromStringFret(
+                noteTick.string, noteTick.fret, currentArrangement, currentStringCount, tuningOffsets, capo);
+            if (!Number.isFinite(expectedMidi)) return '—';
+            return _ndMidiToName(expectedMidi + noteTick.centsError / 100);
+        } catch (_) {
+            return '—';
+        }
+    }
+
+    function _calLabPowerChordNoteRowHtml(noteTick) {
+        if (!noteTick) return '';
+        const meta = _calLabPowerChordNoteMeta(noteTick.string, noteTick.fret);
+        const clarity = Number.isFinite(noteTick.snrRatio) ? noteTick.snrRatio.toFixed(2) : '—';
+        const heard = _calLabPowerChordHeardNote(noteTick);
+        const chips = _calLabGateChipsHtml(noteTick);
+        const passCls = _calLabPowerChordNotePass(noteTick)
+            ? 'text-green-300/90' : 'text-amber-200/90';
+        return `<div class="py-1 border-b border-gray-700/40">
+            <div class="flex justify-between gap-2 text-[10px]">
+                <span class="text-gray-300">${meta.label}</span>
+                <span class="${passCls} shrink-0">${_calLabPowerChordNotePass(noteTick) ? 'pass' : 'fail'}</span>
+            </div>
+            <div class="text-[9px] text-gray-500">Expected ${meta.expectedNote} · heard ${heard} · clarity ${clarity}</div>
+            ${chips ? `<div class="mt-0.5">${chips}</div>` : ''}
+        </div>`;
+    }
+
+    function _calLabPowerChordCaptureBlockHtml(cap, index) {
+        if (!cap || !cap.ok || !Array.isArray(cap.notes)) {
+            return `<div class="text-[10px] text-amber-200/90 py-1">Capture ${index + 1}: probe failed</div>`;
+        }
+        const rows = cap.notes.map((n) => _calLabPowerChordNoteRowHtml(n)).join('');
+        const batch = cap.batchHit
+            ? '<span class="text-green-300/90">batch hit</span>'
+            : '<span class="text-amber-200/90">batch miss</span>';
+        return `<div class="mb-2 p-2 bg-dark-800/50 rounded border border-gray-700/40">
+            <div class="text-[10px] text-gray-400 mb-1">Capture ${index + 1} · ${batch}</div>
+            ${rows}
+        </div>`;
+    }
+
+    function _calLabSummarizePowerChordRole(caps, role) {
+        const def = _CAL_LAB_POWER_CHORD_NOTES.find((n) => n.role === role);
+        if (!def) {
+            return { role, n: 0, passRate: null, dominantFailure: null, failCounts: { SNR: 0, FUND: 0, PITCH: 0 } };
+        }
+        let passes = 0;
+        let total = 0;
+        const failCounts = { SNR: 0, FUND: 0, PITCH: 0 };
+        for (const cap of caps) {
+            if (!cap || !cap.ok || !Array.isArray(cap.notes)) continue;
+            const note = cap.notes.find((n) => n.string === def.s && n.fret === def.f);
+            if (!note) continue;
+            total++;
+            if (_calLabPowerChordNotePass(note)) passes++;
+            if (note.failedGateMask & _CAL_LAB_FAIL.SNR) failCounts.SNR++;
+            if (note.failedGateMask & _CAL_LAB_FAIL.FUND) failCounts.FUND++;
+            if (note.failedGateMask & _CAL_LAB_FAIL.PITCH) failCounts.PITCH++;
+        }
+        let dominantFailure = null;
+        let maxF = 0;
+        for (const [k, v] of Object.entries(failCounts)) {
+            if (v > maxF) { maxF = v; dominantFailure = k; }
+        }
+        return {
+            role,
+            string: def.s,
+            fret: def.f,
+            label: _calLabPowerChordNoteMeta(def.s, def.f).label,
+            expectedNote: _calLabPowerChordNoteMeta(def.s, def.f).expectedNote,
+            n: total,
+            passRate: total > 0 ? passes / total : null,
+            dominantFailure,
+            failCounts,
+        };
+    }
+
+    function _calLabSummarizePowerChordCaptures(caps) {
+        const list = caps || [];
+        const root = _calLabSummarizePowerChordRole(list, 'root');
+        const fifth = _calLabSummarizePowerChordRole(list, 'fifth');
+        const aggregate = _calLabSummarizeCaptures(list);
+        return {
+            ...aggregate,
+            root,
+            fifth,
+            likelyCause: _calLabPowerChordLikelyCause({ root, fifth }),
+        };
+    }
+
+    function _calLabPowerChordLikelyCause(ps) {
+        if (!ps || !ps.root || !ps.fifth) return null;
+        const rootRate = ps.root.passRate;
+        const fifthRate = ps.fifth.passRate;
+        if (rootRate == null && fifthRate == null) return null;
+        const rootOk = rootRate != null && rootRate >= 0.5;
+        const fifthOk = fifthRate != null && fifthRate >= 0.5;
+        if (rootOk && !fifthOk) {
+            if (ps.fifth.dominantFailure === 'FUND') {
+                return 'Root verifies, fifth fails fundamental: distorted tone may be hiding the fifth\'s fundamental.';
+            }
+            if (ps.fifth.dominantFailure === 'PITCH') {
+                return 'Root verifies, fifth fails pitch: tuning or pitch-shift path may not match the song.';
+            }
+            return 'Root verifies, fifth fails: likely masking, wet distortion, or chord voicing issue.';
+        }
+        if (!rootOk && fifthOk) {
+            return 'Fifth verifies, root fails: low-string clarity or fundamental may be weak — check gain, palm muting, or low-string coupling.';
+        }
+        if (!rootOk && !fifthOk) {
+            if (ps.root.dominantFailure === 'SNR' && ps.fifth.dominantFailure === 'SNR') {
+                return 'Both strings fail clarity: signal may be too noisy/wet or wrong channel.';
+            }
+            if (ps.root.dominantFailure === 'FUND' || ps.fifth.dominantFailure === 'FUND') {
+                return 'Fundamental fails: distorted tone may be hiding the fundamental.';
+            }
+            if (ps.root.dominantFailure === 'PITCH' || ps.fifth.dominantFailure === 'PITCH') {
+                return 'Pitch fails: tuning or pitch-shift path may not match the song.';
+            }
+            return 'Both strings struggle to verify: check input channel, gain, and tone path.';
+        }
+        if (rootOk && fifthOk) {
+            return 'Root and fifth both verify in probes — gameplay chord misses may be timing, chart voicing, or a different detector path.';
+        }
+        return null;
+    }
+
+    function _calLabPowerChordSimpleDiagnosis(st) {
+        const caps = (st.techniqueCaptures && st.techniqueCaptures.powerChord) || [];
+        const sum = _calLabSummarizePowerChordCaptures(caps);
+        if (!sum.n) return 'No captures yet — press Capture while playing both strings.';
+        const rootOk = sum.root.passRate != null && sum.root.passRate >= 0.5;
+        const fifthOk = sum.fifth.passRate != null && sum.fifth.passRate >= 0.5;
+        if (rootOk && fifthOk) {
+            return 'Power chord: root and fifth both heard in probes.';
+        }
+        if (rootOk && !fifthOk) {
+            return 'Power chord: root heard, fifth not heard. Try the dry/clean channel to compare.';
+        }
+        if (!rootOk && fifthOk) {
+            return 'Power chord: fifth heard, root not heard. Check gain and low-string clarity.';
+        }
+        if (sum.root.dominantFailure === 'SNR' && sum.fifth.dominantFailure === 'SNR') {
+            return 'Both strings failed signal clarity. Your signal may be too quiet, noisy, or on the wrong channel.';
+        }
+        if (sum.root.dominantFailure === 'FUND' || sum.fifth.dominantFailure === 'FUND') {
+            return 'The main note is missing. Distortion may be hiding it.';
+        }
+        if (sum.likelyCause) return sum.likelyCause;
+        return 'Power chord root/fifth check did not pass. Try the dry/clean channel to compare.';
+    }
+
+    function _calLabFormatPowerChordSum(st) {
+        const caps = (st.techniqueCaptures && st.techniqueCaptures.powerChord) || [];
+        const sum = _calLabSummarizePowerChordCaptures(caps);
+        if (!sum.n) return 'No captures yet — press Capture while playing.';
+        const rootPct = sum.root.passRate != null ? Math.round(sum.root.passRate * 100) : '—';
+        const fifthPct = sum.fifth.passRate != null ? Math.round(sum.fifth.passRate * 100) : '—';
+        const rootWeak = _calLabDominantFailLabel(sum.root.dominantFailure);
+        const fifthWeak = _calLabDominantFailLabel(sum.fifth.dominantFailure);
+        let line = `${sum.n} captures · root pass ${rootPct}% · fifth pass ${fifthPct}%`
+            + ` · root weakest: ${rootWeak} · fifth weakest: ${fifthWeak}`;
+        if (sum.likelyCause) line += ` · ${sum.likelyCause}`;
+        return line;
+    }
+
+    function _calLabMusicianStringRowLabel(s, fret, stringName) {
+        if (s === 0 && fret === 0) return 'thickest string, open';
+        if (s === 1 && fret === 0) return 'next string, open';
+        if (s === 0 && fret === 5) return 'thickest string, 5th fret';
+        const fretTxt = fret === 0 ? 'open' : `fret ${fret}`;
+        return `${stringName || 'string'} · ${fretTxt}`;
+    }
+
+    function _calLabBuildSimpleReportBullets(rep) {
+        const bullets = [];
+        bullets.push('This report did not change gameplay settings.');
+        const hw = rep.hardware || {};
+        if (Number.isFinite(hw.noise_level_pct) && hw.noise_level_pct >= 5) {
+            bullets.push('Your signal is quiet or noisy — check room noise and input gain.');
+        }
+        if (Number.isFinite(hw.signal_level_pct) && hw.signal_level_pct < 5) {
+            bullets.push('Your playing level looks low — try playing louder or raising input gain.');
+        }
+        let fundFails = 0;
+        for (const t of (rep.per_technique || [])) {
+            if (!t.summary || !t.summary.failCounts) continue;
+            fundFails += t.summary.failCounts.FUND || 0;
+        }
+        for (const ps of (rep.per_string || [])) {
+            if (ps.open && ps.open.summary && ps.open.summary.failCounts) {
+                fundFails += ps.open.summary.failCounts.FUND || 0;
+            }
+            if (ps.fret5 && ps.fret5.summary && ps.fret5.summary.failCounts) {
+                fundFails += ps.fret5.summary.failCounts.FUND || 0;
+            }
+        }
+        if (fundFails >= 2) {
+            bullets.push('The main note is missing on several tests. Distortion may be hiding it.');
+        }
+        const pwr = rep.power_chord_diagnostics;
+        if (pwr && pwr.root && pwr.fifth) {
+            const rootOk = pwr.root.passRate != null && pwr.root.passRate >= 0.5;
+            const fifthOk = pwr.fifth.passRate != null && pwr.fifth.passRate >= 0.5;
+            if (!rootOk || !fifthOk) {
+                bullets.push('Power chord root/fifth check did not fully pass.');
+            }
+            if (pwr.likely_cause) {
+                bullets.push(pwr.likely_cause);
+            }
+            if (!rootOk || !fifthOk) {
+                bullets.push('Try the dry/clean channel to compare against a wet tone.');
+            }
+        }
+        if (bullets.length === 1) {
+            bullets.push('No major issues detected from your captures — review details if something still feels off.');
+        }
+        return bullets;
+    }
+
+    function _calLabBuildPowerChordReportSummary(caps) {
+        const sum = _calLabSummarizePowerChordCaptures(caps || []);
+        const snap = getCalibrationSnapshot();
+        let detectorPath = null;
+        try {
+            if (_diagDetector && _diagDetector.path) detectorPath = _diagDetector.path;
+            else if (_ndUsingEngineVerifier) detectorPath = 'desktop-engine-verifier';
+        } catch (_) { /* read-only */ }
+        return {
+            root: sum.root,
+            fifth: sum.fifth,
+            likely_cause: sum.likelyCause,
+            input_channel: snap.channel || selectedChannel,
+            detector_path: detectorPath,
+            aggregate: {
+                n: sum.n,
+                hitRate: sum.hitRate,
+                medianSnrRatio: sum.medianSnrRatio,
+                dominantFailure: sum.dominantFailure,
+            },
+        };
     }
 
     function _calLabCanProbe() {
@@ -7542,6 +8342,10 @@ function createNoteDetector(options = {}) {
         if (halfCaps.length || wholeCaps.length) {
             rec.push('Half bends and whole bends currently use the same native bend probe; compare results as labeled technique captures, not distinct detector modes.');
         }
+        const pwrDiag = report.power_chord_diagnostics;
+        if (pwrDiag && pwrDiag.root && pwrDiag.root.n >= 2 && pwrDiag.likely_cause) {
+            rec.push(`Power chords: ${pwrDiag.likely_cause}`);
+        }
         if (!rec.length) rec.push('No strong patterns detected — collect more captures or review per-step summaries.');
         return rec;
     }
@@ -7576,15 +8380,23 @@ function createNoteDetector(options = {}) {
             let summary;
             if (key === 'sustain' && (st.sustainSeries || []).length) {
                 summary = _calLabSummarizeSustainSeries(st.sustainSeries);
+            } else if (key === 'powerChord') {
+                summary = _calLabSummarizePowerChordCaptures(caps);
             } else {
                 summary = _calLabSummarizeCaptures(caps);
             }
-            return { id: key, label, captures: caps, summary };
+            const entry = { id: key, label, captures: caps, summary };
+            if (key === 'powerChord') {
+                entry.per_string_summary = _calLabBuildPowerChordReportSummary(caps);
+            }
+            return entry;
         });
+        const powerChordCaps = (st.techniqueCaptures && st.techniqueCaptures.powerChord) || [];
         const report = {
             schema: _CAL_LAB_SCHEMA,
             timestamp: new Date().toISOString(),
             plugin_version: _ND_VERSION,
+            assessment_mode: st.mode || null,
             calibration_notes: [
                 'Half bends and whole bends use the same native bend probe (G string fret 7, bend flag); labels distinguish technique captures only.',
             ],
@@ -7610,8 +8422,10 @@ function createNoteDetector(options = {}) {
             per_string: perString,
             per_technique: perTechnique,
             sustain_series: (st.sustainSeries || []),
+            power_chord_diagnostics: _calLabBuildPowerChordReportSummary(powerChordCaps),
         };
         report.recommendations = _calLabBuildRecommendations(report);
+        report.simple_summary = _calLabBuildSimpleReportBullets(report);
         _calLabLastReport = report;
         return report;
     }
@@ -7638,6 +8452,7 @@ function createNoteDetector(options = {}) {
     }
 
     function calibrationLabClose() {
+        _calLabStopAutoCapture('close');
         if (_calLabTick) {
             clearInterval(_calLabTick);
             _calLabTick = null;
@@ -7649,13 +8464,13 @@ function createNoteDetector(options = {}) {
         _calLabState = null;
     }
 
-    function _calLabStepMeta() {
+    function _calLabAllStepMeta() {
         return [
-            { id: 'intro', title: 'Intro' },
+            { id: 'intro', title: 'Get Started' },
             { id: 'noise', title: 'Noise Floor' },
             { id: 'signal', title: 'Signal Level' },
             { id: 'open', title: 'Open Strings' },
-            { id: 'fret5', title: 'Fret 5' },
+            { id: 'fret5', title: 'Fretted Note' },
             { id: 'picked', title: 'Picked Notes' },
             { id: 'hammerOn', title: 'Hammer-ons' },
             { id: 'pullOff', title: 'Pull-offs' },
@@ -7668,6 +8483,41 @@ function createNoteDetector(options = {}) {
             { id: 'sustain', title: 'Sustain / Decay' },
             { id: 'report', title: 'Report' },
         ];
+    }
+
+    function _calLabActiveSteps(mode) {
+        if (!mode) return [{ id: 'intro', title: 'Get Started' }];
+        return _calLabAllStepMeta().filter((s) => {
+            if (s.id === 'intro') return false;
+            if (mode === 'basic') return !_CAL_LAB_ADVANCED_ONLY_STEP_IDS.has(s.id);
+            return true;
+        });
+    }
+
+    function _calLabStepMeta() {
+        return _calLabAllStepMeta();
+    }
+
+    function _calLabStringCaptureRowHtml(st, store, s, f, label, opts) {
+        const caps = (st[store] && st[store][s]) || [];
+        const sum = _calLabSummarizeCaptures(caps);
+        const lastCap = caps.length ? caps[caps.length - 1] : null;
+        const chips = _calLabGateChipsHtml(lastCap);
+        const techDetail = opts && opts.showTech
+            ? `<span class="text-[9px] text-gray-600"> (s${s} f${f})</span>` : '';
+        const countNote = (opts && opts.showCount)
+            ? ` · ${caps.length}/${_CAL_LAB_MIN_CAPTURES} checks` : '';
+        const status = caps.length
+            ? (lastCap && (lastCap.hit || lastCap.gatePassCount === 3)
+                ? '<span class="text-green-300/90 text-[10px]">heard</span>'
+                : '<span class="text-amber-200/90 text-[10px]">not verified</span>')
+            : '';
+        return `<div class="flex flex-col gap-0.5 py-2 border-b border-gray-700/50">
+            <p class="text-gray-300 text-xs mb-1">${label}${techDetail}</p>
+            <div class="flex items-center justify-between gap-2">
+                <span class="text-gray-400 text-[10px]">${countNote.trim() || 'Ready'} ${status}</span>
+                <button type="button" class="nd-cal-lab-cap-str px-2 py-1 rounded text-[10px] bg-dark-600 hover:bg-dark-500 text-gray-200" data-store="${store}" data-s="${s}" data-f="${f}">${opts && opts.btnLabel ? opts.btnLabel : 'Capture'}</button>
+            </div>${chips ? `<div class="mt-0.5">${chips}</div>` : ''}</div>`;
     }
 
     function _calLabStringLabels() {
@@ -7696,47 +8546,128 @@ function createNoteDetector(options = {}) {
         const backBtn = _calLabEl.querySelector('.nd-cal-lab-back');
         const nextBtn = _calLabEl.querySelector('.nd-cal-lab-next');
         if (!body || !title) return;
-        const steps = _calLabStepMeta();
-        const step = _calLabState.step;
         const st = _calLabState;
-        title.textContent = `Technique Assessment — ${steps[step] ? steps[step].title : 'Step'}`;
-        if (backBtn) backBtn.style.visibility = step > 0 ? 'visible' : 'hidden';
-        if (nextBtn) nextBtn.textContent = step >= steps.length - 1 ? 'Done' : 'Next';
-
-        let html = `<div class="nd-cal-lab-live text-cyan-300/90 text-[10px] font-mono mb-2">Live: —</div>`;
-        if (!_calLabCanProbe() && step > 0 && step < steps.length - 1) {
-            html += '<p class="text-amber-200/90 text-[10px] mb-2">Turn Detect on (desktop bridge) for harmonic probes.</p>';
+        const steps = _calLabActiveSteps(st.mode);
+        const step = st.step;
+        const stepDef = steps[step];
+        const stepId = stepDef ? stepDef.id : 'intro';
+        if (st._lastRenderStepId !== stepId || st._lastRenderMode !== st.mode) {
+            _calLabStopAutoCapture('step-change');
+            st._lastRenderStepId = stepId;
+            st._lastRenderMode = st.mode;
+        }
+        const modeLabel = st.mode === 'basic' ? 'Basic' : (st.mode === 'advanced' ? 'Advanced' : '');
+        title.textContent = modeLabel
+            ? `Technique Assessment — ${modeLabel} · ${stepDef ? stepDef.title : 'Step'}`
+            : `Technique Assessment — ${stepDef ? stepDef.title : 'Get Started'}`;
+        if (backBtn) backBtn.style.visibility = (st.mode && step > 0) ? 'visible' : 'hidden';
+        if (nextBtn) {
+            if (!st.mode) {
+                nextBtn.style.visibility = 'hidden';
+                nextBtn.disabled = false;
+            } else {
+                nextBtn.style.visibility = 'visible';
+                nextBtn.textContent = step >= steps.length - 1 ? 'Done' : 'Next';
+                nextBtn.disabled = _calLabIsAutoBusy(st);
+            }
         }
 
-        const stepId = steps[step] ? steps[step].id : 'intro';
+        let html = `<div class="nd-cal-lab-live text-cyan-300/90 text-[10px] font-mono mb-2">Live: —</div>`;
+        if (!_calLabCanProbe() && st.mode && stepId !== 'report') {
+            html += '<p class="text-amber-200/90 text-[10px] mb-2">Turn Detect on (desktop) to run listening checks.</p>';
+        }
 
         if (stepId === 'intro') {
-            html += `<p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Calibration Wizard</strong> sets up audio input and levels. <strong class="text-gray-200">Technique Assessment</strong> (this tool) checks how well your playing verifies.</p>
-                <p class="text-gray-300 text-xs mb-2">Each capture checks three things: <strong class="text-gray-200">signal clarity</strong> (harmonic strength), <strong class="text-gray-200">fundamental</strong> (root pitch present), and <strong class="text-gray-200">pitch</strong> (in tune with the chart). A ratio of 1.0 means clarity meets the detector threshold.</p>
-                <p class="text-gray-400 text-[10px]">Read-only — this tool reports diagnostics only and does not change any settings.</p>`;
+            html += `<p class="text-gray-300 text-xs mb-3"><strong class="text-gray-200">Calibration Wizard</strong> sets up your input. <strong class="text-gray-200">Technique Assessment</strong> checks how well Slopsmith hears your playing.</p>
+                <p class="text-gray-300 text-xs mb-3">Each check looks at <strong class="text-gray-200">signal clarity</strong>, whether the <strong class="text-gray-200">main note</strong> is present, and <strong class="text-gray-200">tuning match</strong>. Read-only — nothing here changes gameplay settings.</p>
+                <button type="button" class="nd-cal-lab-start-basic w-full py-2.5 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2">Start Basic Assessment</button>
+                <p class="text-[10px] text-gray-500 mb-3">Checks input level, open strings, one fretted note, and one power chord. Best first step.</p>
+                <button type="button" class="nd-cal-lab-start-advanced w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Advanced Assessment</button>
+                <p class="text-[10px] text-gray-500">Detailed probes: hammer-ons, pull-offs, palm mutes, harmonics, bends, and sustain.</p>`;
         } else if (stepId === 'noise') {
-            html += `<p class="text-gray-300 text-xs mb-2">Mute all strings. Capture noise floor.</p>
-                <button type="button" class="nd-cal-lab-cap-noise w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Capture Noise</button>
-                <div class="nd-cal-lab-cap-noise-txt text-[11px] text-gray-400">—</div>`;
+            if (st.mode === 'basic') {
+                const busy = _calLabIsAutoBusy(st);
+                const done = st.autoRun && st.autoRun.phase === 'done' && st.autoRun.stepId === 'noise';
+                const noiseResult = Number.isFinite(st.noiseLevelPct)
+                    ? calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct) : '—';
+                html += `<p class="text-gray-300 text-sm mb-2">Mute all strings. We will listen to room noise.</p>
+                    ${_calLabBasicAutoControlsHtml('noise', 'Start noise check', busy, done)}
+                    <div class="nd-cal-lab-auto-status text-[11px] text-gray-300 mb-2 min-h-[2.5rem]"></div>
+                    <div class="nd-cal-lab-auto-result text-[11px] text-gray-400 mb-2">${noiseResult}</div>
+                    <details class="mb-2"><summary class="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 py-1">Manual capture options</summary>
+                        <button type="button" class="nd-cal-lab-cap-noise w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2 mt-1">Capture room noise (manual)</button>
+                    </details>`;
+            } else {
+                html += `<p class="text-gray-300 text-xs mb-2">Mute all strings and rest your hands on the strings.</p>
+                    <button type="button" class="nd-cal-lab-cap-noise w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Capture room noise</button>
+                    <div class="nd-cal-lab-cap-noise-txt text-[11px] text-gray-400">—</div>`;
+            }
         } else if (stepId === 'signal') {
-            html += `<p class="text-gray-300 text-xs mb-2">Play open low E loudly. Capture signal level.</p>
-                <button type="button" class="nd-cal-lab-cap-signal w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Capture Signal</button>
-                <div class="nd-cal-lab-cap-signal-txt text-[11px] text-gray-400">—</div>`;
+            if (st.mode === 'basic') {
+                const busy = _calLabIsAutoBusy(st);
+                const done = st.autoRun && st.autoRun.phase === 'done' && st.autoRun.stepId === 'signal';
+                const sigResult = Number.isFinite(st.signalLevelPct)
+                    ? calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct) : '—';
+                html += `<p class="text-gray-300 text-sm mb-2">Play the thickest string loudly.</p>
+                    ${_calLabBasicAutoControlsHtml('signal', 'Start signal check', busy, done)}
+                    <div class="nd-cal-lab-auto-status text-[11px] text-gray-300 mb-2 min-h-[2.5rem]"></div>
+                    <div class="nd-cal-lab-auto-result text-[11px] text-gray-400 mb-2">${sigResult}</div>
+                    <details class="mb-2"><summary class="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 py-1">Manual capture options</summary>
+                        <button type="button" class="nd-cal-lab-cap-signal w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2 mt-1">Capture playing level (manual)</button>
+                    </details>`;
+            } else {
+                html += `<p class="text-gray-300 text-xs mb-2">Play the thickest string open at normal volume.</p>
+                    <button type="button" class="nd-cal-lab-cap-signal w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Capture playing level</button>
+                    <div class="nd-cal-lab-cap-signal-txt text-[11px] text-gray-400">—</div>`;
+            }
         } else if (stepId === 'open' || stepId === 'fret5') {
             const fret = stepId === 'open' ? 0 : 5;
             const store = stepId === 'open' ? 'openCaptures' : 'fretCaptures';
-            html += `<p class="text-gray-300 text-xs mb-2">Play each string at fret ${fret}. Capture ≥${_CAL_LAB_MIN_CAPTURES} samples per string while the note rings.</p>`;
-            for (const { s, label } of _calLabStringLabels()) {
-                const caps = (st[store] && st[store][s]) || [];
-                const sum = _calLabSummarizeCaptures(caps);
-                const med = sum.medianSnrRatio != null ? sum.medianSnrRatio.toFixed(2) : '—';
-                const lastCap = caps.length ? caps[caps.length - 1] : null;
-                const chips = _calLabGateChipsHtml(lastCap);
-                html += `<div class="flex flex-col gap-0.5 py-1 border-b border-gray-700/50">
-                    <div class="flex items-center justify-between gap-2">
-                        <span class="text-gray-300 font-mono text-xs">${label} (s${s} f${fret}) · ${caps.length}/${_CAL_LAB_MIN_CAPTURES} · clarity ${med}</span>
-                        <button type="button" class="nd-cal-lab-cap-str px-2 py-0.5 rounded text-[10px] bg-dark-600 text-gray-300" data-store="${store}" data-s="${s}" data-f="${fret}">Capture</button>
-                    </div>${chips ? `<div>${chips}</div>` : ''}</div>`;
+            if (st.mode === 'basic') {
+                const rows = stepId === 'open' ? _CAL_LAB_BASIC_OPEN_ROWS : _CAL_LAB_BASIC_FRET_ROWS;
+                const busy = _calLabIsAutoBusy(st);
+                const autoKey = stepId === 'open' ? 'open' : 'fret5';
+                const done = st.autoRun && st.autoRun.phase === 'done' && st.autoRun.stepId === autoKey;
+                const startLabel = stepId === 'open' ? 'Start open-string check' : 'Start fretted-note check';
+                const instruct = stepId === 'open'
+                    ? 'We will check the thickest string open, then the next string open.'
+                    : 'Play the thickest string at the 5th fret when prompted.';
+                let summaryHtml = '';
+                for (const row of rows) {
+                    const caps = (st[store] && st[store][row.s]) || [];
+                    const lastCap = caps.length ? caps[caps.length - 1] : null;
+                    const chips = _calLabGateChipsHtml(lastCap);
+                    const heard = caps.length
+                        ? (lastCap && (lastCap.hit || lastCap.gatePassCount === 3)
+                            ? '<span class="text-green-300/90">heard</span>'
+                            : '<span class="text-amber-200/90">not verified</span>')
+                        : '<span class="text-gray-500">not checked</span>';
+                    summaryHtml += `<div class="py-1 border-b border-gray-700/40 text-[10px]">
+                        <span class="text-gray-300">${row.prompt}</span> · ${caps.length} captures · ${heard}
+                        ${chips ? `<div class="mt-0.5">${chips}</div>` : ''}</div>`;
+                }
+                html += `<p class="text-gray-300 text-sm mb-2">${instruct}</p>
+                    ${_calLabBasicAutoControlsHtml(autoKey, startLabel, busy, done)}
+                    <div class="nd-cal-lab-auto-status text-[11px] text-gray-300 mb-2 min-h-[2.5rem]"></div>
+                    <div class="nd-cal-lab-auto-summary text-[10px] text-gray-400 mb-2">${summaryHtml}</div>
+                    <details class="mb-2"><summary class="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 py-1">Manual capture options</summary>
+                        <div class="mt-1">`;
+                for (const row of rows) {
+                    html += _calLabStringCaptureRowHtml(st, store, row.s, row.f, row.prompt, {
+                        btnLabel: row.btn,
+                    });
+                }
+                html += `</div></details>`;
+            } else {
+                html += `<p class="text-gray-300 text-xs mb-2">Play each string ${fret === 0 ? 'open' : `at fret ${fret}`}. Capture while the note rings.</p>`;
+                for (const { s, label } of _calLabStringLabels()) {
+                    const musician = _calLabMusicianStringRowLabel(s, fret, label);
+                    html += _calLabStringCaptureRowHtml(st, store, s, fret, musician, {
+                        showTech: true,
+                        showCount: true,
+                        btnLabel: `Capture ${musician}`,
+                    });
+                }
             }
         } else if (stepId === 'picked') {
             html += `<p class="text-gray-300 text-xs mb-2">Pick single notes (e.g. 12th fret). Capture while playing.</p>
@@ -7751,9 +8682,35 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="pullOff" data-s="1" data-f="3" data-po="1">Capture pull-off</button>
                 <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'pullOff')}</div>`;
         } else if (stepId === 'powerChord') {
-            html += `<p class="text-gray-300 text-xs mb-2">Play a power chord (low E fret 0 + A fret 2). Capture while both ring.</p>
-                <button type="button" class="nd-cal-lab-cap-pwr w-full py-2 bg-dark-600 rounded text-xs mb-2">Capture power chord</button>
-                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'powerChord')}</div>`;
+            const pwrCaps = (st.techniqueCaptures && st.techniqueCaptures.powerChord) || [];
+            const pwrCaptureBlocks = pwrCaps.length
+                ? pwrCaps.map((cap, i) => _calLabPowerChordCaptureBlockHtml(cap, i)).join('')
+                : '';
+            const simpleDiag = _calLabPowerChordSimpleDiagnosis(st);
+            if (st.mode === 'basic') {
+                const busy = _calLabIsAutoBusy(st);
+                const done = st.autoRun && st.autoRun.phase === 'done' && st.autoRun.stepId === 'powerChord';
+                html += `<p class="text-gray-300 text-sm mb-2">Play a power chord: thickest string open + next string 2nd fret.</p>
+                    <p class="text-[10px] text-gray-500 mb-2">Try the dry/clean channel if available to compare against a wet tone.</p>
+                    ${_calLabBasicAutoControlsHtml('powerChord', 'Start power-chord check', busy, done)}
+                    <div class="nd-cal-lab-auto-status text-[11px] text-gray-300 mb-2 min-h-[2.5rem]"></div>
+                    <p class="nd-cal-lab-pwr-diag-live text-[11px] text-gray-200 mb-2">${simpleDiag}</p>
+                    ${pwrCaptureBlocks ? `<details class="mb-2"><summary class="text-[10px] text-gray-400 cursor-pointer hover:text-gray-200 py-1">Technical capture details</summary>
+                        <div class="nd-cal-lab-tech-sum text-[10px] text-gray-500 mt-1 mb-2">${_calLabFormatPowerChordSum(st)}</div>
+                        <div class="nd-cal-lab-pwr-captures">${pwrCaptureBlocks}</div></details>` : ''}
+                    <details class="mb-2"><summary class="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 py-1">Manual capture options</summary>
+                        <button type="button" class="nd-cal-lab-cap-pwr w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2 mt-1">Capture power chord (manual)</button>
+                    </details>`;
+            } else {
+                html += `<p class="text-gray-300 text-xs mb-2">Play a power chord: thickest string open + next string at the 2nd fret. Capture while both ring.</p>
+                    <p class="text-[10px] text-gray-500 mb-2">Power chords are tested per string. If the root passes but the fifth fails, the issue is usually masking, distortion, or channel choice — not your timing.</p>
+                    <p class="text-[10px] text-gray-500 mb-2">Try the dry/clean channel if available to compare against a wet Spark tone.</p>
+                    <button type="button" class="nd-cal-lab-cap-pwr w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2">Capture power chord</button>
+                    <p class="text-[11px] text-gray-200 mb-2">${simpleDiag}</p>
+                    ${pwrCaptureBlocks ? `<details class="mb-2"><summary class="text-[10px] text-gray-400 cursor-pointer hover:text-gray-200 py-1">Technical capture details</summary>
+                        <div class="nd-cal-lab-tech-sum text-[10px] text-gray-500 mt-1 mb-2">${_calLabFormatPowerChordSum(st)}</div>
+                        <div class="nd-cal-lab-pwr-captures">${pwrCaptureBlocks}</div></details>` : ''}`;
+            }
         } else if (stepId === 'palmMute') {
             html += `<p class="text-gray-300 text-xs mb-2">Palm-muted chugs on low E.</p>
                 <p class="text-[10px] text-amber-200/80 mb-2">Note: charts do not flag palm mutes yet — this probe uses a picked-note context. Results show how muted playing verifies, not chart palm-mute scoring.</p>
@@ -7784,11 +8741,16 @@ function createNoteDetector(options = {}) {
                 <div class="nd-cal-lab-sustain-txt text-[11px] text-gray-400">${(st.sustainSeries || []).length} samples</div>`;
         } else if (stepId === 'report') {
             const rep = _calLabBuildReport();
+            const simpleBullets = _calLabBuildSimpleReportBullets(rep);
+            const simpleHtml = simpleBullets.map((t) => `<li class="text-gray-200">${t}</li>`).join('');
             const recHtml = (rep.recommendations || []).map((t) => `<li class="text-amber-200/90">${t}</li>`).join('');
-            html += `<p class="text-gray-300 text-xs mb-2">Technique Assessment report — informational only; no settings are changed automatically.</p>
-                <ul class="text-[11px] list-disc pl-4 mb-3 space-y-0.5">${recHtml}</ul>
-                <button type="button" class="nd-cal-lab-dl w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2">Download technique assessment report (JSON)</button>
-                <pre class="text-[9px] text-gray-500 max-h-32 overflow-auto whitespace-pre-wrap">${_calLabReportPreview(rep)}</pre>`;
+            html += `<p class="text-gray-300 text-xs mb-2">Your Technique Assessment results. This did not change gameplay settings.</p>
+                <ul class="text-[11px] list-disc pl-4 mb-3 space-y-1">${simpleHtml}</ul>
+                <button type="button" class="nd-cal-lab-dl w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2">Download full report (JSON)</button>
+                <details class="mb-2"><summary class="text-[10px] text-gray-400 cursor-pointer hover:text-gray-200 py-1">Technical details</summary>
+                    <ul class="text-[10px] list-disc pl-4 mb-2 space-y-0.5 mt-2">${recHtml || '<li class="text-gray-500">No extra technical notes.</li>'}</ul>
+                    <pre class="text-[9px] text-gray-500 max-h-32 overflow-auto whitespace-pre-wrap">${_calLabReportPreview(rep)}</pre>
+                </details>`;
         }
 
         body.innerHTML = html;
@@ -7797,6 +8759,7 @@ function createNoteDetector(options = {}) {
     }
 
     function _calLabFormatTechSum(st, key) {
+        if (key === 'powerChord') return _calLabFormatPowerChordSum(st);
         let sum;
         let lastCap = null;
         if (key === 'sustain' && (st.sustainSeries || []).length) {
@@ -7809,11 +8772,10 @@ function createNoteDetector(options = {}) {
             lastCap = caps.length ? caps[caps.length - 1] : null;
         }
         if (!sum.n) return 'No captures yet — press Capture while playing.';
-        const med = Number.isFinite(sum.medianSnrRatio) ? sum.medianSnrRatio.toFixed(2) : '—';
         const unit = key === 'sustain' ? 'samples' : 'captures';
         const weak = _calLabDominantFailLabel(sum.dominantFailure);
         const chips = _calLabGateChipsHtml(lastCap);
-        return `${sum.n} ${unit} · clarity ratio ${med} (1.0 = at threshold) · weakest: ${weak}${chips ? ' · ' : ''}${chips}`;
+        return `${sum.n} ${unit} · weakest area: ${weak}${chips ? ' · ' : ''}${chips}`;
     }
 
     function _calLabReportPreview(rep) {
@@ -7821,6 +8783,16 @@ function createNoteDetector(options = {}) {
             const lines = [];
             for (const t of (rep.per_technique || [])) {
                 if (!t.summary || !t.summary.n) continue;
+                if (t.id === 'powerChord' && t.summary.root && t.summary.fifth) {
+                    const rootPct = t.summary.root.passRate != null
+                        ? Math.round(t.summary.root.passRate * 100) : '—';
+                    const fifthPct = t.summary.fifth.passRate != null
+                        ? Math.round(t.summary.fifth.passRate * 100) : '—';
+                    let line = `${t.label}: ${t.summary.n} captures · root ${rootPct}% · fifth ${fifthPct}%`;
+                    if (t.summary.likelyCause) line += ` · ${t.summary.likelyCause}`;
+                    lines.push(line);
+                    continue;
+                }
                 const med = Number.isFinite(t.summary.medianSnrRatio)
                     ? t.summary.medianSnrRatio.toFixed(2) : '—';
                 lines.push(`${t.label}: ${t.summary.n} captures · clarity ${med} · weakest: ${_calLabDominantFailLabel(t.summary.dominantFailure)}`);
@@ -7835,29 +8807,93 @@ function createNoteDetector(options = {}) {
         const body = _calLabEl.querySelector('.nd-cal-lab-body');
         if (!body) return;
 
+        const startBasic = body.querySelector('.nd-cal-lab-start-basic');
+        if (startBasic) {
+            startBasic.onclick = () => {
+                _calLabStopAutoCapture('mode');
+                st.mode = 'basic';
+                st.step = 0;
+                renderCalibrationLab();
+            };
+        }
+        const startAdvanced = body.querySelector('.nd-cal-lab-start-advanced');
+        if (startAdvanced) {
+            startAdvanced.onclick = () => {
+                _calLabStopAutoCapture('mode');
+                st.mode = 'advanced';
+                st.step = 0;
+                renderCalibrationLab();
+            };
+        }
+
+        body.querySelectorAll('.nd-cal-lab-auto-start').forEach((btn) => {
+            btn.onclick = () => {
+                const key = btn.getAttribute('data-auto-step');
+                if (key === 'noise') _calLabStartNoiseAuto();
+                else if (key === 'signal') _calLabStartSignalAuto();
+                else if (key === 'open') _calLabStartOpenAuto(false);
+                else if (key === 'fret5') _calLabStartFretAuto(false);
+                else if (key === 'powerChord') _calLabStartPowerChordAuto(false);
+            };
+        });
+        body.querySelectorAll('.nd-cal-lab-auto-retry').forEach((btn) => {
+            btn.onclick = () => {
+                const key = btn.getAttribute('data-auto-step');
+                _calLabRetryBasicAuto(key);
+            };
+        });
+        body.querySelectorAll('.nd-cal-lab-auto-stop').forEach((btn) => {
+            btn.onclick = () => {
+                _calLabStopAutoCapture('user');
+                _calLabSetAutoStatus('<span class="text-gray-400">Stopped.</span>');
+                _calLabUpdateBasicAutoButtons();
+            };
+        });
+
         const capNoise = body.querySelector('.nd-cal-lab-cap-noise');
         if (capNoise) {
             capNoise.onclick = () => {
+                _calLabStopAutoCapture('manual');
                 const s = getCalibrationSnapshot();
                 st.noiseLevelPct = s.inputLevelPct;
                 st.noisePeakPct = s.inputPeakPct;
                 const el = body.querySelector('.nd-cal-lab-cap-noise-txt');
                 if (el) el.textContent = calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct);
+                const autoEl = body.querySelector('.nd-cal-lab-auto-result');
+                if (autoEl) {
+                    autoEl.textContent = calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct);
+                }
+                if (st.autoRun) {
+                    st.autoRun.phase = 'done';
+                    st.autoRun.stepId = 'noise';
+                }
+                renderCalibrationLab();
             };
         }
         const capSignal = body.querySelector('.nd-cal-lab-cap-signal');
         if (capSignal) {
             capSignal.onclick = () => {
+                _calLabStopAutoCapture('manual');
                 const s = getCalibrationSnapshot();
                 st.signalLevelPct = s.inputLevelPct;
                 st.signalPeakPct = s.inputPeakPct;
                 const el = body.querySelector('.nd-cal-lab-cap-signal-txt');
                 if (el) el.textContent = calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct);
+                const autoEl = body.querySelector('.nd-cal-lab-auto-result');
+                if (autoEl) {
+                    autoEl.textContent = calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct);
+                }
+                if (st.autoRun) {
+                    st.autoRun.phase = 'done';
+                    st.autoRun.stepId = 'signal';
+                }
+                renderCalibrationLab();
             };
         }
 
         body.querySelectorAll('.nd-cal-lab-cap-str').forEach((btn) => {
             btn.onclick = async () => {
+                _calLabStopAutoCapture('manual');
                 const store = btn.getAttribute('data-store');
                 const s = parseInt(btn.getAttribute('data-s'), 10);
                 const f = parseInt(btn.getAttribute('data-f'), 10);
@@ -7865,6 +8901,7 @@ function createNoteDetector(options = {}) {
                 btn.disabled = true;
                 const cap = await _calLabCaptureProbe({ s, f }, store);
                 btn.disabled = false;
+                if (!_calLabState || _calLabState !== st) return;
                 if (cap.ok) {
                     if (!st[store]) st[store] = {};
                     if (!st[store][s]) st[store][s] = [];
@@ -7876,6 +8913,7 @@ function createNoteDetector(options = {}) {
 
         body.querySelectorAll('.nd-cal-lab-cap-tech').forEach((btn) => {
             btn.onclick = async () => {
+                _calLabStopAutoCapture('manual');
                 const tech = btn.getAttribute('data-tech');
                 const s = parseInt(btn.getAttribute('data-s'), 10);
                 const f = parseInt(btn.getAttribute('data-f'), 10);
@@ -7899,9 +8937,11 @@ function createNoteDetector(options = {}) {
         const capPwr = body.querySelector('.nd-cal-lab-cap-pwr');
         if (capPwr) {
             capPwr.onclick = async () => {
+                _calLabStopAutoCapture('manual');
                 capPwr.disabled = true;
                 const cap = await _calLabCaptureMulti([{ s: 0, f: 0 }, { s: 1, f: 2 }], 'powerChord');
                 capPwr.disabled = false;
+                if (!_calLabState || _calLabState !== st) return;
                 if (cap.ok) {
                     if (!st.techniqueCaptures) st.techniqueCaptures = {};
                     if (!st.techniqueCaptures.powerChord) st.techniqueCaptures.powerChord = [];
@@ -7939,8 +8979,10 @@ function createNoteDetector(options = {}) {
     }
 
     function calibrationLabNext() {
-        if (!_calLabState) return;
-        const steps = _calLabStepMeta();
+        if (!_calLabState || !_calLabState.mode) return;
+        if (_calLabIsAutoBusy(_calLabState)) return;
+        _calLabStopAutoCapture('next');
+        const steps = _calLabActiveSteps(_calLabState.mode);
         if (_calLabState.step >= steps.length - 1) {
             calibrationLabClose();
             return;
@@ -7950,7 +8992,9 @@ function createNoteDetector(options = {}) {
     }
 
     function calibrationLabBack() {
-        if (!_calLabState || _calLabState.step <= 0) return;
+        if (!_calLabState || !_calLabState.mode || _calLabState.step <= 0) return;
+        if (_calLabIsAutoBusy(_calLabState)) return;
+        _calLabStopAutoCapture('back');
         _calLabState.step--;
         renderCalibrationLab();
     }
@@ -7958,6 +9002,7 @@ function createNoteDetector(options = {}) {
     function openInstrumentCalibrationLab() {
         calibrationLabClose();
         _calLabState = {
+            mode: null,
             step: 0,
             noiseLevelPct: null,
             noisePeakPct: null,
@@ -7967,6 +9012,7 @@ function createNoteDetector(options = {}) {
             fretCaptures: {},
             techniqueCaptures: {},
             sustainSeries: [],
+            autoRun: _calLabDefaultAutoRun(),
         };
         const overlay = document.createElement('div');
         overlay.className = 'nd-cal-lab';
@@ -12108,6 +13154,224 @@ function createNoteDetector(options = {}) {
         _liveSessionId = null;
     }
 
+    // ── Diagnostic basic-guitar sloppak — post-play report (read-only) ──
+    // Recognises the generated technique-assessment diagnostic track and
+    // maps existing _diagEvents into beginner-friendly categories. Does
+    // NOT change scoring, thresholds, or settings.
+    const _DIAG_BASIC_GUITAR_MATCH_TOL_S = 0.075;
+    const _DIAG_BASIC_GUITAR_CHART = [
+        { t: 4,  category: 'openLow',      label: 'Open low string',  chord: false, s: 0, f: 0 },
+        { t: 8,  category: 'openNext',     label: 'Open next string', chord: false, s: 1, f: 0 },
+        { t: 12, category: 'fretted',      label: 'Fretted note',     chord: false, s: 0, f: 5 },
+        { t: 16, category: 'powerChords',  label: 'Power chord',      chord: true },
+        { t: 20, category: 'powerChords',  label: 'Power chord',      chord: true },
+        { t: 24, category: 'powerChords',  label: 'Power chord',      chord: true },
+        { t: 28, category: 'powerChords',  label: 'Power chord',      chord: true },
+        { t: 32, category: 'repeatCheck',  label: 'Repeat open low',  chord: false, s: 0, f: 0 },
+        { t: 36, category: 'repeatCheck',  label: 'Repeat fretted',   chord: false, s: 0, f: 5 },
+        { t: 40, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+        { t: 44, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+        { t: 48, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+    ];
+
+    function _isDiagnosticBasicGuitarSession() {
+        const fn = (_ndShared.currentFilename || '').toLowerCase();
+        if (fn.includes('slopsmith-diagnostic-basic-guitar.sloppak')) return true;
+        const currentHw = resolveHw();
+        const info = (currentHw && currentHw.getSongInfo) ? currentHw.getSongInfo() : {};
+        return info.title === 'Slopsmith Diagnostic — Basic Guitar'
+            && info.artist === 'Slopsmith'
+            && info.arrangement === 'Diagnostic Guitar';
+    }
+
+    function _diagBasicGuitarMatchEvent(events, spec) {
+        for (const ev of events) {
+            if (!ev || !Number.isFinite(ev.t)) continue;
+            if (Math.abs(ev.t - spec.t) > _DIAG_BASIC_GUITAR_MATCH_TOL_S) continue;
+            if (!!ev.chord !== !!spec.chord) continue;
+            if (!spec.chord) {
+                if (ev.s !== spec.s || ev.f !== spec.f) continue;
+            }
+            return ev;
+        }
+        return null;
+    }
+
+    function _buildDiagnosticBasicGuitarPlayReport() {
+        const events = _diagEvents.slice();
+        let matchedCount = 0;
+        for (const spec of _DIAG_BASIC_GUITAR_CHART) {
+            if (_diagBasicGuitarMatchEvent(events, spec)) matchedCount++;
+        }
+        if (matchedCount === 0) return null;
+
+        const playTotal = hits + misses;
+        const overall = {
+            hits,
+            misses,
+            accuracy: playTotal > 0 ? Math.round((hits / playTotal) * 100) : 0,
+            bestStreak,
+        };
+
+        const categoryMeta = {
+            openLow:      { label: 'Open low string' },
+            openNext:     { label: 'Open next string' },
+            fretted:      { label: 'Fretted note' },
+            powerChords:  { label: 'Power chords' },
+            repeatCheck:  { label: 'Repeat check' },
+        };
+
+        const categories = {};
+        let hasPartialPowerChords = false;
+
+        for (const catId of Object.keys(categoryMeta)) {
+            const specs = _DIAG_BASIC_GUITAR_CHART.filter((s) => s.category === catId);
+            let attempts = 0;
+            let catHits = 0;
+            let catMisses = 0;
+            const timingErrors = [];
+            const chordAttempts = [];
+
+            for (const spec of specs) {
+                const ev = _diagBasicGuitarMatchEvent(events, spec);
+                if (!ev) continue;
+                attempts++;
+                if (ev.hit) catHits++; else catMisses++;
+                if (Number.isFinite(ev.te)) timingErrors.push(ev.te);
+                if (spec.chord) {
+                    const hs = Number.isFinite(ev.hs) ? ev.hs : null;
+                    const tt = Number.isFinite(ev.tt) ? ev.tt : 2;
+                    chordAttempts.push({ t: ev.t, hit: !!ev.hit, hs, tt });
+                    if (hs != null && hs < tt) hasPartialPowerChords = true;
+                }
+            }
+
+            if (attempts === 0) continue;
+
+            const cat = {
+                id: catId,
+                label: categoryMeta[catId].label,
+                attempts,
+                hits: catHits,
+                misses: catMisses,
+                accuracy: Math.round((catHits / attempts) * 100),
+                timingMedianMs: timingErrors.length
+                    ? _diagPercentile(timingErrors, 50)
+                    : null,
+            };
+
+            if (catId === 'powerChords' && chordAttempts.length) {
+                const heard = chordAttempts.filter((c) => c.hs != null);
+                const avgHeard = heard.length
+                    ? heard.reduce((sum, c) => sum + c.hs, 0) / heard.length
+                    : null;
+                cat.chordHits = catHits;
+                cat.chordMisses = catMisses;
+                cat.avgStringsHeard = avgHeard;
+                cat.expectedStrings = 2;
+                cat.perAttempt = chordAttempts.map((c) => {
+                    const heardTxt = c.hs != null ? `heard ${c.hs} of ${c.tt} strings` : 'strings heard unknown';
+                    return { t: c.t, hit: c.hit, heardTxt };
+                });
+            }
+
+            categories[catId] = cat;
+        }
+
+        if (!Object.keys(categories).length) return null;
+
+        return {
+            overall,
+            categories,
+            matchedCount,
+            hasPartialPowerChords,
+            sections: sectionStats.map((s) => ({
+                name: s.name,
+                hits: s.hits,
+                misses: s.misses,
+                accuracy: (s.hits + s.misses) > 0
+                    ? Math.round((s.hits / (s.hits + s.misses)) * 100)
+                    : 0,
+            })),
+        };
+    }
+
+    function _diagBasicGuitarHitMissHtml(hit) {
+        return hit
+            ? '<span class="text-green-400">Hit</span>'
+            : '<span class="text-red-400">Miss</span>';
+    }
+
+    function _renderDiagnosticBasicGuitarPlayHtml(report) {
+        if (!report || !report.categories) return '';
+        const cats = report.categories;
+        let rows = '';
+
+        for (const id of ['openLow', 'openNext', 'fretted']) {
+            const c = cats[id];
+            if (!c || !c.attempts) continue;
+            rows += `<div class="flex justify-between gap-2 mb-1">`
+                + `<span class="text-gray-300">${c.label}</span>`
+                + _diagBasicGuitarHitMissHtml(c.hits > 0)
+                + `</div>`;
+        }
+
+        const pwr = cats.powerChords;
+        if (pwr && pwr.attempts) {
+            let pwrDetail = '';
+            if (pwr.avgStringsHeard != null) {
+                pwrDetail += `<div class="text-[10px] text-gray-500">`
+                    + `${pwr.chordHits}/${pwr.attempts} hit`
+                    + ` · avg heard ${pwr.avgStringsHeard.toFixed(1)} of ${pwr.expectedStrings} strings`
+                    + `</div>`;
+            } else {
+                pwrDetail += `<div class="text-[10px] text-gray-500">${pwr.hits}/${pwr.attempts} hit</div>`;
+            }
+            const partialLines = (pwr.perAttempt || [])
+                .filter((a) => a.heardTxt && (!a.hit || a.heardTxt.indexOf('heard 2 of 2') === -1))
+                .map((a) => {
+                    const prefix = Number.isFinite(a.t) ? `${a.t}s: ` : '';
+                    return `${prefix}${a.heardTxt}`;
+                });
+            if (partialLines.length) {
+                pwrDetail += `<div class="text-[10px] text-gray-500 mt-0.5">`
+                    + partialLines.join('<br>')
+                    + `</div>`;
+            }
+            rows += `<div class="mb-1">`
+                + `<div class="flex justify-between gap-2">`
+                + `<span class="text-gray-300">${pwr.label}</span>`
+                + `<span class="text-gray-400">${pwr.hits}/${pwr.attempts} hit</span>`
+                + `</div>${pwrDetail}</div>`;
+        }
+
+        const rep = cats.repeatCheck;
+        if (rep && rep.attempts) {
+            rows += `<div class="flex justify-between gap-2 mb-1">`
+                + `<span class="text-gray-300">${rep.label}</span>`
+                + `<span class="text-gray-400">${rep.hits}/${rep.attempts} hit</span>`
+                + `</div>`;
+        }
+
+        if (!rows) return '';
+
+        let notes = '<p class="text-[10px] text-gray-500 mt-2">'
+            + 'This diagnostic report did not change gameplay settings.'
+            + '</p>';
+        if (report.hasPartialPowerChords) {
+            notes += '<p class="text-[10px] text-gray-500 mt-1">'
+                + 'Power chords were partly heard. Try a cleaner/drier channel or run '
+                + 'Technique Assessment for root/fifth detail.'
+                + '</p>';
+        }
+
+        return `<div class="mt-3 text-xs border-t border-gray-600 pt-3">`
+            + `<div class="text-gray-200 text-xs font-semibold mb-2">Diagnostic Results</div>`
+            + rows
+            + notes
+            + `</div>`;
+    }
+
     // Returns true if a summary overlay was created, false if it bailed
     // (fewer than 5 judgments) — callers deferring the summary use this
     // to know whether there is actually an overlay to reveal later.
@@ -12186,6 +13450,14 @@ function createNoteDetector(options = {}) {
             breakdownHtml += '</div>';
         }
 
+        let diagnosticPlayHtml = '';
+        if (_isDiagnosticBasicGuitarSession()) {
+            const playReport = _buildDiagnosticBasicGuitarPlayReport();
+            if (playReport) {
+                diagnosticPlayHtml = _renderDiagnosticBasicGuitarPlayHtml(playReport);
+            }
+        }
+
         const overlay = document.createElement('div');
         overlay.className = 'nd-summary-overlay';
         // Skin attribute mirrors the instance root's so the overlay (a
@@ -12214,6 +13486,7 @@ function createNoteDetector(options = {}) {
                 <div class="nd-sum-xp hidden"></div>
                 ${breakdownHtml}
                 ${sectionHtml}
+                ${diagnosticPlayHtml}
                 <div class="nd-sum-actions">
                     ${tuningMode ? `
                     <button class="nd-summary-download nd-btn nd-btn-primary">
