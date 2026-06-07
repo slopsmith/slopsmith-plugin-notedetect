@@ -1649,7 +1649,7 @@ function createNoteDetector(options = {}) {
             if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
             if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
             if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
-            if (s.inputGain !== undefined) inputGain = s.inputGain;
+            if (Number.isFinite(s.inputGain)) inputGain = Math.max(1, Math.min(5, s.inputGain));
             if (s.latencyOffset !== undefined) latencyOffset = s.latencyOffset;
             // Clamp to the slider's range so a stale persisted value
             // (older build, manual edit) can't put scoring in a state the
@@ -1739,9 +1739,9 @@ function createNoteDetector(options = {}) {
     let _calWizardEl = null;
     let _calWizardTick = null;
     let _calWizardState = null;
-    const _CAL_WIZARD_NOTE_CHECKS = [
-        { id: 'lowE', label: 'Low E', midi: 40 },
-        { id: 'openA', label: 'Open A', midi: 45 },
+    const _CAL_WIZARD_NOTE_CHECK_DEFS = [
+        { id: 'lowE', string: 0, fallbackLabel: 'Low E', fallbackMidi: 40 },
+        { id: 'openA', string: 1, fallbackLabel: 'Open A', fallbackMidi: 45 },
     ];
     const _CAL_WIZARD_STEPS = [
         { id: 'welcome', title: 'Welcome' },
@@ -5333,6 +5333,30 @@ function createNoteDetector(options = {}) {
         { ch: 0, label: 'Input 1 / Ch 1' },
         { ch: 1, label: 'Input 2 / Ch 2' },
     ];
+    const _CAL_WIZARD_TIMED_PLAYALONG_SEC = 30;
+    const _CAL_WIZARD_PLAY_ALONG_WAIT_MS = 60000;
+    const _CAL_WIZARD_PLAY_ALONG_WAIT_POLL_MS = 250;
+    const _CAL_WIZARD_PLAYHEAD_ADVANCE_MIN_SEC = 0.02;
+    const _CAL_WIZARD_PLAYHEAD_ADVANCE_MIN_GAP_MS = 150;
+    const _CAL_WIZARD_PAUSE_RETRY_DELAYS_MS = [0, 150, 500, 1200, 2500, 4000];
+    let _calWizardPauseRetryTimers = [];
+
+    function _calWizardDefaultAllStringsState() {
+        return {
+            running: false,
+            index: 0,
+            ids: [],
+            complete: false,
+            failedId: null,
+            detailsOpen: false,
+            message: null,
+        };
+    }
+
+    function _calWizardClearPauseRetries() {
+        _calWizardPauseRetryTimers.forEach((id) => clearTimeout(id));
+        _calWizardPauseRetryTimers = [];
+    }
 
     function _calWizardNewState() {
         return {
@@ -5342,10 +5366,14 @@ function createNoteDetector(options = {}) {
             noise: null,
             signal: null,
             notes: {},
+            allStrings: _calWizardDefaultAllStringsState(),
             timing: null,
             recommended: { inputGain: null, latencyOffset: null, reasons: {} },
             applyChecked: { inputGain: true, latencyOffset: true },
             applied: null,
+            complete: null,
+            playAlong: null,
+            timingCaptureNote: null,
             autoCapture: null,
             channelProbeRunning: false,
             channelProbeResult: null,
@@ -5660,22 +5688,236 @@ function createNoteDetector(options = {}) {
         });
     }
 
+    function _calWizardResolveNoteCheckContext() {
+        try { _syncChartStateFromHw(); } catch (_) { /* read-only refresh */ }
+        const hw = resolveHw();
+        let info = null;
+        try { info = (hw && hw.getSongInfo) ? hw.getSongInfo() : null; } catch (_) {}
+        const hasTuning = !!(info && Array.isArray(info.tuning) && info.tuning.length > 0);
+        const arrangement = currentArrangement || 'guitar';
+        const stringCount = (Number.isFinite(currentStringCount) && currentStringCount > 0)
+            ? currentStringCount : 6;
+        const offsets = Array.isArray(tuningOffsets) ? tuningOffsets : [0, 0, 0, 0, 0, 0];
+        return { hasTuning, arrangement, stringCount, offsets };
+    }
+
+    function _calWizardOpenStringMidi(stringIndex, ctx) {
+        const { hasTuning, arrangement, stringCount, offsets } = ctx;
+        let expectedMidi = null;
+        if (hasTuning) {
+            try {
+                const computed = _ndMidiFromStringFret(
+                    stringIndex, 0, arrangement, stringCount, offsets, 0);
+                if (Number.isFinite(computed)) expectedMidi = computed;
+            } catch (_) { /* fall through to fallback */ }
+        }
+        if (!Number.isFinite(expectedMidi)) {
+            try {
+                const base = _ndStandardMidiFor(arrangement, stringCount);
+                if (base && base[stringIndex] !== undefined) expectedMidi = base[stringIndex];
+            } catch (_) { /* ignore */ }
+        }
+        return expectedMidi;
+    }
+
+    function _calWizardOpenStringDisplayNum(stringIndex, stringCount) {
+        return stringCount - stringIndex;
+    }
+
+    function _calWizardOpenStringLabel(stringIndex, stringCount, expectedNote, hasTuning) {
+        const n = _calWizardOpenStringDisplayNum(stringIndex, stringCount);
+        const note = expectedNote || '—';
+        if (stringIndex === 0) {
+            return hasTuning
+                ? `String ${n} — low string (${note})`
+                : `String ${n} — low string`;
+        }
+        if (stringIndex === stringCount - 1) {
+            return hasTuning
+                ? `String ${n} — high string (${note})`
+                : `String ${n} — high string`;
+        }
+        return hasTuning ? `String ${n} (${note})` : `String ${n}`;
+    }
+
+    function _calWizardResolveNoteChecks(opts) {
+        const mode = (opts && opts.mode === 'all') ? 'all' : 'quick';
+        const ctx = _calWizardResolveNoteCheckContext();
+        const { hasTuning, stringCount } = ctx;
+        if (mode === 'all') {
+            const specs = [];
+            for (let s = 0; s < stringCount; s++) {
+                const expectedMidi = _calWizardOpenStringMidi(s, ctx);
+                if (!Number.isFinite(expectedMidi)) continue;
+                const expectedNote = _ndMidiToName(expectedMidi);
+                specs.push({
+                    id: 'openS' + s,
+                    label: _calWizardOpenStringLabel(s, stringCount, expectedNote, hasTuning),
+                    expectedMidi,
+                    expectedNote,
+                    string: s,
+                    displayString: _calWizardOpenStringDisplayNum(s, stringCount),
+                });
+            }
+            return specs;
+        }
+        const specs = [];
+        for (const def of _CAL_WIZARD_NOTE_CHECK_DEFS) {
+            if (def.string >= stringCount) continue;
+            let expectedMidi = _calWizardOpenStringMidi(def.string, ctx);
+            if (!Number.isFinite(expectedMidi)) expectedMidi = def.fallbackMidi;
+            const expectedNote = _ndMidiToName(expectedMidi);
+            const label = def.string === 0
+                ? (hasTuning ? `Open low string (${expectedNote})` : def.fallbackLabel)
+                : (hasTuning ? `Open 2nd string (${expectedNote})` : def.fallbackLabel);
+            specs.push({
+                id: def.id,
+                label,
+                expectedMidi,
+                expectedNote,
+                string: def.string,
+            });
+        }
+        if (!specs.length) {
+            return _CAL_WIZARD_NOTE_CHECK_DEFS.map((def) => ({
+                id: def.id,
+                label: def.fallbackLabel,
+                expectedMidi: def.fallbackMidi,
+                expectedNote: _ndMidiToName(def.fallbackMidi),
+                string: def.string,
+            }));
+        }
+        return specs;
+    }
+
+    function _calWizardFindNoteCheckSpec(noteId) {
+        if (!noteId) return null;
+        const quick = _calWizardResolveNoteChecks({ mode: 'quick' });
+        const hit = quick.find((n) => n.id === noteId);
+        if (hit) return hit;
+        const all = _calWizardResolveNoteChecks({ mode: 'all' });
+        return all.find((n) => n.id === noteId) || null;
+    }
+
+    // Wizard-only raw pitch readout — bypasses chart-aware detectedDisplayMidi.
+    function _calWizardRawPitchFields() {
+        const confOk = detectedConfidence > detectionConfidenceMin;
+        const rawMidi = (detectedMidi >= 0 && confOk) ? detectedMidi : null;
+        const rawNote = Number.isFinite(rawMidi) ? _ndMidiToName(rawMidi) : '—';
+        let displayNote = null;
+        if (detectedString >= 0 && confOk) {
+            const dm = Number.isFinite(detectedDisplayMidi) ? detectedDisplayMidi : detectedMidi;
+            if (Number.isFinite(dm)) displayNote = _ndMidiToName(dm);
+        }
+        return {
+            rawMidi,
+            rawNote,
+            displayNote,
+            confidencePct: confOk ? Math.round(detectedConfidence * 100) : null,
+            channel: _ndHealthInputChannelLabel(),
+        };
+    }
+
     function _calWizardMidiNearTarget(detectedMidi, targetMidi, centsTol) {
         if (!Number.isFinite(detectedMidi) || !Number.isFinite(targetMidi)) return false;
         return Math.abs(_ndNearestOctaveCents(detectedMidi, targetMidi)) <= centsTol;
     }
 
-    function _calWizardStartNoteCapture(noteId) {
+    function _calWizardStopAllStringsRun(reason, opts) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.allStrings) return;
+        const seq = wiz.allStrings;
+        const wasRunning = seq.running;
+        seq.running = false;
+        if (opts && opts.clearMessage) seq.message = null;
+        if (reason === 'restart') {
+            seq.complete = false;
+            seq.failedId = null;
+        }
+        if (wasRunning && wiz.autoCapture && wiz.autoCapture.kind === 'note') {
+            const nid = wiz.autoCapture.noteId;
+            if (nid && seq.ids && seq.ids.includes(nid)) {
+                _calWizardStopAutoCapture();
+            }
+        }
+    }
+
+    function _calWizardStartAllStringsRun() {
         const wiz = _calWizardState;
         if (!wiz) return;
-        const spec = _CAL_WIZARD_NOTE_CHECKS.find((n) => n.id === noteId);
-        if (!spec) return;
         const snap = getCalibrationSnapshot();
         if (!snap.enabled) {
             _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
             return;
         }
+        _calWizardStopAllStringsRun('restart', { clearMessage: true });
+        const specs = _calWizardResolveNoteChecks({ mode: 'all' });
+        if (!specs.length) return;
+        for (const key of Object.keys(wiz.notes)) {
+            if (key.startsWith('openS')) delete wiz.notes[key];
+        }
+        const ids = specs.map((s) => s.id);
+        const first = specs[0];
+        wiz.allStrings = {
+            running: true,
+            index: 0,
+            ids,
+            complete: false,
+            failedId: null,
+            detailsOpen: true,
+            message: first ? `Play ${first.label}` : null,
+        };
+        renderCalibrationWizard();
+        _calWizardStartNoteCapture(ids[0]);
+    }
+
+    function _calWizardAdvanceAllStringsRun(noteId, ok) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.allStrings || !wiz.allStrings.running) return false;
+        const seq = wiz.allStrings;
+        const expectedId = seq.ids[seq.index];
+        if (noteId !== expectedId) return true;
+        seq.detailsOpen = true;
+        if (!ok) {
+            seq.running = false;
+            seq.failedId = noteId;
+            const spec = _calWizardFindNoteCheckSpec(noteId);
+            const label = spec ? spec.label : noteId;
+            seq.message = `${label} did not pass — retry the run or check manually.`;
+            renderCalibrationWizard();
+            return true;
+        }
+        seq.index += 1;
+        if (seq.index >= seq.ids.length) {
+            seq.running = false;
+            seq.complete = true;
+            seq.message = 'All open strings passed.';
+            _calWizardSetAutoStatus('<span class="text-green-300/90">All open strings passed.</span>');
+            renderCalibrationWizard();
+            return true;
+        }
+        const nextId = seq.ids[seq.index];
+        const nextSpec = _calWizardFindNoteCheckSpec(nextId);
+        seq.message = nextSpec ? `Play ${nextSpec.label}` : `Play string ${seq.index + 1}`;
+        renderCalibrationWizard();
+        _calWizardStartNoteCapture(nextId);
+        return true;
+    }
+
+    function _calWizardStartNoteCapture(noteId) {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            if (wiz.allStrings && wiz.allStrings.running) {
+                _calWizardStopAllStringsRun('detect-off');
+            }
+            return;
+        }
         _calWizardBeginCountdownThen('note_' + noteId, 2, () => {
+            const spec = _calWizardFindNoteCheckSpec(noteId);
+            if (!spec) return;
             _calWizardStopAutoCapture();
             const stable = [];
             const started = Date.now();
@@ -5683,12 +5925,8 @@ function createNoteDetector(options = {}) {
             wiz.autoCapture = { kind: 'note', noteId, stable, started };
             const tick = () => {
                 const s = getCalibrationSnapshot();
-                let heardMidi = null;
-                if (detectedString >= 0 && detectedConfidence > detectionConfidenceMin
-                    && Number.isFinite(detectedMidi)) {
-                    heardMidi = Number.isFinite(detectedDisplayMidi) ? detectedDisplayMidi : detectedMidi;
-                }
-                if (_calWizardMidiNearTarget(heardMidi, spec.midi, 100)) {
+                const heardMidi = _calWizardRawPitchFields().rawMidi;
+                if (_calWizardMidiNearTarget(heardMidi, spec.expectedMidi, 100)) {
                     stable.push({ midi: heardMidi, conf: detectedConfidence, t: Date.now() });
                 } else {
                     stable.length = 0;
@@ -5699,27 +5937,43 @@ function createNoteDetector(options = {}) {
                     wiz.notes[noteId] = {
                         ok: true,
                         label: spec.label,
+                        expectedNote: spec.expectedNote,
+                        expectedMidi: spec.expectedMidi,
                         heardNote: _ndMidiToName(last.midi),
                         confidencePct: Math.round(last.conf * 100),
                         at: Date.now(),
                     };
                     _calWizardStopAutoCapture();
                     _calWizardSetAutoStatus(
-                        `<span class="text-green-300/90">${spec.label} OK</span> — heard ${wiz.notes[noteId].heardNote} `
+                        `<span class="text-green-300/90">${spec.label} OK</span> — `
+                        + `expected ${spec.expectedNote}, heard ${wiz.notes[noteId].heardNote} `
                         + `(${wiz.notes[noteId].confidencePct}% conf)`);
-                    renderCalibrationWizard();
+                    if (!_calWizardAdvanceAllStringsRun(noteId, true)) {
+                        renderCalibrationWizard();
+                    }
                     return;
                 }
                 _calWizardSetAutoStatus(
                     `<span class="text-cyan-300/90">Listening for ${spec.label}…</span> `
                     + (s.heardConfidencePct != null
-                        ? `Heard: ${s.heardNote} · ${s.heardConfidencePct}%`
-                        : s.hearingLine));
+                        ? `Expected: ${spec.expectedNote} · Heard: ${s.rawHeardNote ?? s.heardNote} · ${s.heardConfidencePct}%`
+                        : `Expected: ${spec.expectedNote} · Channel: ${s.channel || '—'} · Live: `
+                        + calibrationFormatLevel(s.inputLevelPct, s.inputPeakPct)));
                 if (elapsed >= maxWait) {
                     _calWizardStopAutoCapture();
-                    wiz.notes[noteId] = { ok: false, label: spec.label, at: Date.now() };
-                    _calWizardSetAutoStatus(`<span class="text-amber-200/90">${spec.label}: no stable note detected. Retry.</span>`);
-                    renderCalibrationWizard();
+                    wiz.notes[noteId] = {
+                        ok: false,
+                        label: spec.label,
+                        expectedNote: spec.expectedNote,
+                        expectedMidi: spec.expectedMidi,
+                        at: Date.now(),
+                    };
+                    _calWizardSetAutoStatus(
+                        `<span class="text-amber-200/90">${spec.label}: no stable note detected. `
+                        + `Expected ${spec.expectedNote}. Retry.</span>`);
+                    if (!_calWizardAdvanceAllStringsRun(noteId, false)) {
+                        renderCalibrationWizard();
+                    }
                 }
             };
             tick();
@@ -5745,6 +5999,8 @@ function createNoteDetector(options = {}) {
         renderCalibrationWizard();
     }
 
+    // Hides the wizard card and passes clicks through — reused for tuner step and
+    // timing play-along (not tuner-specific despite the name).
     function _calWizardSetTunerMinimized(minimized) {
         const wiz = _calWizardState;
         if (!_calWizardEl || !wiz) return;
@@ -5761,6 +6017,327 @@ function createNoteDetector(options = {}) {
             _calWizardEl.style.pointerEvents = 'auto';
             if (card) card.style.visibility = 'visible';
             if (ret) ret.style.display = 'none';
+            _calWizardUpdateReturnButtonTimer(null);
+        }
+    }
+
+    function _calWizardMinimizeForPlayback() {
+        _calWizardSetTunerMinimized(true);
+    }
+
+    function _calWizardUpdateReturnButtonTimer(secLeft) {
+        if (!_calWizardEl) return;
+        const primary = _calWizardEl.querySelector('.nd-cal-return-primary');
+        const secondary = _calWizardEl.querySelector('.nd-cal-return-secondary');
+        if (!primary || !secondary) return;
+        if (secLeft === 'waiting') {
+            primary.textContent = 'Press Play to start timing';
+            secondary.textContent = `The ${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s timer starts when playback begins`;
+        } else if (Number.isFinite(secLeft) && secLeft >= 0) {
+            primary.textContent = `Timing test: ${secLeft}s left`;
+            secondary.textContent = 'Keep playing — setup will return automatically';
+        } else {
+            primary.textContent = 'Return to Calibration Wizard';
+            secondary.textContent = 'Tap here to continue setup';
+        }
+    }
+
+    function _calWizardTeardownPlayAlongWait(pa) {
+        if (!pa) return;
+        if (pa.waitTimeoutId) {
+            clearTimeout(pa.waitTimeoutId);
+            pa.waitTimeoutId = null;
+        }
+        if (pa.waitPollId) {
+            clearInterval(pa.waitPollId);
+            pa.waitPollId = null;
+        }
+        if (pa.onPlayHandler && window.slopsmith && typeof window.slopsmith.off === 'function') {
+            try { window.slopsmith.off('song:play', pa.onPlayHandler); } catch (_) {}
+            pa.onPlayHandler = null;
+        }
+    }
+
+    function _calWizardIsPlaybackActive() {
+        try {
+            if (window.slopsmith && window.slopsmith.isPlaying) return true;
+        } catch (_) { /* host may be unavailable */ }
+        return false;
+    }
+
+    function _calWizardPlayheadAdvancing(pa) {
+        const hw = resolveHw();
+        if (!hw || typeof hw.getTime !== 'function' || !pa) return false;
+        const t = hw.getTime();
+        if (!Number.isFinite(pa._phLast)) {
+            pa._phLast = t;
+            pa._phLastAt = Date.now();
+            return false;
+        }
+        const gapMs = Date.now() - pa._phLastAt;
+        if (gapMs < _CAL_WIZARD_PLAYHEAD_ADVANCE_MIN_GAP_MS) return false;
+        const advancing = t > pa._phLast + _CAL_WIZARD_PLAYHEAD_ADVANCE_MIN_SEC;
+        pa._phLast = t;
+        pa._phLastAt = Date.now();
+        return advancing;
+    }
+
+    function _calWizardBeginTimedPlayAlongCountdown() {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong || wiz.playAlong.phase !== 'waiting') return;
+        const pa = wiz.playAlong;
+        _calWizardTeardownPlayAlongWait(pa);
+        pa.phase = 'running';
+        pa.endsAt = Date.now() + pa.durationMs;
+        const tickCountdown = () => {
+            if (!_calWizardState || !_calWizardState.playAlong) return;
+            const active = _calWizardState.playAlong;
+            if (active.phase !== 'running' || !Number.isFinite(active.endsAt)) return;
+            const left = Math.ceil((active.endsAt - Date.now()) / 1000);
+            if (left <= 0) {
+                _calWizardFinishTimedPlayAlong(false);
+                return;
+            }
+            _calWizardUpdateReturnButtonTimer(left);
+        };
+        tickCountdown();
+        pa.intervalId = setInterval(tickCountdown, 1000);
+        pa.timerId = setTimeout(() => _calWizardFinishTimedPlayAlong(false), pa.durationMs + 50);
+    }
+
+    function _calWizardPollPlayAlongWait() {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong || wiz.playAlong.phase !== 'waiting') return;
+        const pa = wiz.playAlong;
+        if (pa.playbackSeen || _calWizardIsPlaybackActive() || _calWizardPlayheadAdvancing(pa)) {
+            _calWizardBeginTimedPlayAlongCountdown();
+        }
+    }
+
+    function _calWizardCancelTimedPlayAlongWaiting(message) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong) return;
+        _calWizardStopTimedPlayAlong('cancel-wait');
+        _calWizardSetTunerMinimized(false);
+        wiz.timingCaptureNote = message;
+        renderCalibrationWizard();
+        _calWizardRefreshLive();
+    }
+
+    function _calWizardStopTimedPlayAlong(reason) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong) return false;
+        const pa = wiz.playAlong;
+        _calWizardTeardownPlayAlongWait(pa);
+        if (pa.timerId) {
+            clearTimeout(pa.timerId);
+            pa.timerId = null;
+        }
+        if (pa.intervalId) {
+            clearInterval(pa.intervalId);
+            pa.intervalId = null;
+        }
+        wiz.playAlong = null;
+        _calWizardUpdateReturnButtonTimer(null);
+        return true;
+    }
+
+    function _calWizardDispatchPlaybackPause(reason) {
+        const caps = window.slopsmith && window.slopsmith.capabilities;
+        if (!caps || typeof caps.dispatch !== 'function') {
+            return Promise.resolve({ attempted: false, handled: false });
+        }
+        try {
+            const result = caps.dispatch({
+                capability: 'playback',
+                command: 'pause',
+                requester: 'slopsmith-plugin-notedetect',
+                args: { requesterId: 'cal-wizard-timed-playalong', reason: reason || 'timed-playalong-complete' },
+            });
+            const parse = (r) => ({
+                attempted: true,
+                handled: !!(r && (r.outcome === 'handled' || r.status === 'paused')),
+                result: r,
+            });
+            if (result && typeof result.then === 'function') {
+                return result.then(parse).catch((e) => {
+                    console.warn('[note_detect] cal-wizard timed playalong pause:', e);
+                    return { attempted: true, handled: false, error: e };
+                });
+            }
+            return Promise.resolve(parse(result));
+        } catch (e) {
+            console.warn('[note_detect] cal-wizard timed playalong pause:', e);
+            return Promise.resolve({ attempted: false, handled: false, error: e });
+        }
+    }
+
+    function _calWizardAppendTimingCaptureNote(fragment) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.timingCaptureNote || !fragment) return;
+        if (!wiz.timingCaptureNote.includes(fragment)) {
+            wiz.timingCaptureNote += ` ${fragment}`;
+            renderCalibrationWizard();
+        }
+    }
+
+    function _calWizardMaybePauseAfterTimedPlayAlong(pa) {
+        if (!pa || pa.wasPlayingAtArm !== false) return;
+        if (!_calWizardIsPlaybackActive()) return;
+        _calWizardClearPauseRetries();
+        const delays = _CAL_WIZARD_PAUSE_RETRY_DELAYS_MS;
+        delays.forEach((delayMs, idx) => {
+            const isLast = idx === delays.length - 1;
+            const timerId = setTimeout(() => {
+                _calWizardPauseRetryTimers = _calWizardPauseRetryTimers.filter((id) => id !== timerId);
+                if (!_calWizardState) return;
+                if (!_calWizardIsPlaybackActive()) {
+                    _calWizardAppendTimingCaptureNote('Playback paused.');
+                    return;
+                }
+                const reason = idx === 0
+                    ? 'cal-wizard-timed-playalong-complete'
+                    : 'cal-wizard-timed-playalong-retry';
+                _calWizardDispatchPlaybackPause(reason).then(() => {
+                    if (!_calWizardState) return;
+                    if (!_calWizardIsPlaybackActive()) {
+                        _calWizardAppendTimingCaptureNote('Playback paused.');
+                    } else if (isLast) {
+                        _calWizardAppendTimingCaptureNote(
+                            'Playback may still be running — pause when ready.');
+                    }
+                });
+            }, delayMs);
+            _calWizardPauseRetryTimers.push(timerId);
+        });
+    }
+
+    function _calWizardFinishTimedPlayAlong(partial) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong) return;
+        if (wiz.playAlong.phase === 'waiting') {
+            _calWizardCancelTimedPlayAlongWaiting('Timed play-along cancelled — returned before playback started.');
+            return;
+        }
+        const stashedPlayAlong = { wasPlayingAtArm: wiz.playAlong.wasPlayingAtArm };
+        _calWizardStopTimedPlayAlong('finish');
+        _calWizardSetTunerMinimized(false);
+        wiz.timingCaptureNote = partial
+            ? 'Partial window captured — returned early.'
+            : `Timed play-along captured (${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s window).`;
+        _calWizardCaptureTimingSnapshot();
+        if (!partial) _calWizardMaybePauseAfterTimedPlayAlong(stashedPlayAlong);
+    }
+
+    function _calWizardStartTimedPlayAlong(durationSec) {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            wiz.timingCaptureNote = 'Turn Detect on first.';
+            renderCalibrationWizard();
+            return;
+        }
+        _calWizardStopTimedPlayAlong('restart');
+        try { _resetCalibrationSamples(); } catch (e) {
+            console.warn('[note_detect] resetCalibrationSamples:', e);
+        }
+        wiz.timing = null;
+        wiz.timingCaptureNote = null;
+        const sec = Number.isFinite(durationSec) && durationSec > 0
+            ? durationSec : _CAL_WIZARD_TIMED_PLAYALONG_SEC;
+        const durationMs = sec * 1000;
+        const wasPlayingAtArm = _calWizardIsPlaybackActive();
+        wiz.playAlong = {
+            phase: 'waiting',
+            durationSec: sec,
+            durationMs,
+            waitStartedAt: Date.now(),
+            waitTimeoutId: null,
+            waitPollId: null,
+            onPlayHandler: null,
+            playbackSeen: false,
+            wasPlayingAtArm,
+            endsAt: null,
+            timerId: null,
+            intervalId: null,
+        };
+        _calWizardMinimizeForPlayback();
+        _calWizardUpdateReturnButtonTimer('waiting');
+        const pa = wiz.playAlong;
+        if (_calWizardIsPlaybackActive()) {
+            _calWizardBeginTimedPlayAlongCountdown();
+            return;
+        }
+        pa.onPlayHandler = () => {
+            const w = _calWizardState;
+            if (!w || !w.playAlong || w.playAlong.phase !== 'waiting') return;
+            w.playAlong.playbackSeen = true;
+            _calWizardPollPlayAlongWait();
+        };
+        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+            try { window.slopsmith.on('song:play', pa.onPlayHandler); } catch (_) {}
+        }
+        pa.waitPollId = setInterval(_calWizardPollPlayAlongWait, _CAL_WIZARD_PLAY_ALONG_WAIT_POLL_MS);
+        pa.waitTimeoutId = setTimeout(() => {
+            const w = _calWizardState;
+            if (!w || !w.playAlong || w.playAlong.phase !== 'waiting') return;
+            _calWizardCancelTimedPlayAlongWaiting('Timed play-along cancelled — playback did not start.');
+        }, _CAL_WIZARD_PLAY_ALONG_WAIT_MS);
+    }
+
+    function _calWizardFmtGain(v) {
+        return Number.isFinite(v) ? `${(+v).toFixed(2)}x` : '—';
+    }
+
+    function _calWizardFmtLatencyMs(v) {
+        return Number.isFinite(v) ? `${Math.round(v * 1000)} ms` : '—';
+    }
+
+    function _calWizardCompletionHtml(wiz) {
+        const applied = wiz.applied;
+        const appliedParts = [];
+        if (applied && applied.inputGain != null) {
+            appliedParts.push(`Input gain ${_calWizardFmtGain(applied.inputGain)}`);
+        }
+        if (applied && applied.latencyOffset != null) {
+            appliedParts.push(`Detection delay ${_calWizardFmtLatencyMs(applied.latencyOffset)}`);
+        }
+        if (wiz.complete === 'applied') {
+            const detailLine = appliedParts.length
+                ? appliedParts.join(' · ')
+                : 'Checked settings were applied.';
+            return `
+                <div class="text-center py-3 mb-4 rounded-xl bg-dark-800/90 border border-green-900/40">
+                    <p class="text-xl font-bold text-white mb-2">Calibration applied</p>
+                    <p class="text-sm text-gray-200 mb-1">You're done. These settings are now active.</p>
+                    <p class="text-xs text-gray-400">${detailLine}</p>
+                </div>
+                <button type="button" class="nd-cal-done w-full py-3 bg-accent hover:bg-accent-light rounded-xl text-base font-bold text-white mb-3 shadow-lg">Done — Close Wizard</button>
+                <button type="button" class="nd-cal-run-lab w-full py-2.5 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-sm text-gray-300">Run Technique Assessment</button>`;
+        }
+        return `
+            <div class="text-center py-3 mb-4 rounded-xl bg-dark-800/90 border border-gray-600">
+                <p class="text-xl font-bold text-white mb-2">Calibration finished</p>
+                <p class="text-sm text-gray-200">No recommended settings were applied.</p>
+            </div>
+            <button type="button" class="nd-cal-done w-full py-3 bg-accent hover:bg-accent-light rounded-xl text-base font-bold text-white mb-3 shadow-lg">Done — Close Wizard</button>
+            <button type="button" class="nd-cal-run-lab w-full py-2.5 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-sm text-gray-300">Run Technique Assessment</button>`;
+    }
+
+    function _calWizardReleaseTuner() {
+        try {
+            if (window.tuner && typeof window.tuner.disable === 'function') {
+                window.tuner.disable();
+            }
+        } catch (e) {
+            console.warn('[note_detect] cal wizard tuner release:', e);
+        }
+        if (_calWizardState) _calWizardSetTunerMinimized(false);
+        if (enabled) {
+            try { restartAudio(); } catch (e) {
+                console.warn('[note_detect] cal wizard restartAudio after tuner release:', e);
+            }
         }
     }
 
@@ -6103,13 +6680,9 @@ function createNoteDetector(options = {}) {
         try { avMs = hw && hw.getAvOffset ? hw.getAvOffset() : null; } catch (_) {}
         const teHits = (d && d.timing_error_ms_hits) ? d.timing_error_ms_hits : {};
         const total = hits + misses;
-        let heardNote = '—';
-        let heardConfPct = null;
-        if (detectedString >= 0 && detectedConfidence > detectionConfidenceMin) {
-            const displayMidi = Number.isFinite(detectedDisplayMidi) ? detectedDisplayMidi : detectedMidi;
-            if (Number.isFinite(displayMidi)) heardNote = _ndMidiToName(displayMidi);
-            heardConfPct = Math.round(detectedConfidence * 100);
-        }
+        const pitch = _calWizardRawPitchFields();
+        const heardNote = pitch.rawNote;
+        const heardConfPct = pitch.confidencePct;
         let hearingLine = '—';
         try { hearingLine = _ndHealthDetectedLine(); } catch (_) {}
         const sr = audioCtx && audioCtx.sampleRate
@@ -6122,7 +6695,10 @@ function createNoteDetector(options = {}) {
             hearingLine,
             heardNote,
             heardConfidencePct: heardConfPct,
-            channel: _ndHealthInputChannelLabel(),
+            rawHeardNote: pitch.rawNote,
+            displayHeardNote: pitch.displayNote,
+            rawMidi: pitch.rawMidi,
+            channel: pitch.channel,
             source: _ndHealthDetectorPathLabel(),
             sampleRateHz: sr,
             avOffsetMs: avMs,
@@ -6140,7 +6716,11 @@ function createNoteDetector(options = {}) {
     }
 
     function calibrationWizardClose() {
+        _calWizardStopAllStringsRun('close');
+        _calWizardClearPauseRetries();
         _calWizardStopAutoCapture();
+        _calWizardStopTimedPlayAlong('close');
+        _calWizardReleaseTuner();
         if (_calWizardTick) {
             clearInterval(_calWizardTick);
             _calWizardTick = null;
@@ -6160,17 +6740,66 @@ function createNoteDetector(options = {}) {
     function _calWizardRefreshLive() {
         if (!_calWizardEl || !_calWizardState) return;
         const snap = getCalibrationSnapshot();
+        const wiz = _calWizardState;
         const live = _calWizardEl.querySelector('.nd-cal-live-level');
         if (live) live.textContent = 'Live: ' + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
         const heard = _calWizardEl.querySelector('.nd-cal-heard');
         if (heard) {
-            heard.textContent = snap.heardConfidencePct != null
-                ? `Now hearing: ${snap.heardNote} · ${snap.heardConfidencePct}% confidence`
-                : `Now hearing: ${snap.hearingLine === '—' ? 'nothing yet — play a note' : snap.hearingLine}`;
+            if (wiz.step === 5) {
+                heard.textContent = snap.heardConfidencePct != null
+                    ? `Now hearing: ${snap.rawHeardNote ?? snap.heardNote} · ${snap.heardConfidencePct}% confidence`
+                    : `Now hearing: nothing yet — play a note · Channel: ${snap.channel || '—'} · Live: `
+                    + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
+            } else {
+                heard.textContent = snap.heardConfidencePct != null
+                    ? `Now hearing: ${snap.heardNote} · ${snap.heardConfidencePct}% confidence`
+                    : `Now hearing: ${snap.hearingLine === '—' ? 'nothing yet — play a note' : snap.hearingLine}`;
+            }
+        }
+        const debugEl = _calWizardEl.querySelector('.nd-cal-pitch-debug');
+        if (debugEl) {
+            if (wiz.step === 5) {
+                let expectNote = '—';
+                if (wiz.autoCapture && wiz.autoCapture.kind === 'note' && wiz.autoCapture.noteId) {
+                    const active = _calWizardFindNoteCheckSpec(wiz.autoCapture.noteId);
+                    if (active) expectNote = active.expectedNote;
+                }
+                if (expectNote === '—') {
+                    const noteSpecs = _calWizardResolveNoteChecks({ mode: 'quick' });
+                    const primary = noteSpecs[0];
+                    if (primary) expectNote = primary.expectedNote;
+                }
+                if (snap.heardConfidencePct != null) {
+                    let line = `Expected: ${expectNote} · Heard: ${snap.rawHeardNote ?? '—'}`;
+                    if (snap.displayHeardNote && snap.displayHeardNote !== snap.rawHeardNote) {
+                        line += ` · Display: ${snap.displayHeardNote}`;
+                        const now = Date.now();
+                        if (!wiz._lastPitchDbg || now - wiz._lastPitchDbg > 2000) {
+                            console.debug('[cal-wizard] pitch', {
+                                expected: expectNote,
+                                raw: snap.rawHeardNote,
+                                display: snap.displayHeardNote,
+                                conf: snap.heardConfidencePct,
+                                channel: snap.channel,
+                            });
+                            wiz._lastPitchDbg = now;
+                        }
+                    }
+                    line += ` · Conf: ${snap.heardConfidencePct}% · Channel: ${snap.channel || '—'}`;
+                    debugEl.textContent = line;
+                    debugEl.classList.remove('hidden');
+                } else {
+                    debugEl.textContent = `Expected: ${expectNote} · Channel: ${snap.channel || '—'} · Live: `
+                        + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
+                    debugEl.classList.remove('hidden');
+                }
+            } else {
+                debugEl.textContent = '';
+                debugEl.classList.add('hidden');
+            }
         }
         const medEl = _calWizardEl.querySelector('.nd-cal-timing-median');
         if (medEl) {
-            const wiz = _calWizardState;
             const t = wiz.timing;
             const m = t && Number.isFinite(t.medianMs) ? t.medianMs : snap.timingMedianMs;
             const n = t && t.sampleCount ? t.sampleCount : 0;
@@ -6180,34 +6809,68 @@ function createNoteDetector(options = {}) {
         }
     }
 
-    function _calWizardReviewRowsHtml(wiz, snap) {
+    function _calWizardReviewChanges(wiz) {
         const rec = wiz.recommended || {};
-        const rows = [];
-        const pushRow = (key, label, curVal, recVal, fmtCur, fmtRec, reason) => {
+        const changes = [];
+        const consider = (key, label, curVal, recVal, fmt, reason) => {
             if (!Number.isFinite(recVal)) return;
-            if (Math.abs(recVal - curVal) < 0.004) return;
-            const checked = wiz.applyChecked[key] !== false ? 'checked' : '';
-            rows.push(`<tr class="border-b border-gray-700/50">
-                <td class="py-1 pr-2 text-gray-300">${label}</td>
-                <td class="py-1 text-gray-400 font-mono">${fmtCur}</td>
-                <td class="py-1 text-green-300/90 font-mono">${fmtRec}</td>
-                <td class="py-1 text-[10px] text-gray-500">${reason || ''}</td>
-                <td class="py-1"><input type="checkbox" class="nd-cal-apply-chk accent-green-400" data-key="${key}" ${checked}></td></tr>`);
+            if (Number.isFinite(curVal) && Math.abs(recVal - curVal) < 0.004) return;
+            changes.push({ key, label, curVal, recVal, fmt, reason: reason || '' });
         };
-        pushRow('inputGain', 'Input gain', inputGain, rec.inputGain,
-            `${inputGain.toFixed(2)}x`,
-            `${rec.inputGain.toFixed(2)}x`,
-            rec.reasons && rec.reasons.inputGain);
-        pushRow('latencyOffset', 'Audio latency offset', latencyOffset, rec.latencyOffset,
-            `${Math.round(latencyOffset * 1000)} ms`,
-            `${Math.round(rec.latencyOffset * 1000)} ms`,
-            rec.reasons && rec.reasons.latencyOffset);
-        if (!rows.length) {
-            return '<p class="text-gray-400 text-[11px]">No safe setting changes recommended — you can finish without applying.</p>';
+        consider('inputGain', 'Input gain', inputGain, rec.inputGain,
+            _calWizardFmtGain, rec.reasons && rec.reasons.inputGain);
+        consider('latencyOffset', 'Detection delay', latencyOffset, rec.latencyOffset,
+            _calWizardFmtLatencyMs, rec.reasons && rec.reasons.latencyOffset);
+        return changes;
+    }
+
+    function _calWizardReviewSummaryHtml(wiz, opts = {}) {
+        const showCheckboxes = opts.showCheckboxes !== false;
+        const onlyChecked = !!opts.onlyChecked;
+        const changes = _calWizardReviewChanges(wiz);
+        const visible = onlyChecked
+            ? changes.filter((c) => wiz.applyChecked[c.key] !== false)
+            : changes;
+        if (!visible.length) {
+            if (onlyChecked && changes.length) {
+                return '<p class="text-sm text-gray-300 mb-3">No settings are selected to apply. Go back to Review to check items, or finish without applying.</p>';
+            }
+            return '<p class="text-sm text-gray-300 mb-3">No safe setting changes recommended — you can finish without applying.</p>';
         }
-        return `<table class="w-full text-[10px] mb-2"><thead><tr class="text-gray-500">
-            <th class="text-left py-1">Setting</th><th class="text-left">Current</th><th class="text-left">Recommended</th>
-            <th class="text-left">Reason</th><th class="text-left">Apply</th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+        const cards = visible.map((c) => {
+            const checked = wiz.applyChecked[c.key] !== false ? 'checked' : '';
+            const chk = showCheckboxes
+                ? `<input type="checkbox" class="nd-cal-apply-chk accent-green-400 mt-0.5 shrink-0" data-key="${c.key}" ${checked}>`
+                : '';
+            return `<div class="flex items-start gap-3 p-3 rounded-lg bg-dark-800/90 border border-gray-600">
+                ${chk}
+                <div class="min-w-0 flex-1">
+                    <div class="text-sm font-medium text-gray-100">${c.label}</div>
+                    <div class="text-sm text-gray-300 mt-1">${c.fmt(c.curVal)} → <span class="text-green-300 font-mono font-medium">${c.fmt(c.recVal)}</span></div>
+                </div>
+            </div>`;
+        }).join('');
+        return `<div class="space-y-2 mb-3">${cards}</div>`;
+    }
+
+    function _calWizardReviewDetailsHtml(wiz) {
+        const changes = _calWizardReviewChanges(wiz);
+        if (!changes.length) return '';
+        const rows = changes.map((c) => {
+            const checked = wiz.applyChecked[c.key] !== false ? 'checked' : '';
+            return `<tr class="border-b border-gray-700/50">
+                <td class="py-1.5 pr-2 text-gray-300">${c.label}</td>
+                <td class="py-1.5 text-gray-400 font-mono">${c.fmt(c.curVal)}</td>
+                <td class="py-1.5 text-green-300/90 font-mono">${c.fmt(c.recVal)}</td>
+                <td class="py-1.5 text-xs text-gray-400">${c.reason}</td>
+                <td class="py-1.5"><input type="checkbox" class="nd-cal-apply-chk accent-green-400" data-key="${c.key}" ${checked}></td></tr>`;
+        }).join('');
+        return `<details class="mb-3">
+            <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200 py-1 select-none">Show technical details</summary>
+            <table class="w-full text-xs mt-2"><thead><tr class="text-gray-500 text-left">
+                <th class="py-1 pr-1">Setting</th><th class="pr-1">Current</th><th class="pr-1">Recommended</th><th class="pr-1">Reason</th><th>Apply</th>
+            </tr></thead><tbody>${rows}</tbody></table>
+        </details>`;
     }
 
     function renderCalibrationWizard() {
@@ -6305,53 +6968,103 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-start-signal w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${sDone ? 'Retry Signal Capture' : 'Start Signal Capture'}</button>
                 <p class="text-[10px] text-gray-500">If <strong>Too low</strong>: raise interface gain or play closer to the mic/DI. If <strong>Too hot</strong>: lower gain to avoid clipping.</p>`;
         } else if (step === 5) {
-            const noteRows = _CAL_WIZARD_NOTE_CHECKS.map((spec) => {
+            const noteSpecs = _calWizardResolveNoteChecks({ mode: 'quick' });
+            const allNoteSpecs = _calWizardResolveNoteChecks({ mode: 'all' });
+            const allStr = wiz.allStrings || _calWizardDefaultAllStringsState();
+            const allRunning = !!allStr.running;
+            const detailsOpen = !!(allStr.detailsOpen || allStr.running || allStr.complete || allStr.failedId);
+            const noteRowHtml = (spec, compact) => {
                 const r = wiz.notes[spec.id];
                 const st = r && r.ok ? 'text-green-300/90' : r ? 'text-amber-200/90' : 'text-gray-500';
-                const txt = r && r.ok ? `${r.heardNote} (${r.confidencePct}%)`
-                    : r ? 'Not detected — retry' : 'Not checked';
-                return `<div class="flex justify-between py-1 border-b border-gray-700/50">
-                    <span class="text-gray-300">${spec.label}</span>
-                    <span class="${st} text-[10px]">${txt}</span></div>`;
+                const txt = r && r.ok
+                    ? `OK — heard ${r.heardNote} (${r.confidencePct}%)`
+                    : r
+                        ? `Failed — expected ${r.expectedNote || spec.expectedNote}`
+                        : `Expected ${spec.expectedNote}`;
+                const labelCls = compact ? 'text-[10px]' : 'text-xs';
+                return `<div class="flex justify-between py-1 border-b border-gray-700/50 gap-2">
+                    <span class="text-gray-300 ${labelCls}">${spec.label}</span>
+                    <span class="${st} text-[10px] text-right shrink-0">${txt}</span></div>`;
+            };
+            const noteRows = noteSpecs.map((spec) => noteRowHtml(spec, false)).join('');
+            const noteButtons = noteSpecs.map((spec) =>
+                `<button type="button" class="nd-cal-check-note w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-1" data-note="${spec.id}">Check ${spec.label}</button>`
+            ).join('');
+            const allRows = allNoteSpecs.map((spec) => noteRowHtml(spec, true)).join('');
+            const allBtnDisabled = allRunning ? ' disabled' : '';
+            const allBtnDisabledCls = allRunning ? ' opacity-50 cursor-not-allowed' : '';
+            const allButtons = allNoteSpecs.map((spec) => {
+                const n = spec.displayString != null ? spec.displayString : (spec.string + 1);
+                return `<button type="button" class="nd-cal-check-note-all w-full py-1.5 bg-dark-600 hover:bg-dark-500 rounded text-[10px] text-gray-200 mb-1${allBtnDisabledCls}" data-note="${spec.id}"${allBtnDisabled}>Check String ${n}</button>`;
             }).join('');
+            let seqStatusHtml = '';
+            if (allStr.message) {
+                const seqCls = allStr.complete
+                    ? 'text-green-300/90'
+                    : allStr.failedId
+                        ? 'text-amber-200/90'
+                        : 'text-cyan-300/90';
+                seqStatusHtml = `<p class="text-[10px] ${seqCls} mb-2">${allStr.message}</p>`;
+            }
+            const runBtnLabel = allRunning ? 'Checking…' : 'Run All-Strings Check';
+            const runBtnDisabled = allRunning ? ' disabled' : '';
+            const runBtnCls = allRunning ? ' opacity-60 cursor-not-allowed' : '';
             html = `
                 ${_calWizardDetectBanner(snap)}
                 <p class="text-gray-300 text-xs mb-2">Quick check that Slopsmith hears open strings. This is simpler than Technique Assessment — just confirms basic detection works.</p>
+                <p class="text-[10px] text-gray-500 mb-2">Targets match the current song tuning. Use the same tone and pitch-shift path you will play the song with.</p>
+                <p class="text-[10px] text-gray-500 mb-2">Load a song first for song tuning in the tuner.</p>
                 <div class="nd-cal-heard text-cyan-300/90 text-[10px] font-mono mb-2">Now hearing: —</div>
+                <div class="nd-cal-pitch-debug text-[9px] text-gray-500 font-mono mb-1 hidden"></div>
                 <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 min-h-[1.5rem]">—</div>
                 <div class="mb-2">${noteRows}</div>
-                <button type="button" class="nd-cal-check-note w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-1" data-note="lowE">Check Low E</button>
-                <button type="button" class="nd-cal-check-note w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200" data-note="openA">Check Open A</button>
+                ${noteButtons}
+                <details class="nd-cal-all-strings mt-3 mb-2"${detailsOpen ? ' open' : ''}>
+                    <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200 py-1 select-none">Check all open strings (advanced)</summary>
+                    <p class="text-[10px] text-gray-500 mt-2 mb-2">Optional — verify every open string against song tuning. Not required to continue.</p>
+                    <button type="button" class="nd-cal-run-all-strings w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${runBtnCls}"${runBtnDisabled}>${runBtnLabel}</button>
+                    ${seqStatusHtml}
+                    <div class="mb-2">${allRows}</div>
+                    ${allButtons}
+                </details>
                 <p class="text-[10px] text-gray-500">If a check fails: retune, confirm the right input channel, raise gain slightly, and try the other channel (dry vs wet).</p>`;
         } else if (step === 6) {
             const t = wiz.timing;
             const liveMed = snap.timingMedianMs;
             const liveN = (snap.diagnostic && snap.diagnostic.timing_error_ms_hits)
                 ? snap.diagnostic.timing_error_ms_hits.count : 0;
+            const playAlongBusy = !!(wiz.playAlong);
             html = `
                 ${_calWizardDetectBanner(snap)}
-                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play part of a song first</strong> with Detect on so hits are scored. Then return here and capture timing. You can start playback behind this wizard — it stays open.</p>
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play part of a song</strong> with Detect on so hits are scored. Use a timed test for a clean ${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s sample window, or minimize manually.</p>
+                <p class="text-[10px] text-gray-500 mb-2">Use the speed you normally practice. This measures input vs chart alignment, not tempo.</p>
                 <div class="nd-cal-timing-median text-gray-300 text-xs mb-2">Your average timing vs chart: —</div>
                 <p class="text-[10px] text-gray-500 mb-2">Live session: ${Number.isFinite(liveMed) ? _ndFormatMs(liveMed) + ' average' : 'not enough hits yet'} · ${liveN} hit samples</p>
                 <p class="text-[10px] text-gray-500 mb-2"><strong class="text-gray-400">Chart/video offset</strong> (main Settings) moves notes on screen. <strong class="text-gray-400">Detection delay</strong> (latency offset) moves when your playing is judged — this step helps tune detection delay.</p>
                 <p class="text-[10px] text-amber-200/80">Mostly late? Detection delay may need increasing. Mostly early? Try lowering it.</p>
+                ${wiz.timingCaptureNote ? `<p class="text-[10px] text-cyan-300/90 mb-2">${wiz.timingCaptureNote}</p>` : ''}
+                <button type="button" class="nd-cal-start-playalong w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${playAlongBusy ? ' opacity-60 cursor-not-allowed' : ''}"${playAlongBusy ? ' disabled' : ''}>Start Timed Play-Along Test (${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s)</button>
+                <button type="button" class="nd-cal-minimize-play w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Minimize Wizard — Play Song</button>
                 <button type="button" class="nd-cal-reset-timing w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Reset Timing Samples</button>
                 <button type="button" class="nd-cal-capture-timing w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">Capture Timing Snapshot</button>
                 ${t && t.captured ? `<p class="text-[10px] text-green-300/90">Stored: ${_ndFormatMs(t.medianMs)} · ${t.sampleCount} samples</p>` : ''}`;
         } else if (step === 7) {
             html = `
-                <p class="text-gray-300 text-xs mb-2">Review safe recommendations. Uncheck any row you do not want applied.</p>
-                ${_calWizardReviewRowsHtml(wiz, snap)}
-                <p class="text-[10px] text-gray-500 mt-2 font-semibold text-gray-400">Never changed by this wizard:</p>
-                <p class="text-[10px] text-gray-500">Pitch tolerance · Timing tolerance · Chord leniency · Clean timing/pitch thresholds · Harmonic SNR · Note verifier / scoring thresholds</p>`;
+                <p class="text-sm text-gray-200 mb-3">Review safe recommendations. Uncheck anything you do not want applied.</p>
+                ${_calWizardReviewSummaryHtml(wiz, { showCheckboxes: true })}
+                ${_calWizardReviewDetailsHtml(wiz)}
+                <p class="text-xs text-gray-500 mt-2"><strong class="text-gray-400">Never changed by this wizard:</strong> pitch tolerance, timing tolerance, chord leniency, clean timing/pitch thresholds, harmonic SNR, note verifier / scoring thresholds</p>`;
         } else if (step === 8) {
-            const applied = wiz.applied;
-            html = `
-                <p class="text-gray-300 text-xs mb-2">Apply only the checked safe settings, or finish without changes.</p>
-                ${_calWizardReviewRowsHtml(wiz, snap)}
-                ${applied ? `<p class="text-[10px] text-green-300/90 mt-2">Applied: ${JSON.stringify(applied)}</p>` : ''}
-                <button type="button" class="nd-cal-apply-safe w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mt-3 mb-2">Apply Recommended Settings</button>
-                <button type="button" class="nd-cal-finish-no-apply w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200">Finish Without Applying</button>`;
+            if (wiz.complete) {
+                html = _calWizardCompletionHtml(wiz);
+            } else {
+                html = `
+                <p class="text-base font-medium text-gray-100 mb-3">Ready to apply recommended calibration settings.</p>
+                ${_calWizardReviewSummaryHtml(wiz, { showCheckboxes: false, onlyChecked: true })}
+                <p class="text-sm text-gray-400 mb-4">Apply updates input gain and/or detection delay only. Scoring strictness and detection thresholds are not changed.</p>
+                <button type="button" class="nd-cal-apply-safe w-full py-3 bg-accent hover:bg-accent-light rounded-xl text-sm font-bold text-white mb-3 shadow-lg">Apply Recommended Settings</button>
+                <button type="button" class="nd-cal-finish-no-apply w-full py-2.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300">Finish Without Applying</button>`;
+            }
         }
         body.innerHTML = html;
 
@@ -6360,7 +7073,12 @@ function createNoteDetector(options = {}) {
             openTuner.onclick = () => { _calWizardOpenTunerFromWizard(); };
         }
         const tunedBtn = body.querySelector('.nd-cal-tuned');
-        if (tunedBtn) tunedBtn.onclick = () => calibrationWizardNext();
+        if (tunedBtn) {
+            tunedBtn.onclick = () => {
+                _calWizardReleaseTuner();
+                calibrationWizardNext();
+            };
+        }
 
         const startNoise = body.querySelector('.nd-cal-start-noise');
         if (startNoise) startNoise.onclick = () => _calWizardStartNoiseCapture();
@@ -6394,17 +7112,53 @@ function createNoteDetector(options = {}) {
             };
         });
 
+        body.querySelectorAll('.nd-cal-check-note-all').forEach((btn) => {
+            btn.onclick = () => {
+                if (_calWizardState && _calWizardState.allStrings && _calWizardState.allStrings.running) return;
+                const id = btn.getAttribute('data-note');
+                if (id) _calWizardStartNoteCapture(id);
+            };
+        });
+
+        const runAllStrings = body.querySelector('.nd-cal-run-all-strings');
+        if (runAllStrings) {
+            runAllStrings.onclick = () => {
+                if (_calWizardState && _calWizardState.allStrings && _calWizardState.allStrings.running) return;
+                _calWizardStartAllStringsRun();
+            };
+        }
+
         const resetTiming = body.querySelector('.nd-cal-reset-timing');
         if (resetTiming) {
             resetTiming.onclick = () => {
-                try { resetCalibrationSamples(); } catch (e) { console.warn('[note_detect] resetCalibrationSamples:', e); }
+                _calWizardStopTimedPlayAlong('reset');
+                try { _resetCalibrationSamples(); } catch (e) { console.warn('[note_detect] resetCalibrationSamples:', e); }
                 wiz.timing = null;
+                wiz.timingCaptureNote = null;
                 _calWizardRefreshLive();
                 renderCalibrationWizard();
             };
         }
         const capTiming = body.querySelector('.nd-cal-capture-timing');
-        if (capTiming) capTiming.onclick = () => _calWizardCaptureTimingSnapshot();
+        if (capTiming) {
+            capTiming.onclick = () => {
+                wiz.timingCaptureNote = null;
+                _calWizardCaptureTimingSnapshot();
+            };
+        }
+
+        const startPlayAlong = body.querySelector('.nd-cal-start-playalong');
+        if (startPlayAlong) {
+            startPlayAlong.onclick = () => _calWizardStartTimedPlayAlong(_CAL_WIZARD_TIMED_PLAYALONG_SEC);
+        }
+
+        const minimizePlay = body.querySelector('.nd-cal-minimize-play');
+        if (minimizePlay) {
+            minimizePlay.onclick = () => {
+                _calWizardStopTimedPlayAlong('manual-minimize');
+                _calWizardMinimizeForPlayback();
+            };
+        }
 
         body.querySelectorAll('.nd-cal-apply-chk').forEach((chk) => {
             chk.onchange = () => {
@@ -6416,31 +7170,45 @@ function createNoteDetector(options = {}) {
         const applyBtn = body.querySelector('.nd-cal-apply-safe');
         if (applyBtn) {
             applyBtn.onclick = () => {
-                const result = _calWizardApplySafeSettings(wiz);
-                let msg = 'Applied: ';
-                if (result.inputGain != null) msg += `input gain ${result.inputGain.toFixed(2)}x `;
-                if (result.latencyOffset != null) msg += `latency ${Math.round(result.latencyOffset * 1000)} ms `;
-                if (!result.inputGain && !result.latencyOffset) msg = 'Nothing selected to apply.';
-                const note = body.querySelector('.nd-cal-apply-result');
-                if (note) note.textContent = msg;
-                else {
-                    const p = document.createElement('p');
-                    p.className = 'nd-cal-apply-result text-[10px] text-green-300/90 mt-2';
-                    p.textContent = msg;
-                    applyBtn.parentNode.insertBefore(p, applyBtn.nextSibling);
-                }
+                _calWizardApplySafeSettings(wiz);
+                wiz.complete = 'applied';
+                renderCalibrationWizard();
             };
         }
         const finishNo = body.querySelector('.nd-cal-finish-no-apply');
-        if (finishNo) finishNo.onclick = () => calibrationWizardClose();
+        if (finishNo) {
+            finishNo.onclick = () => {
+                wiz.complete = 'finished';
+                wiz.applied = null;
+                renderCalibrationWizard();
+            };
+        }
+
+        const doneBtn = body.querySelector('.nd-cal-done');
+        if (doneBtn) doneBtn.onclick = () => calibrationWizardClose();
+
+        const runLabBtn = body.querySelector('.nd-cal-run-lab');
+        if (runLabBtn) {
+            runLabBtn.onclick = () => {
+                calibrationWizardClose();
+                try { openInstrumentCalibrationLab(); } catch (e) {
+                    console.warn('[note_detect] openInstrumentCalibrationLab:', e);
+                }
+            };
+        }
 
         if (step >= 1 && step <= 6) _calWizardRefreshLive();
     }
 
     function calibrationWizardNext() {
         if (!_calWizardState) return;
+        _calWizardStopAllStringsRun('next');
         _calWizardStopAutoCapture();
-        if (_calWizardState.tunerMinimized) _calWizardSetTunerMinimized(false);
+        if (_calWizardState.step === 2) {
+            _calWizardReleaseTuner();
+        } else if (_calWizardState.tunerMinimized) {
+            _calWizardSetTunerMinimized(false);
+        }
         if (_calWizardState.step >= 8) return;
         _calWizardState.step++;
         renderCalibrationWizard();
@@ -6448,6 +7216,7 @@ function createNoteDetector(options = {}) {
 
     function calibrationWizardBack() {
         if (!_calWizardState || _calWizardState.step <= 0) return;
+        _calWizardStopAllStringsRun('back');
         _calWizardStopAutoCapture();
         if (_calWizardState.tunerMinimized) _calWizardSetTunerMinimized(false);
         _calWizardState.step--;
@@ -6461,8 +7230,9 @@ function createNoteDetector(options = {}) {
         overlay.className = 'nd-cal-wizard';
         overlay.style.cssText = 'position:fixed;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.65);pointer-events:auto;';
         overlay.innerHTML = `
-            <button type="button" class="nd-cal-return-wizard hidden fixed bottom-6 left-1/2 -translate-x-1/2 z-[301] px-4 py-2 bg-accent hover:bg-accent-light rounded-full text-xs font-semibold text-white shadow-lg" style="display:none;pointer-events:auto;">
-                Return to Calibration Wizard
+            <button type="button" class="nd-cal-return-wizard bg-accent hover:bg-accent-light text-white shadow-2xl border-2 border-white/25" style="display:none;pointer-events:auto;position:fixed;left:50%;transform:translateX(-50%);bottom:120px;z-index:301;padding:16px 32px;border-radius:16px;max-width:calc(100vw - 2rem);text-align:center;cursor:pointer;">
+                <span class="nd-cal-return-primary block text-sm font-bold leading-tight">Return to Calibration Wizard</span>
+                <span class="nd-cal-return-secondary block text-[11px] font-normal opacity-90 mt-1">Tap here to continue setup</span>
             </button>
             <div class="nd-cal-wizard-card bg-dark-700 border border-gray-600 rounded-2xl shadow-2xl text-sm" style="width:24rem;max-width:calc(100vw - 2rem);max-height:calc(100vh - 3rem);display:flex;flex-direction:column;">
                 <div class="flex justify-between items-center px-4 py-3 border-b border-gray-700">
@@ -6480,7 +7250,21 @@ function createNoteDetector(options = {}) {
         overlay.querySelector('.nd-cal-back').onclick = () => calibrationWizardBack();
         overlay.querySelector('.nd-cal-next').onclick = () => calibrationWizardNext();
         const ret = overlay.querySelector('.nd-cal-return-wizard');
-        if (ret) ret.onclick = () => _calWizardSetTunerMinimized(false);
+        if (ret) {
+            ret.onclick = () => {
+                if (_calWizardState && _calWizardState.playAlong) {
+                    if (_calWizardState.playAlong.phase === 'waiting') {
+                        _calWizardCancelTimedPlayAlongWaiting(
+                            'Timed play-along cancelled — returned before playback started.');
+                        return;
+                    }
+                    _calWizardFinishTimedPlayAlong(true);
+                    return;
+                }
+                _calWizardSetTunerMinimized(false);
+                _calWizardRefreshLive();
+            };
+        }
         document.body.appendChild(overlay);
         _calWizardEl = overlay;
         renderCalibrationWizard();
