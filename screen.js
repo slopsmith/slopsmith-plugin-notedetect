@@ -1246,7 +1246,7 @@ function _ndConstraintCheckString(
 //   - hm (harmonic): energy-only check (pitch check at fundamental is unreliable)
 //     — a future pass could check at 2x / 1.5x fundamental for stricter NYI
 //     classification.
-function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount, offsets, capo, pitchCheckCents, minHitRatio = 0.6) {
+function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount, offsets, capo, pitchCheckCents, minHitRatio = 0.6, prevFramePeak = 0) {
     let hitStrings = 0;
     const results = [];
 
@@ -1258,6 +1258,12 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
     // spectrum.
     const spectrum = _ndFftMagnitude(buffer, sampleRate);
     const totalEnergy = _ndTotalEnergy(spectrum.magnitudes);
+    // Peak magnitude for palm mute onset check — computed once per frame,
+    // only when a prevFramePeak was passed in (avoids the reduce on frames
+    // with no pm notes).
+    const framePeak = prevFramePeak > 0
+        ? spectrum.magnitudes.reduce((a, b) => Math.max(a, b), 0)
+        : 0;
 
     for (const cn of chordNotes) {
         // Per-technique threshold adjustments (brief §"Handling Techniques")
@@ -1267,6 +1273,47 @@ function _ndScoreChord(buffer, sampleRate, chordNotes, arrangement, stringCount,
         if (cn.ho || cn.po) {
             // Hammer-on / pull-off: no pick attack, energy will be lower
             energyThreshold = 0.015;
+        }
+        if (cn.tp) {
+            // Tap: two-hand tap, no pick attack — treat same as hammer-on
+            // for energy purposes. The tap finger produces a similar
+            // low-energy onset to a hammer-on.
+            energyThreshold = 0.015;
+        }
+        if (cn.fhm) {
+            // Fret hand mute: dead note produced by fretting without
+            // sufficient pressure. No sustain, very short decay, but the
+            // pick attack is still present so energyThreshold stays at
+            // the default. The audible content is percussive noise rather
+            // than a pitched tone — widen the pitch window to avoid false
+            // misses from the noisy spectrum.
+            cents = Math.max(cents, 150);
+        }
+        if (cn.tr) {
+            // Tremolo: rapid repeated pick on a single note. RS treats
+            // this identically to a regular note in its scoring pipeline
+            // (no special detection). We follow the same approach —
+            // no threshold adjustment needed.
+        }
+        if (cn.pm) {
+            // Palm mute: short percussive attack, fast decay, suppressed
+            // sustain. The reference implementation uses half the standard
+            // matching threshold (0.1 vs 0.2) for palm mutes specifically,
+            // and gates onset detection behind a -50dB floor with a 1.25x
+            // peak rise condition. We approximate both here:
+            // — energyThreshold lowered to 0.02 (half of the 0.03 default)
+            // — if the current frame's peak hasn't risen 1.25x from the
+            //   previous frame, raise threshold back to suppress false
+            //   triggers during the decay tail of a previous note.
+            // PMUTE_HAMMERON / PMUTE_PULLOFF: Math.min keeps the lower
+            // value from the ho/po block above.
+            energyThreshold = Math.min(energyThreshold, 0.02);
+            if (prevFramePeak > 0 && framePeak < prevFramePeak * 1.25 && framePeak < 0.9) {
+                // Peak hasn't risen enough — likely decay tail, not a new
+                // pm attack. Raise threshold to suppress false trigger.
+                energyThreshold = Math.max(energyThreshold, 0.03);
+            }
+        }
         }
         if (cn.b || cn.sl) {
             // Bend / slide: pitch is moving, widen the pitch window
@@ -2063,6 +2110,11 @@ function createNoteDetector(options = {}) {
     let accumBuffer = new Float32Array(0);
     let pendingBuffer = null;
     let processingFrame = false;
+    // Previous frame's peak magnitude — used for palm mute onset detection.
+    // RS uses a 1.25x peak rise condition to re-trigger onset detection for
+    // pm notes specifically. We track the previous frame peak here so
+    // _ndScoreChord can compare against it when cn.pm is set.
+    let _ndPrevFramePeak = 0;
 
     // Timers
     let detectInterval = null;
@@ -3781,6 +3833,7 @@ function createNoteDetector(options = {}) {
                             s: cn.s, f: cn.f,
                             ho: !!cn.ho, po: !!cn.po,
                             b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                            pm: !!cn.pm, tp: !!cn.tp, fhm: !!cn.fhm, tr: !!cn.tr,
                         })),
                     };
                     const gen = sessionGen;
@@ -3796,17 +3849,17 @@ function createNoteDetector(options = {}) {
             } else if (frameBuffer) {
                 // Browser: _ndScoreChord is already a DSP band-energy check.
                 const sr = audioCtx ? audioCtx.sampleRate : bridgeSampleRate;
+                const prevPeak = _ndPrevFramePeak;
                 batch = _ndScoreChord(
                     frameBuffer, sr,
                     _ndSingleNotes, currentArrangement, currentStringCount,
-                    // Same arrangement-aware pitch window as the desktop-bridge
-                    // path above, so bass gets the wider 60c gate in the browser
-                    // fallback too (otherwise the fallback undercuts the bass
-                    // improvement on low strings whose bins resolve coarsely).
                     tuningOffsets, capo,
                     verifyParams.pitchCheckCents,
-                    chordHitRatio
+                    chordHitRatio,
+                    prevPeak
                 );
+                // Track peak for next frame's palm mute onset check.
+                _ndPrevFramePeak = frameBuffer.reduce((a, b) => Math.max(a, Math.abs(b)), 0);
             }
             // results[] is aligned 1:1 with the notes[] array we sent.
             if (batch && Array.isArray(batch.results)) {
@@ -3891,6 +3944,7 @@ function createNoteDetector(options = {}) {
                             s: cn.s, f: cn.f,
                             ho: !!cn.ho, po: !!cn.po,
                             b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
+                            pm: !!cn.pm, tp: !!cn.tp, fhm: !!cn.fhm, tr: !!cn.tr,
                         })),
                     };
                     const gen = sessionGen;
@@ -5512,7 +5566,8 @@ function createNoteDetector(options = {}) {
                 s: n.s,
                 f: n.f,
                 sus: Number.isFinite(n.sus) ? n.sus : 0,
-                ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+               ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+               pm: !!n.pm, tp: !!n.tp, fhm: !!n.fhm, tr: !!n.tr,
             };
             notes.push(entry);
             byId.set(id, { ...n });
@@ -5531,9 +5586,10 @@ function createNoteDetector(options = {}) {
                     s: cn.s,
                     f: cn.f,
                     sus: Number.isFinite(cn.sus) ? cn.sus : 0,
-                    ho: !!cn.ho, po: !!cn.po, b: !!cn.b, sl: !!cn.sl, hm: !!cn.hm,
-                };
-                notes.push(entry);
+                    ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+                    pm: !!n.pm, tp: !!n.tp, fhm: !!n.fhm, tr: !!n.tr,
+            };
+            notes.push(entry);
                 byId.set(id, { ...cn, t: c.t });
             }
         }
@@ -7750,6 +7806,7 @@ function createNoteDetector(options = {}) {
                 .map(n => ({
                     s: n.s, f: n.f,
                     ho: !!n.ho, po: !!n.po, b: !!n.b, sl: !!n.sl, hm: !!n.hm,
+                    pm: !!n.pm, tp: !!n.tp, fhm: !!n.fhm, tr: !!n.tr,
                 }));
             let cleanNotes = clean.length ? clean : null;
             // A ctx only makes sense alongside a live target.
