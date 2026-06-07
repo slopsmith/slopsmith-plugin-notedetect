@@ -9138,6 +9138,11 @@ function createNoteDetector(options = {}) {
                 <button type="button" class="nd-cal-lab-open w-full mt-2 py-2 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-xs text-gray-200 transition">
                     Technique Assessment
                 </button>
+                <div class="text-[10px] text-gray-500 mt-2 mb-1 leading-tight">Play a short built-in track to check timing, open strings, fretted notes, and power chords on the highway.</div>
+                <button type="button" class="nd-diag-launch-basic w-full py-2 bg-dark-600 hover:bg-dark-500 border border-cyan-900/50 rounded-lg text-xs text-gray-200 transition">
+                    Run Basic Guitar Diagnostic
+                </button>
+                <div class="nd-health-diag-launch-status text-[10px] text-cyan-200/90 mt-1 leading-snug"></div>
             </div>
 
             ${tuningMode ? `
@@ -9292,6 +9297,10 @@ function createNoteDetector(options = {}) {
         const calLabBtn = panel.querySelector('.nd-cal-lab-open');
         if (calLabBtn) {
             calLabBtn.onclick = () => openInstrumentCalibrationLab();
+        }
+        const diagLaunchBtn = panel.querySelector('.nd-diag-launch-basic');
+        if (diagLaunchBtn) {
+            diagLaunchBtn.onclick = () => _ndLaunchDiagnosticTrack('basic-guitar-6', panel);
         }
 
         try {
@@ -13164,12 +13173,98 @@ function createNoteDetector(options = {}) {
             artist: 'Slopsmith',
             arrangement: 'Diagnostic Guitar',
             filenameIncludes: 'slopsmith-diagnostic-basic-guitar.sloppak',
+            dlcRelativePath: 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak',
             instrument: 'guitar',
             stringCount: 6,
             reportProfile: 'basic-guitar-v1',
             description: 'Checks timing, open strings, fretted notes, and power chords.',
         },
     ];
+
+    function _ndSetDiagnosticLaunchStatus(panel, message) {
+        if (!panel) return;
+        const el = panel.querySelector('.nd-health-diag-launch-status');
+        if (el) el.textContent = message || '';
+    }
+
+    async function _ndLaunchDiagnosticTrack(trackId, panel) {
+        const track = _DIAGNOSTIC_TRACK_CATALOG.find((t) => t.id === trackId);
+        if (!track || !track.dlcRelativePath) {
+            _ndSetDiagnosticLaunchStatus(
+                panel,
+                'Diagnostic track is not configured.',
+            );
+            return;
+        }
+        if (typeof window.playSong !== 'function') {
+            _ndSetDiagnosticLaunchStatus(
+                panel,
+                'Diagnostic track could not be loaded. Restart Slopsmith or rescan your library.',
+            );
+            return;
+        }
+
+        _ndSetDiagnosticLaunchStatus(panel, 'Loading diagnostic track…');
+
+        const waitForSongReady = () => new Promise((resolve) => {
+            if (!window.slopsmith || typeof window.slopsmith.on !== 'function') {
+                resolve(false);
+                return;
+            }
+            let settled = false;
+            const finish = (ok) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                try { window.slopsmith.off('song:ready', onReady); } catch (_) {}
+                resolve(ok);
+            };
+            const onReady = () => finish(true);
+            const timer = setTimeout(() => finish(false), 15000);
+            try {
+                window.slopsmith.on('song:ready', onReady);
+            } catch (_) {
+                finish(false);
+            }
+        });
+
+        const filenameMatchesTrack = () => {
+            const fn = (_ndShared.currentFilename || '').toLowerCase();
+            const needle = String(track.filenameIncludes || '').toLowerCase();
+            return !!(needle && fn.includes(needle));
+        };
+
+        try {
+            const loadPromise = window.playSong(
+                track.dlcRelativePath,
+                track.arrangement || undefined,
+            );
+            if (loadPromise && typeof loadPromise.then === 'function') {
+                await loadPromise;
+            }
+        } catch (e) {
+            console.warn('[note_detect] diagnostic launch failed:', e);
+            _ndSetDiagnosticLaunchStatus(
+                panel,
+                'Diagnostic track could not be loaded. Restart Slopsmith or rescan your library.',
+            );
+            return;
+        }
+
+        const ready = await waitForSongReady();
+        if (ready || filenameMatchesTrack()) {
+            _ndSetDiagnosticLaunchStatus(
+                panel,
+                'Loaded Basic Guitar Diagnostic. Press Play or Spacebar to begin.',
+            );
+            return;
+        }
+
+        _ndSetDiagnosticLaunchStatus(
+            panel,
+            'Diagnostic track is not available yet. Restart Slopsmith or rescan the library. If it still does not appear, the built-in diagnostic pack may not be installed.',
+        );
+    }
 
     const _DIAGNOSTIC_REPORT_PROFILES = {
         'basic-guitar-v1': {
