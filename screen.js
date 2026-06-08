@@ -13228,16 +13228,13 @@ function createNoteDetector(options = {}) {
             }
         });
 
-        const filenameMatchesTrack = () => {
-            const fn = (_ndShared.currentFilename || '').toLowerCase();
-            const needle = String(track.filenameIncludes || '').toLowerCase();
-            return !!(needle && fn.includes(needle));
-        };
+        const readyPromise = waitForSongReady();
 
         try {
             const loadPromise = window.playSong(
-                track.dlcRelativePath,
-                track.arrangement || undefined,
+                encodeURIComponent(track.dlcRelativePath),
+                undefined,
+                { bridge: false },
             );
             if (loadPromise && typeof loadPromise.then === 'function') {
                 await loadPromise;
@@ -13251,8 +13248,8 @@ function createNoteDetector(options = {}) {
             return;
         }
 
-        const ready = await waitForSongReady();
-        if (ready || filenameMatchesTrack()) {
+        const ready = await readyPromise;
+        if (ready) {
             _ndSetDiagnosticLaunchStatus(
                 panel,
                 'Loaded Basic Guitar Diagnostic. Press Play or Spacebar to begin.',
