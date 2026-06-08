@@ -200,10 +200,55 @@ const _ndShared = (window.__ndShared = window.__ndShared || {
     // already owned, and every instance on a source skips its own host-chart
     // pushes/drains while another instance owns that source's contained slot.
     containedSlotOwners: new Map(),
+    // Snapshot for "Return to Previous Song" after a Detection Health
+    // diagnostic playthrough — one slot, screen.js only.
+    diagnosticReturn: {
+        active: false,
+        previousFilename: null,
+        previousArrangementIndex: null,
+        previousTitle: null,
+        previousArtist: null,
+        launchedTrackId: null,
+        diagnosticFilename: null,
+    },
 });
+// HMR / prior evaluations may lack diagnosticReturn on the reused object.
+if (!_ndShared.diagnosticReturn) {
+    _ndShared.diagnosticReturn = {
+        active: false,
+        previousFilename: null,
+        previousArrangementIndex: null,
+        previousTitle: null,
+        previousArtist: null,
+        launchedTrackId: null,
+        diagnosticFilename: null,
+    };
+}
 // Local aliases — kept for readability of the rest of the file, but
 // they're the same objects as `window.__ndShared.*`.
 const _ndInstances = _ndShared.instances;
+
+const _ND_DIAGNOSTIC_FILENAME_MARKERS = [
+    'slopsmith-diagnostic-basic-guitar.sloppak',
+];
+
+function _ndFilenameLooksDiagnostic(fn) {
+    const lower = String(fn || '').toLowerCase();
+    if (!lower) return false;
+    return _ND_DIAGNOSTIC_FILENAME_MARKERS.some((m) => lower.includes(m));
+}
+
+function _ndClearDiagnosticReturnState() {
+    const r = _ndShared.diagnosticReturn;
+    if (!r) return;
+    r.active = false;
+    r.previousFilename = null;
+    r.previousArrangementIndex = null;
+    r.previousTitle = null;
+    r.previousArtist = null;
+    r.launchedTrackId = null;
+    r.diagnosticFilename = null;
+}
 
 // (The playSong wrapper's idempotency guard lives on the wrapper
 // function object itself — see `_ndInstallPlaySongHook()` below —
@@ -13187,6 +13232,118 @@ function createNoteDetector(options = {}) {
         if (el) el.textContent = message || '';
     }
 
+    function _ndSetDiagnosticLaunchStatusAny(message) {
+        const el = document.querySelector('.nd-health-diag-launch-status');
+        if (el) el.textContent = message || '';
+    }
+
+    function _ndWaitForSongReadyEvent(timeoutMs) {
+        const ms = timeoutMs != null ? timeoutMs : 15000;
+        return new Promise((resolve) => {
+            if (!window.slopsmith || typeof window.slopsmith.on !== 'function') {
+                resolve(false);
+                return;
+            }
+            let settled = false;
+            const finish = (ok) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                try { window.slopsmith.off('song:ready', onReady); } catch (_) {}
+                resolve(ok);
+            };
+            const onReady = () => finish(true);
+            const timer = setTimeout(() => finish(false), ms);
+            try {
+                window.slopsmith.on('song:ready', onReady);
+            } catch (_) {
+                finish(false);
+            }
+        });
+    }
+
+    function _ndCaptureDiagnosticReturnBeforeLaunch(track) {
+        _ndClearDiagnosticReturnState();
+        const prevFn = String(_ndShared.currentFilename || '').trim();
+        if (!prevFn) return;
+        if (_getDiagnosticTrackForSession()) return;
+        const diagFn = String(track.dlcRelativePath || '').trim();
+        if (!diagFn) return;
+        const prevLower = prevFn.toLowerCase();
+        if (prevLower === diagFn.toLowerCase()) return;
+        if (track.filenameIncludes
+            && prevLower.includes(String(track.filenameIncludes).toLowerCase())) {
+            return;
+        }
+        const hw = resolveHw();
+        let info = {};
+        try {
+            info = (hw && hw.getSongInfo) ? (hw.getSongInfo() || {}) : {};
+        } catch (_) { /* read-only snapshot */ }
+        const arrIdx = info.arrangement_index;
+        _ndShared.diagnosticReturn.active = true;
+        _ndShared.diagnosticReturn.previousFilename = prevFn;
+        _ndShared.diagnosticReturn.previousArrangementIndex = Number.isFinite(arrIdx)
+            ? arrIdx
+            : null;
+        _ndShared.diagnosticReturn.previousTitle = info.title || null;
+        _ndShared.diagnosticReturn.previousArtist = info.artist || null;
+        _ndShared.diagnosticReturn.launchedTrackId = track.id;
+        _ndShared.diagnosticReturn.diagnosticFilename = diagFn;
+    }
+
+    async function _ndReturnToPreviousSongAfterDiagnostic() {
+        const r = _ndShared.diagnosticReturn;
+        if (!r || !r.active || !r.previousFilename) {
+            return false;
+        }
+        if (typeof window.playSong !== 'function') {
+            _ndSetDiagnosticLaunchStatusAny(
+                'Could not return to the previous song. Load it from your library.',
+            );
+            _ndClearDiagnosticReturnState();
+            return false;
+        }
+
+        const prevFn = r.previousFilename;
+        const arrIdx = r.previousArrangementIndex;
+        const readyPromise = _ndWaitForSongReadyEvent();
+
+        try {
+            const loadPromise = window.playSong(
+                encodeURIComponent(prevFn),
+                Number.isFinite(arrIdx) ? arrIdx : undefined,
+                { bridge: false },
+            );
+            if (loadPromise && typeof loadPromise.then === 'function') {
+                await loadPromise;
+            }
+        } catch (e) {
+            console.warn('[note_detect] return to previous song failed:', e);
+            _ndSetDiagnosticLaunchStatusAny(
+                'Could not return to the previous song. Load it from your library.',
+            );
+            _ndClearDiagnosticReturnState();
+            return false;
+        }
+
+        const ready = await readyPromise;
+        const prevTitle = r.previousTitle;
+        _ndClearDiagnosticReturnState();
+        if (ready) {
+            const label = prevTitle
+                ? `Returned to ${prevTitle}. Press Play when ready.`
+                : 'Returned to previous song. Press Play when ready.';
+            _ndSetDiagnosticLaunchStatusAny(label);
+            return true;
+        }
+
+        _ndSetDiagnosticLaunchStatusAny(
+            'Could not return to the previous song. Load it from your library.',
+        );
+        return false;
+    }
+
     async function _ndLaunchDiagnosticTrack(trackId, panel) {
         const track = _DIAGNOSTIC_TRACK_CATALOG.find((t) => t.id === trackId);
         if (!track || !track.dlcRelativePath) {
@@ -13204,31 +13361,11 @@ function createNoteDetector(options = {}) {
             return;
         }
 
+        _ndCaptureDiagnosticReturnBeforeLaunch(track);
+
         _ndSetDiagnosticLaunchStatus(panel, 'Loading diagnostic track…');
 
-        const waitForSongReady = () => new Promise((resolve) => {
-            if (!window.slopsmith || typeof window.slopsmith.on !== 'function') {
-                resolve(false);
-                return;
-            }
-            let settled = false;
-            const finish = (ok) => {
-                if (settled) return;
-                settled = true;
-                clearTimeout(timer);
-                try { window.slopsmith.off('song:ready', onReady); } catch (_) {}
-                resolve(ok);
-            };
-            const onReady = () => finish(true);
-            const timer = setTimeout(() => finish(false), 15000);
-            try {
-                window.slopsmith.on('song:ready', onReady);
-            } catch (_) {
-                finish(false);
-            }
-        });
-
-        const readyPromise = waitForSongReady();
+        const readyPromise = _ndWaitForSongReadyEvent();
 
         try {
             const loadPromise = window.playSong(
@@ -13624,6 +13761,12 @@ function createNoteDetector(options = {}) {
             );
         }
 
+        const returnSnap = _ndShared.diagnosticReturn;
+        const showReturnPrevBtn = !!(diagnosticReport
+            && returnSnap
+            && returnSnap.active
+            && returnSnap.previousFilename);
+
         const overlay = document.createElement('div');
         overlay.className = 'nd-summary-overlay';
         // Skin attribute mirrors the instance root's so the overlay (a
@@ -13654,6 +13797,10 @@ function createNoteDetector(options = {}) {
                 ${sectionHtml}
                 ${diagnosticPlayHtml}
                 <div class="nd-sum-actions">
+                    ${showReturnPrevBtn ? `
+                    <button type="button" class="nd-summary-return-prev nd-btn">
+                        Return to Previous Song
+                    </button>` : ''}
                     ${tuningMode ? `
                     <button class="nd-summary-download nd-btn nd-btn-primary">
                         Download Diagnostic JSON
@@ -13666,6 +13813,16 @@ function createNoteDetector(options = {}) {
         `;
         const closeBtn = overlay.querySelector('.nd-summary-close');
         if (closeBtn) closeBtn.onclick = () => overlay.remove();
+        const returnPrevBtn = overlay.querySelector('.nd-summary-return-prev');
+        if (returnPrevBtn) {
+            returnPrevBtn.onclick = () => {
+                overlay.remove();
+                _ndReturnToPreviousSongAfterDiagnostic().catch((e) => {
+                    console.warn('[note_detect] return to previous song failed:',
+                        e && e.message ? e.message : e);
+                });
+            };
+        }
         const dlBtn = overlay.querySelector('.nd-summary-download');
         if (dlBtn) dlBtn.onclick = () => _downloadDiagnostic();
         // Capture the reveal-animation targets at BUILD time: a deferred
@@ -14434,6 +14591,14 @@ function _ndInstallPlaySongHook() {
             let f = args[0];
             try { f = decodeURIComponent(f); } catch (_) { /* leave raw */ }
             _ndShared.currentFilename = f;
+            const ret = _ndShared.diagnosticReturn;
+            if (ret && ret.active && f) {
+                const pf = ret.previousFilename;
+                const isRestoreTarget = pf && f === pf;
+                if (!isRestoreTarget && !_ndFilenameLooksDiagnostic(f)) {
+                    _ndClearDiagnosticReturnState();
+                }
+            }
         }
         // For each live instance: silent-disable if currently enabled
         // (stop audio + timers without popping a summary modal), then
