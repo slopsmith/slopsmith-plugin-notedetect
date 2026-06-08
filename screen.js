@@ -9176,18 +9176,20 @@ function createNoteDetector(options = {}) {
                 <div class="text-gray-200 text-[10px] font-semibold uppercase tracking-wider mt-2 mb-1">Recent notes that did not verify</div>
                 <div class="nd-health-rejects text-gray-400 text-[10px] whitespace-pre-line leading-snug mb-1">—</div>
                 <div class="nd-health-hint text-amber-200/90 mt-2 pt-2 border-t border-gray-700/80">—</div>
-                <div class="text-[10px] text-gray-500 mt-1 leading-tight">Read-only. Use the buttons below to run Calibration Wizard or Technique Assessment (gear icon next to Detect).</div>
-                <button type="button" class="nd-cal-wizard-open w-full mt-2 py-2 bg-dark-600 hover:bg-dark-500 border border-gray-700 rounded-lg text-xs text-gray-200 transition">
-                    Run Calibration Wizard
-                </button>
-                <button type="button" class="nd-cal-lab-open w-full mt-2 py-2 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-xs text-gray-200 transition">
-                    Technique Assessment
-                </button>
+                <div class="text-[10px] text-gray-500 mt-1 leading-tight">Read-only health stats. Use the diagnostic track for playthrough assessment, Calibration Wizard for setup, and Advanced Signal Check for deeper signal detail.</div>
                 <div class="text-[10px] text-gray-500 mt-2 mb-1 leading-tight">Play a short built-in track to check timing, open strings, fretted notes, and power chords on the highway.</div>
                 <button type="button" class="nd-diag-launch-basic w-full py-2 bg-dark-600 hover:bg-dark-500 border border-cyan-900/50 rounded-lg text-xs text-gray-200 transition">
                     Run Basic Guitar Diagnostic
                 </button>
-                <div class="nd-health-diag-launch-status text-[10px] text-cyan-200/90 mt-1 leading-snug"></div>
+                <div class="nd-health-diag-launch-status text-[10px] text-cyan-200/90 mt-1 mb-2 leading-snug"></div>
+                <div class="text-[10px] text-gray-500 mb-1 leading-tight">Set up audio input, levels, and timing before you play.</div>
+                <button type="button" class="nd-cal-wizard-open w-full py-2 bg-dark-600 hover:bg-dark-500 border border-gray-700 rounded-lg text-xs text-gray-200 transition">
+                    Run Calibration Wizard
+                </button>
+                <div class="text-[10px] text-gray-500 mt-2 mb-1 leading-tight">Optional deeper troubleshooting for root/fifth, SNR, tuning, and signal-clarity details after a diagnostic track.</div>
+                <button type="button" class="nd-cal-lab-open w-full py-2 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-xs text-gray-200 transition">
+                    Advanced Signal Check
+                </button>
             </div>
 
             ${tuningMode ? `
