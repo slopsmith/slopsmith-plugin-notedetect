@@ -1875,6 +1875,141 @@ function createNoteDetector(options = {}) {
     // chord branch can dispatch `audio.scoreChord(ctx)` without
     // re-resolving from window on every tick. Cleared by stopAudio().
     let bridgeDesktop = null;
+
+    // ── Multi-input engine source binding (desktop bridge only) ───────────
+    // Each detector instance can score its OWN engine input source so several
+    // detectors (split-screen panels / a 4-input interface) run independently.
+    // `sourceId` selects which engine source the bridge calls target:
+    //   null  → the legacy default source 0, via the un-suffixed bridge methods
+    //           (setChart / scoreChord / getNoteVerdicts / getRawPitch …). The
+    //           default singleton and any instance that doesn't opt in stay here,
+    //           so the single-player path is byte-identical.
+    //   >= 0  → a dedicated source, via the *Source* bridge methods.
+    // A caller may pass an explicit `opts.sourceId` (caller owns its lifecycle),
+    // or `opts.ownSource: true` to have this instance allocate one on enable
+    // (addSource) and free it on destroy (removeSource).
+    let sourceId = (typeof opts.sourceId === 'number' && opts.sourceId >= 0)
+        ? opts.sourceId : null;
+    const _ndWantOwnSource = sourceId == null && !isDefault && opts.ownSource === true;
+    let _ndOwnsSource = false;  // true once WE allocated sourceId (free on destroy)
+    // Owned sources we unbound but couldn't free yet (removeSource missing/threw
+    // — only reachable on a hypothetical mid-session addon downgrade). A list, so
+    // a second orphan can't overwrite an earlier one; every entry is retried on the
+    // next ready enable and on destroy, so an owned source can never leak silently.
+    const _ndOrphanSourceIds = [];
+
+    // Bridge-method routing: pick the *Source* variant when this instance is
+    // bound to a dedicated source, else the legacy (source-0) method. Each
+    // returns the native promise (or a resolved null when unavailable), and the
+    // *Available helpers gate the bridge path the same way the inline typeof
+    // checks used to. `a` is bridgeDesktop.audio.
+    function _ndBridgeAudio() { return (bridgeDesktop && bridgeDesktop.audio) || null; }
+    // True only when the addon exposes the FULL source-indexed scoring API this
+    // instance routes to once bound. Binding a source without these would silently
+    // break scoring on a downlevel/partial addon — so we never bind unless ready.
+    function _ndDesktopSourceApiReady(a) {
+        return !!a
+            && typeof a.scoreSourceChord === 'function'
+            && typeof a.setSourceChart === 'function'
+            && typeof a.getSourceNoteVerdicts === 'function'
+            && typeof a.getSourcePitchDetection === 'function';
+    }
+    function _ndBridgeScoreAvailable() {
+        const a = _ndBridgeAudio(); if (!a) return false;
+        return sourceId != null
+            ? typeof a.scoreSourceChord === 'function'
+            : typeof a.scoreChord === 'function';
+    }
+    function _ndBridgeScoreChord(ctx) {
+        const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        if (sourceId != null && typeof a.scoreSourceChord === 'function')
+            return a.scoreSourceChord(sourceId, ctx);
+        if (sourceId == null && typeof a.scoreChord === 'function')
+            return a.scoreChord(ctx);
+        return Promise.resolve(null);
+    }
+    function _ndBridgeVerifierAvailable() {
+        const a = _ndBridgeAudio(); if (!a) return false;
+        return sourceId != null
+            ? (typeof a.setSourceChart === 'function' && typeof a.getSourceNoteVerdicts === 'function')
+            : (typeof a.setChart === 'function' && typeof a.getNoteVerdicts === 'function');
+    }
+    function _ndBridgeSetChart(chart) {
+        const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        if (sourceId != null && typeof a.setSourceChart === 'function')
+            return a.setSourceChart(sourceId, chart);
+        if (sourceId == null && typeof a.setChart === 'function')
+            return a.setChart(chart);
+        return Promise.resolve(null);
+    }
+    function _ndBridgeGetVerdicts(songTime, playing) {
+        const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        if (sourceId != null && typeof a.getSourceNoteVerdicts === 'function')
+            return a.getSourceNoteVerdicts(sourceId, songTime, playing);
+        if (sourceId == null && typeof a.getNoteVerdicts === 'function')
+            return a.getNoteVerdicts(songTime, playing);
+        return Promise.resolve(null);
+    }
+    // Post-gate raw YIN (sustain glow): prefer getRawPitch; fall back to the
+    // active-pitch query on an addon that predates it (same as the legacy path).
+    function _ndBridgeRawPitch() {
+        const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        if (sourceId != null) {
+            if (typeof a.getSourceRawPitch === 'function') return a.getSourceRawPitch(sourceId);
+            if (typeof a.getSourcePitchDetection === 'function') return a.getSourcePitchDetection(sourceId);
+            return Promise.resolve(null);
+        }
+        if (typeof a.getRawPitch === 'function') return a.getRawPitch();
+        if (typeof a.getPitchDetection === 'function') return a.getPitchDetection();
+        return Promise.resolve(null);
+    }
+    // Active (ML-or-YIN) detection for the monophonic scoring branch.
+    function _ndBridgePitch() {
+        const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        if (sourceId != null && typeof a.getSourcePitchDetection === 'function')
+            return a.getSourcePitchDetection(sourceId);
+        if (sourceId == null && typeof a.getPitchDetection === 'function')
+            return a.getPitchDetection();
+        return Promise.resolve(null);
+    }
+    // Free an engine source we allocated. Re-resolves window.slopsmithDesktop
+    // because stopAudio() clears bridgeDesktop before destroy() runs.
+    // Best-effort removeSource(id). Re-resolves window.slopsmithDesktop because
+    // stopAudio() clears bridgeDesktop. Returns true iff the source was freed
+    // (or there was nothing to free).
+    function _ndTryFreeSource(id) {
+        if (id == null) return true;
+        const d = (typeof window !== 'undefined') ? window.slopsmithDesktop : null;
+        const a = d && d.audio;
+        if (!a || typeof a.removeSource !== 'function') return false;
+        try {
+            const r = a.removeSource(id);
+            // removeSource is async IPC on the desktop bridge — the call is
+            // dispatched (the engine removes the source) regardless of the result,
+            // so we count it as freed; swallow any rejection so a transient failure
+            // can't surface as an unhandled promise rejection.
+            if (r && typeof r.then === 'function') r.then(undefined, () => {});
+            return true;
+        } catch (_) { return false; }
+    }
+    // Retry freeing every previously-orphaned source (see _ndOrphanSourceIds);
+    // keep the ones that still can't be freed.
+    function _ndFlushOrphanSources() {
+        for (let i = _ndOrphanSourceIds.length - 1; i >= 0; i--) {
+            if (_ndTryFreeSource(_ndOrphanSourceIds[i])) _ndOrphanSourceIds.splice(i, 1);
+        }
+    }
+    // Free the source we own (called from destroy). Also retries any orphans from
+    // an earlier downgrade — at destroy the addon is usually ready again, so those
+    // get reclaimed. If the current source can't be freed (removeSource missing —
+    // a downlevel addon), the engine reclaims it on its own teardown; the orphan
+    // list can't help on a dead instance (no later enable), so we don't pretend to.
+    function _ndReleaseOwnedSource() {
+        _ndFlushOrphanSources();
+        if (_ndOwnsSource && sourceId != null) _ndTryFreeSource(sourceId);
+        _ndOwnsSource = false;
+        sourceId = null;
+    }
     // True when the desktop engine exposes the continuous chart-verifier
     // API (audio.setChart / audio.getNoteVerdicts) AND a chart has been
     // pushed for the current song. When set, the desktop detect loop drains
@@ -2062,6 +2197,54 @@ function createNoteDetector(options = {}) {
                     bridgeDesktop = desktop;
                     accumBuffer = new Float32Array(0);
 
+                    // Bind a dedicated engine input source when this instance opted
+                    // in (multi-input / split-screen) — but ONLY when the addon
+                    // exposes the FULL source-indexed scoring API. A partial/
+                    // downlevel addon (e.g. addSource without scoreSourceChord)
+                    // must NOT leave us bound to a source we can't score, which
+                    // would silently stop scoring. In that case we stay on source 0
+                    // (legacy methods). Allocate once and keep it across disable/
+                    // enable (freed only on destroy); the default singleton + un-
+                    // opted instances stay on source 0 — byte-identical.
+                    if (_ndDesktopSourceApiReady(desktop.audio)) {
+                        // A ready addon can also reclaim any earlier orphans.
+                        _ndFlushOrphanSources();
+                        // Re-bind a caller-managed sourceId that an earlier degraded
+                        // enable cleared (opts.sourceId is the source of truth).
+                        if (sourceId == null && !_ndOwnsSource
+                            && typeof opts.sourceId === 'number' && opts.sourceId >= 0) {
+                            sourceId = opts.sourceId;
+                        }
+                        if (_ndWantOwnSource && sourceId == null
+                            && typeof desktop.audio.addSource === 'function') {
+                            try {
+                                const chIdx = selectedChannel === 'left' ? 0
+                                    : selectedChannel === 'right' ? 1 : -1;
+                                const id = await desktop.audio.addSource(chIdx);
+                                if (typeof id === 'number' && id >= 0) {
+                                    sourceId = id;
+                                    _ndOwnsSource = true;
+                                }
+                            } catch (_) { /* stay on source 0 */ }
+                        }
+                    } else if (sourceId != null) {
+                        // This addon can't score per source (downlevel, or — in
+                        // theory — downgraded since a prior enable bound us). Don't
+                        // stay bound to a source we can't route to: best-effort free
+                        // an owned source (remembering it as an orphan if that fails)
+                        // and fall back to the legacy source-0 path, so
+                        // `sourceId != null` always implies the routed *Source*
+                        // methods exist.
+                        if (!_ndOwnsSource) {
+                            console.warn('[note_detect] desktop addon lacks the source-indexed '
+                                + 'scoring API; ignoring opts.sourceId and using the default input');
+                        } else if (!_ndTryFreeSource(sourceId)) {
+                            _ndOrphanSourceIds.push(sourceId);
+                        }
+                        sourceId = null;
+                        _ndOwnsSource = false;
+                    }
+
                     // Record whether the engine's polyphonic ML detector
                     // (Basic Pitch) is actually active — stamped into the
                     // diagnostic export so a session is unambiguously tied to
@@ -2136,9 +2319,10 @@ function createNoteDetector(options = {}) {
                                 // lit. Fall back to getPitchDetection only if the
                                 // addon predates getRawPitch.
                                 try {
-                                    const lp = (typeof desktop.audio.getRawPitch === 'function')
-                                        ? await desktop.audio.getRawPitch()
-                                        : await desktop.audio.getPitchDetection();
+                                    // Routes to getSourceRawPitch for a bound
+                                    // source, else the legacy getRawPitch (with the
+                                    // same getPitchDetection downlevel fallback).
+                                    const lp = await _ndBridgeRawPitch();
                                     if (!enabled || gen !== sessionGen) return;
                                     if (lp && typeof lp.midiNote === 'number' && lp.midiNote >= 0
                                         && typeof lp.confidence === 'number'
@@ -2246,7 +2430,7 @@ function createNoteDetector(options = {}) {
                                 }
                             } else {
                                 bridgeNewOnsets.clear();
-                                const p = await desktop.audio.getPitchDetection();
+                                const p = await _ndBridgePitch();
                                 if (!enabled || gen !== sessionGen) return;
                                 if (p && typeof p.midiNote === 'number' && p.midiNote >= 0
                                     && typeof p.confidence === 'number' && p.confidence >= detectionConfidenceMin) {
@@ -3326,11 +3510,10 @@ function createNoteDetector(options = {}) {
         const verifyParams = _ndVerifyParamsFor(ctx.arrangement);
         let result;
         if (usingDesktopBridge) {
-            if (!bridgeDesktop || !bridgeDesktop.audio
-                || typeof bridgeDesktop.audio.scoreChord !== 'function') return;
+            if (!_ndBridgeScoreAvailable()) return;
             const gen = sessionGen;
             try {
-                result = await bridgeDesktop.audio.scoreChord({
+                result = await _ndBridgeScoreChord({
                     arrangement: ctx.arrangement,
                     stringCount: ctx.stringCount,
                     offsets: ctx.offsets.slice(0, ctx.stringCount),
@@ -3525,8 +3708,7 @@ function createNoteDetector(options = {}) {
             const verifyParams = _ndVerifyParamsFor(currentArrangement);
             let batch = null;
             if (usingDesktopBridge) {
-                if (bridgeDesktop && bridgeDesktop.audio
-                    && typeof bridgeDesktop.audio.scoreChord === 'function') {
+                if (_ndBridgeScoreAvailable()) {
                     const ctx = {
                         arrangement: currentArrangement,
                         stringCount: currentStringCount,
@@ -3558,7 +3740,7 @@ function createNoteDetector(options = {}) {
                     };
                     const gen = sessionGen;
                     try {
-                        batch = await bridgeDesktop.audio.scoreChord(ctx);
+                        batch = await _ndBridgeScoreChord(ctx);
                     } catch (e) {
                         console.warn('[note_detect] scoreChord IPC failed:', e && e.message ? e.message : e);
                         batch = null;
@@ -3649,8 +3831,7 @@ function createNoteDetector(options = {}) {
                     // note against the ML detector's active pitch set), else
                     // the constraint scorer — and it times chords correctly,
                     // which a renderer-side detectNotes scorer did not.
-                    if (!bridgeDesktop || !bridgeDesktop.audio
-                        || typeof bridgeDesktop.audio.scoreChord !== 'function') {
+                    if (!_ndBridgeScoreAvailable()) {
                         continue;
                     }
                     const ctx = {
@@ -3668,7 +3849,7 @@ function createNoteDetector(options = {}) {
                     };
                     const gen = sessionGen;
                     try {
-                        chordResult = await bridgeDesktop.audio.scoreChord(ctx);
+                        chordResult = await _ndBridgeScoreChord(ctx);
                     } catch (e) {
                         console.warn('[note_detect] scoreChord IPC failed:', e && e.message ? e.message : e);
                         continue;
@@ -5260,9 +5441,9 @@ function createNoteDetector(options = {}) {
         _ndVerifierChartSig = '';
         _ndLastPushedPlayhead = 0;
         if (!usingDesktopBridge || !bridgeDesktop || !bridgeDesktop.audio) return;
-        if (typeof bridgeDesktop.audio.setChart !== 'function'
-            || typeof bridgeDesktop.audio.getNoteVerdicts !== 'function') {
-            // Downlevel addon — fall back to the legacy matchNotes path.
+        if (!_ndBridgeVerifierAvailable()) {
+            // Downlevel addon (or, for a bound source, no source-indexed verifier
+            // API) — fall back to the legacy matchNotes path.
             return;
         }
         if (!hw || typeof hw.getNotes !== 'function' || typeof hw.getChords !== 'function') return;
@@ -5337,7 +5518,7 @@ function createNoteDetector(options = {}) {
 
         try {
             const verifyParams = _ndVerifyParamsFor(currentArrangement);
-            const ok = await bridgeDesktop.audio.setChart({
+            const ok = await _ndBridgeSetChart({
                 arrangement: currentArrangement,
                 stringCount: currentStringCount,
                 tuningOffsets: tuningOffsets.slice(0, currentStringCount),
@@ -5414,7 +5595,7 @@ function createNoteDetector(options = {}) {
 
         let verdicts = null;
         try {
-            verdicts = await bridgeDesktop.audio.getNoteVerdicts(playheadAudio, playing);
+            verdicts = await _ndBridgeGetVerdicts(playheadAudio, playing);
         } catch (e) {
             console.warn('[note_detect] getNoteVerdicts failed:', e && e.message ? e.message : e);
             return;
@@ -6131,6 +6312,10 @@ function createNoteDetector(options = {}) {
         // callers like splitscreen that unmount a panel without
         // meaning to end-of-song the session.
         disable({ silent: true });
+        // Free the engine input source we allocated for this instance (if any).
+        // disable()→stopAudio() already cleared bridgeDesktop, so this re-resolves
+        // window.slopsmithDesktop. No-op for the default singleton / source 0.
+        _ndReleaseOwnedSource();
         // Unbind slopsmith drill listeners so multiple createNoteDetector()
         // instances (splitscreen) don't accumulate handlers across mount/
         // unmount cycles. disable() leaves them alone (resumes drill state
