@@ -375,6 +375,27 @@ function _ndArrangementKindFromName(name) {
     return /bass/i.test(String(name || '')) ? 'bass' : 'guitar';
 }
 
+// Infer centOffset semitones from tuning data when getSongInfo() doesn't
+// expose centOffset directly. The RS2014 A220 trick always produces
+// implausibly high tuning offsets for bass — no legitimate 4/5 string bass
+// arrangement has its lowest open string above A1 (MIDI 33, ~55 Hz) without
+// the octave-up authoring trick being in play. When detected, return -12
+// (one octave down). Guitar arrangements never use this trick.
+// ── UPSTREAM TODO ────────────────────────────────────────────────────────
+// Remove this function entirely once getSongInfo() exposes centOffset and
+// _syncChartStateFromHw reads it directly.
+// ─────────────────────────────────────────────────────────────────────────
+function _ndInferCentOffsetSemitones(arrangement, stringCount, offsets) {
+    if (arrangement !== 'bass') return 0;
+    const base = _ndStandardMidiFor(arrangement, stringCount);
+    if (!base || !base[0]) return 0;
+    const offset = (offsets && Number.isFinite(offsets[0])) ? offsets[0] : 0;
+    const lowestOpenMidi = base[0] + offset;
+    // MIDI 33 = A1 = ~55 Hz. Any bass arrangement with a lowest open string
+    // above this is almost certainly using the A220 octave-up trick.
+    return lowestOpenMidi > 33 ? -12 : 0;
+}
+
 function _ndStandardMidiFor(arrangement, stringCount) {
     if (arrangement === 'bass') {
         return stringCount === 5 ? _ND_TUNING_BASS_5 : _ND_TUNING_BASS_4;
@@ -670,7 +691,13 @@ function _ndResolveDisplayFingering(detectedMidi, candidateNotes, arrangement, s
 // Lowest frequency we claim to detect. Below this and YIN's autocorrelation
 // window needs to be longer than the input — at 48 kHz a 30 Hz period is
 // ~1600 samples, so halfLen must exceed that, i.e. buffer must exceed ~3200.
-const _ND_MIN_DETECTABLE_HZ = 30;
+// 
+// ZZ _ND_MIND_DETECTABLE Lowered from 30 to 20 Hz to support extended-range bass tunings
+// (Drop A = A0 = ~27.5 Hz, 8-string low F#0 = ~23.1 Hz). The human
+// hearing floor is ~20 Hz; nothing a real instrument produces sits below
+// it. _ndMinAnalysisSamples and HPS lowBin both derive from this constant
+// so they automatically cover the new floor.
+const _ND_MIN_DETECTABLE_HZ = 20;
 const _ND_SPECTRAL_WHITENING_ALPHA = 0.33;
 const _ND_HARMONIC_SUB_PASSES = 3;
 const _ND_HARMONIC_COUNT = 5;       // harmonics to subtract per pass
@@ -901,6 +928,14 @@ let _ndFftScratchSize = 0;
 let _ndHpsScratch = null;
 let _ndHpsScratchSize = 0;
 
+// Set by _syncChartStateFromHw when the active arrangement has a lowest
+// open string below MIDI 33 (A1 = ~55 Hz) after centOffset is applied.
+// Used by _ndFftMagnitude to halve TARGET_BIN_HZ for low-bass arrangements,
+// doubling FFT resolution below 40 Hz without affecting guitar or standard
+// bass. Module-level (not per-instance) — same rationale as FFT scratch
+// buffers: synchronous JS, no re-entrancy risk.
+let _ndLowBassResolution = false;
+
 // YIN autocorrelation history — ring buffer of the last N cumulative-mean-
 // normalised difference arrays, one per _ndYinDetect call. 
 //
@@ -925,7 +960,15 @@ function _ndFftMagnitude(buffer, sampleRate) {
     // ~90 cents of drift even after parabolic interpolation). Deriving
     // the floor from sampleRate keeps the fundamental resolvable on
     // 5-string bass across any rate a modern audio interface serves.
-    const TARGET_BIN_HZ = 3;
+    //
+    // Low-bass arrangements (lowest open string below A1 after centOffset)
+    // get halved bin width — doubles FFT resolution below 40 Hz so
+    // fundamentals at B0 (~31 Hz) and below are resolved by more than a
+    // handful of bins. At 48 kHz this raises the FFT floor from 16384 to
+    // 32768 — roughly 2× CPU cost for those frames only. Guitar and
+    // standard bass are unaffected. _ndLowBassResolution is set by
+    // _syncChartStateFromHw on every song/arrangement load.
+    const TARGET_BIN_HZ = _ndLowBassResolution ? 1.5 : 3;
     const resolutionFloor = _ndNextPow2(Math.ceil(sampleRate / TARGET_BIN_HZ));
     const fftSize = Math.max(_ndNextPow2(buffer.length), resolutionFloor);
     const halfBins = (fftSize >> 1) + 1;
@@ -988,7 +1031,7 @@ for (let k = 0; k < halfBins; k++) {
 
     for (let pass = 0; pass < _ND_HARMONIC_SUB_PASSES; pass++) {
         // Find the strongest remaining bin in the guitar/bass frequency range.
-        const minBin = Math.max(1, Math.floor(30 / (sampleRate / fftSize)));
+        const minBin = Math.max(1, Math.floor(_ND_MIN_DETECTABLE_HZ / (sampleRate / fftSize)));
         const maxBin = Math.min(halfBins - 1, Math.floor(5000 / (sampleRate / fftSize)));
         let peakBin = minBin;
         let peakVal = magnitudes[minBin];
@@ -2105,6 +2148,18 @@ function createNoteDetector(options = {}) {
     let tuningOffsets = [0, 0, 0, 0, 0, 0];
     let capo = 0;
     let currentStringCount = 6; // kept in sync with tuningOffsets.length
+    // Global pitch shift in semitones derived from the arrangement's
+    // centOffset field. RS2014 CDLC for extended-range bass commonly uses
+    // centOffset = -1200 (exactly -12 semitones / one octave down) so the
+    // chart can be authored at A440 while sounding at A220. Without applying
+    // this, all expected frequencies are calculated one octave too high.
+    // ── UPSTREAM TODO ────────────────────────────────────────────────────
+    // When getSongInfo() exposes centOffset, replace the heuristic inference
+    // in _syncChartStateFromHw with:
+    //   currentCentOffsetSemitones = Math.round((info.centOffset || 0) / 100);
+    // and remove the _ndInferCentOffsetSemitones() calls entirely.
+    // ─────────────────────────────────────────────────────────────────────
+    let currentCentOffsetSemitones = 0;
 
     // Audio buffers
     let accumBuffer = new Float32Array(0);
@@ -5498,6 +5553,30 @@ function createNoteDetector(options = {}) {
         } else if (Array.isArray(info.tuning)) {
             currentStringCount = info.tuning.length;
         }
+
+        // ── UPSTREAM TODO ────────────────────────────────────────────────
+        // Replace the _ndInferCentOffsetSemitones call with:
+        //   currentCentOffsetSemitones = Math.round((info.centOffset || 0) / 100);
+        // once getSongInfo() exposes centOffset.
+        // ─────────────────────────────────────────────────────────────────
+        // Run after string-count resolution — the inference depends on
+        // currentStringCount being correct.
+        currentCentOffsetSemitones = _ndInferCentOffsetSemitones(
+            currentArrangement, currentStringCount, tuningOffsets
+        );
+
+        // Update the module-level FFT resolution flag so _ndFftMagnitude
+        // uses the correct bin width for this arrangement.
+        const lowestMidiWithOffset = _ndMidiFromStringFret(
+            0, 0, currentArrangement, currentStringCount, tuningOffsets, 0
+        ) + currentCentOffsetSemitones;
+        _ndLowBassResolution = currentArrangement === 'bass' && lowestMidiWithOffset < 33;
+
+        // Fold centOffset into capo so all downstream MIDI calculations
+        // automatically get the correct pitch without any call-site changes.
+        // Safe because _syncChartStateFromHw resets capo = 0 at the top on
+        // every call, so centOffset never accumulates across loads.
+        capo += currentCentOffsetSemitones;
     }
 
     // ── Engine-side chart verification (desktop bridge) ───────────────────
