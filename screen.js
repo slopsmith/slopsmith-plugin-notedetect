@@ -2227,6 +2227,18 @@ function createNoteDetector(options = {}) {
                                 }
                             } catch (_) { /* stay on source 0 */ }
                         }
+                        // Keep an owned source's input channel in sync with the
+                        // current selection — fresh addSource already bound it, but a
+                        // REUSED source (allocated on an earlier enable) may have had
+                        // its channel changed while detect was disabled.
+                        if (_ndOwnsSource && sourceId != null
+                            && typeof desktop.audio.setSourceInputChannel === 'function') {
+                            try {
+                                const chIdx = selectedChannel === 'left' ? 0
+                                    : selectedChannel === 'right' ? 1 : -1;
+                                desktop.audio.setSourceInputChannel(sourceId, chIdx);
+                            } catch (_) { /* best-effort */ }
+                        }
                     } else if (sourceId != null) {
                         // This addon can't score per source (downlevel, or — in
                         // theory — downgraded since a prior enable bound us). Don't
@@ -4784,6 +4796,19 @@ function createNoteDetector(options = {}) {
         }
         selectedChannel = next;
         saveSettings();
+        // For a bound engine source (desktop multi-input), retarget the source's
+        // input channel directly: restartAudio() below rebuilds only the browser
+        // getUserMedia graph, not the live engine source binding. Derive the channel
+        // from `next` (the normalized selection) — the same source of truth the
+        // enable-time reapply uses — not the raw idx. No-op on the browser path
+        // (sourceId == null) or a downlevel addon.
+        if (sourceId != null) {
+            const a = bridgeDesktop && bridgeDesktop.audio;
+            if (a && typeof a.setSourceInputChannel === 'function') {
+                const chIdx = next === 'left' ? 0 : next === 'right' ? 1 : -1;
+                try { a.setSourceInputChannel(sourceId, chIdx); } catch (_) { /* best-effort */ }
+            }
+        }
         restartAudio();
         return true;
     }
