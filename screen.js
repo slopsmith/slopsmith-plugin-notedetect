@@ -2274,11 +2274,14 @@ function createNoteDetector(options = {}) {
                                 }
                             } catch (_) { /* stay on source 0 */ }
                         }
-                        // Keep an owned source's input channel in sync with the
-                        // current selection — fresh addSource already bound it, but a
-                        // REUSED source (allocated on an earlier enable) may have had
-                        // its channel changed while detect was disabled.
-                        if (_ndOwnsSource && sourceId != null
+                        // Keep the bound source's input channel in sync with the
+                        // current selection. A fresh addSource already bound it, but a
+                        // REUSED owned source — OR a caller-managed opts.sourceId — may
+                        // have had its channel changed (via setChannel) while detect was
+                        // disabled, so re-route on every enable for any non-default
+                        // source this detector drives (matches setChannel's sourceId!==0
+                        // contract). Never source 0 (the shared default).
+                        if (sourceId != null && sourceId !== 0
                             && typeof desktop.audio.setSourceInputChannel === 'function') {
                             try {
                                 desktop.audio.setSourceInputChannel(sourceId, _ndChannelIndex);
@@ -8380,7 +8383,10 @@ window.createNoteDetector.setDefaultSuppressed = function (suppressed) {
         const def = window.noteDetect;
         if (def && typeof def.isEnabled === 'function' && def.isEnabled()
             && typeof def.disable === 'function') {
-            try { def.disable(); } catch (_) { /* best-effort */ }
+            // SILENT — the host is only taking over detection, not ending a song. A
+            // plain disable() would pop the end-of-song summary modal + emit
+            // notedetect:session once the singleton has a few judgments.
+            try { def.disable({ silent: true }); } catch (_) { /* best-effort */ }
         }
     }
 };
