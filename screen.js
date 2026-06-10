@@ -1509,12 +1509,61 @@ function createNoteDetector(options = {}) {
     if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
     if (chordTimingHitThreshold > timingTolerance)    chordTimingHitThreshold = timingTolerance;
 
-    // opts.channel overrides the persisted channel for this instance
-    // (used by splitscreen to force left/right per panel).
-    if (opts.channel !== undefined && opts.channel !== null) {
-        if (opts.channel === 0) selectedChannel = 'left';
-        else if (opts.channel === 1) selectedChannel = 'right';
-        else if (opts.channel === -1) selectedChannel = 'mono';
+    // Engine input channel index for the DESKTOP source path (-1 = mono mix of the
+    // first pair, else 0-based). Source of truth for addSource/setSourceInputChannel
+    // and supports channels beyond L/R (a multi-channel interface, or a PipeWire
+    // combine of two interfaces). `selectedChannel` (the string above) stays what
+    // the 2-channel browser splitter uses; the two are kept in sync for the values
+    // the splitter can represent (-1/0/1).
+    let _ndChannelIndex = selectedChannel === 'left' ? 0
+        : selectedChannel === 'right' ? 1 : -1;
+
+    // Phase 2: which engine input DEVICE this instance's source captures from.
+    // 0 = primary input device (the only one on the single-device path); 1..N =
+    // an ADDITIONAL device the host (splitscreen) bound via bindInputDevice, so
+    // two separate interfaces each feed their own panel. Fixed at addSource time
+    // (a source's device can't change live — re-add to move it). Desktop-only.
+    let _ndDeviceKey = 0;
+    if (typeof opts.deviceKey === 'number' && Number.isInteger(opts.deviceKey) && opts.deviceKey >= 0)
+        _ndDeviceKey = opts.deviceKey;
+
+    // Phase 2: user-dialed capture-latency correction (milliseconds) for a source
+    // on an EXTRA input device — the residual offset between that device's path and
+    // the primary's, which can't be auto-measured reliably on JACK/PipeWire. The
+    // host (splitscreen) exposes a per-panel control that calls setVerifierOffset().
+    // Positive = scoring playhead later; negative = earlier. Applied to the bound
+    // source's engine verifier. No effect on the primary / browser path.
+    let _ndVerifierOffsetMs = 0;
+    if (typeof opts.verifierOffsetMs === 'number' && Number.isFinite(opts.verifierOffsetMs))
+        _ndVerifierOffsetMs = opts.verifierOffsetMs;
+    function _ndApplyVerifierOffset() {
+        const a = _ndBridgeAudio();
+        // Apply ONLY to a source WE allocated (_ndOwnsSource). Never source 0 (the
+        // shared legacy/default path), and never a borrowed opts.sourceId the detector
+        // doesn't own — mutating a shared/reused source would leak this panel's latency
+        // correction onto another consumer and skew its scoring.
+        if (_ndOwnsSource && sourceId != null && sourceId !== 0
+            && a && typeof a.setSourceVerifierOffset === 'function') {
+            try { a.setSourceVerifierOffset(sourceId, _ndVerifierOffsetMs / 1000); } catch (_) { /* best-effort */ }
+        }
+    }
+
+    // opts.channel overrides the persisted channel for this instance (used by
+    // splitscreen to bind each panel to a distinct input channel). Accepts -1/0/1
+    // (mono/left/right). Channel >= 2 (multi-channel selection) is DEFERRED — see
+    // setChannel() — so clamp it to mono rather than store an index the capture path
+    // may not honor (which would also export stale selectedChannel metadata).
+    if (typeof opts.channel === 'number' && Number.isInteger(opts.channel) && opts.channel >= -1) {
+        if (opts.channel >= 2) {
+            console.warn(`[note_detect] opts.channel ${opts.channel} (multi-channel selection) is not yet supported; using mono.`);
+            _ndChannelIndex = -1;
+            selectedChannel = 'mono';
+        } else {
+            _ndChannelIndex = opts.channel;
+            if (opts.channel === 0) selectedChannel = 'left';
+            else if (opts.channel === 1) selectedChannel = 'right';
+            else selectedChannel = 'mono';  // -1
+        }
     }
 
     // Audio metering
@@ -2218,9 +2267,7 @@ function createNoteDetector(options = {}) {
                         if (_ndWantOwnSource && sourceId == null
                             && typeof desktop.audio.addSource === 'function') {
                             try {
-                                const chIdx = selectedChannel === 'left' ? 0
-                                    : selectedChannel === 'right' ? 1 : -1;
-                                const id = await desktop.audio.addSource(chIdx);
+                                const id = await desktop.audio.addSource(_ndChannelIndex, _ndDeviceKey);
                                 if (typeof id === 'number' && id >= 0) {
                                     sourceId = id;
                                     _ndOwnsSource = true;
@@ -2234,11 +2281,12 @@ function createNoteDetector(options = {}) {
                         if (_ndOwnsSource && sourceId != null
                             && typeof desktop.audio.setSourceInputChannel === 'function') {
                             try {
-                                const chIdx = selectedChannel === 'left' ? 0
-                                    : selectedChannel === 'right' ? 1 : -1;
-                                desktop.audio.setSourceInputChannel(sourceId, chIdx);
+                                desktop.audio.setSourceInputChannel(sourceId, _ndChannelIndex);
                             } catch (_) { /* best-effort */ }
                         }
+                        // Apply the user-dialed capture-latency correction to the
+                        // bound source (no-op at 0 / for source 0).
+                        if (sourceId != null) _ndApplyVerifierOffset();
                     } else if (sourceId != null) {
                         // This addon can't score per source (downlevel, or — in
                         // theory — downgraded since a prior enable bound us). Don't
@@ -2771,7 +2819,33 @@ function createNoteDetector(options = {}) {
             if (!enabled || !usingDesktopBridge || levelsInFlight) return;
             levelsInFlight = true;
             try {
-                const levels = await desktop.audio.getLevels();
+                // A BOUND source (multi-input panel) must gate on ITS OWN device's
+                // level — not the global/primary level. Otherwise the silence gate
+                // (which can force a detected note to a miss when its level window
+                // looks silent) reads the primary device, which is silent while the
+                // user plays a DIFFERENT bound interface, and force-fails every hit.
+                let levels;
+                if (sourceId != null && sourceId !== 0) {
+                    // A NON-DEFAULT (owned / extra-device) source must gate on ITS OWN
+                    // meter. If the addon is too old to expose getSourceLevels, do NOT
+                    // fall back to the global getLevels() — that reads the primary
+                    // device, which is silent while the user plays this interface, so
+                    // the silence gate would force EVERY note on it to a miss. Skip the
+                    // poll instead (the gate then has no data and never force-fails).
+                    if (typeof desktop.audio.getSourceLevels !== 'function') {
+                        // Older addon: can't read THIS source's level. Latch
+                        // unavailable so the sustain-glow fixed-fallback engages (and
+                        // we don't gate on the wrong meter). DROP any level history from
+                        // a prior metered session so the silence gate sees "no data"
+                        // rather than force-failing on the previous source's levels.
+                        bridgeLevelsUnavailable = true;
+                        _ndLevelSamples.length = 0;
+                        return;
+                    }
+                    levels = await desktop.audio.getSourceLevels(sourceId);
+                } else {
+                    levels = await desktop.audio.getLevels();
+                }
                 // Re-check after the await: disable()/destroy() can fire
                 // between the IPC round-trip and the resolve, and the
                 // bridge timer doesn't track sessionGen the way the
@@ -4741,9 +4815,13 @@ function createNoteDetector(options = {}) {
     }
 
     function onChannelChange(channel) {
-        selectedChannel = channel;
-        saveSettings();
-        restartAudio();
+        // Route through setChannel() so a bound engine source (desktop multi-input)
+        // is RE-TARGETED to the new channel, not just the browser splitter. Updating
+        // only selectedChannel here left _ndChannelIndex — which all desktop source
+        // routing uses — stale, so the bound source kept its old channel. The built-in
+        // dropdown offers left/right/mono only, which map to indices 0/1/-1.
+        const idx = channel === 'left' ? 0 : channel === 'right' ? 1 : -1;
+        setChannel(idx);  // updates _ndChannelIndex + selectedChannel, retargets the source, saves, restarts
     }
 
     async function populateDevices() {
@@ -4786,32 +4864,56 @@ function createNoteDetector(options = {}) {
     // anything else so upstream bugs (stringified input, out-of-range
     // index) surface instead of silently coercing to mono.
     function setChannel(idx) {
-        let next;
-        if (idx === -1) next = 'mono';
-        else if (idx === 0) next = 'left';
-        else if (idx === 1) next = 'right';
-        else {
-            console.warn(`[note_detect] setChannel: invalid channel ${idx}; expected -1 (mono), 0 (left), or 1 (right).`);
+        if (!Number.isInteger(idx) || idx < -1) {
+            console.warn(`[note_detect] setChannel: invalid channel ${idx}; expected an integer >= -1 (-1 = mono mix, else 0-based input channel).`);
             return false;
         }
-        selectedChannel = next;
+        // Multichannel channel selection (index >= 2) is DEFERRED. It is only valid on
+        // the desktop engine-SOURCE path, but at any given moment this detector may
+        // instead run the browser getUserMedia splitter (borrowing mode, or a desktop
+        // build where the native bridge is unavailable), which captures only channels
+        // 0/1 — accepting >=2 there silently captures the wrong input and exports stale
+        // metadata. The validated multi-device flow binds ONE device per panel and uses
+        // mono/left/right; selecting channel 3+ of a single multi-channel interface
+        // needs runtime, capture-mode-aware gating (a follow-up). Reject for now so the
+        // two channel representations (_ndChannelIndex + selectedChannel) never diverge.
+        if (idx >= 2) {
+            console.warn(`[note_detect] setChannel: channel ${idx} (multi-channel selection) is not yet supported; use a separate input device per panel.`);
+            return false;
+        }
+        _ndChannelIndex = idx;
+        // selectedChannel (serialized into session/diagnostic metadata) stays in sync —
+        // only -1/0/1 are reachable now, so it never goes stale.
+        if (idx === -1) selectedChannel = 'mono';
+        else if (idx === 0) selectedChannel = 'left';
+        else selectedChannel = 'right';  // idx === 1
         saveSettings();
-        // For a bound engine source (desktop multi-input), retarget the source's
-        // input channel directly: restartAudio() below rebuilds only the browser
-        // getUserMedia graph, not the live engine source binding. Derive the channel
-        // from `next` (the normalized selection) — the same source of truth the
-        // enable-time reapply uses — not the raw idx. No-op on the browser path
-        // (sourceId == null) or a downlevel addon.
-        if (sourceId != null) {
+        // Retarget the bound engine source's input channel directly — restartAudio()
+        // below only rebuilds the browser getUserMedia graph, not the live engine
+        // binding. Applies to THIS detector's source whether we allocated it
+        // (_ndOwnsSource) or it was caller-assigned (opts.sourceId): the channel is
+        // what this detector listens to, so it must follow. (Only the per-panel verifier
+        // OFFSET stays owned-only, since that tweak shouldn't leak onto a shared source.)
+        // Never source 0 (the shared default). No-op on the browser path.
+        if (sourceId != null && sourceId !== 0) {
             const a = bridgeDesktop && bridgeDesktop.audio;
             if (a && typeof a.setSourceInputChannel === 'function') {
-                const chIdx = next === 'left' ? 0 : next === 'right' ? 1 : -1;
-                try { a.setSourceInputChannel(sourceId, chIdx); } catch (_) { /* best-effort */ }
+                try { a.setSourceInputChannel(sourceId, _ndChannelIndex); } catch (_) { /* best-effort */ }
             }
         }
         restartAudio();
         return true;
     }
+
+    // Set the per-source capture-latency correction (milliseconds) and apply it
+    // live to the bound engine source. The host (splitscreen) calls this from a
+    // per-panel control so the user can dial in an extra device's timing.
+    function setVerifierOffset(ms) {
+        if (typeof ms !== 'number' || !Number.isFinite(ms)) return;
+        _ndVerifierOffsetMs = ms;
+        _ndApplyVerifierOffset();
+    }
+    function getVerifierOffset() { return _ndVerifierOffsetMs; }
 
     // ── HUD ───────────────────────────────────────────────────────────
     function createHUD() {
@@ -6020,6 +6122,10 @@ function createNoteDetector(options = {}) {
     // the user turned Detect off (wantsDetect false) or it's already on.
     function _reArmOnSongLoaded() {
         if (!isDefault) return;
+        // While split mode owns detection (its panels score per-input), the main-
+        // player singleton must stay off — otherwise it re-arms here on every song
+        // load and renders a second HUD on top of P1. Splitscreen sets this flag.
+        if (typeof window !== 'undefined' && window.__ndSuppressDefault) return;
         if (enabled) return;
         if (!detectPreference) return;
         enable().catch((e) => {
@@ -6283,6 +6389,26 @@ function createNoteDetector(options = {}) {
         // loop stays in force). startAudio() has already established
         // usingDesktopBridge / bridgeDesktop by this point.
         await _ndPushChartToBridge();
+
+        // Phase 2 warm-up grace: a source on an ADDITIONAL input device starts
+        // COLD — its interface only began streaming when the user bound it
+        // (seconds ago), so the stream + detection settle over the first couple
+        // seconds. The PRIMARY device has been streaming since launch, so it's
+        // already warm and accurate from the first note. Without this, the extra
+        // device's cold-start would be scored as misses that permanently drag the
+        // cumulative accuracy ("missed the start, never catches up"). Wipe that
+        // one cold-start window so the displayed score reflects steady state.
+        // Guarded by sessionGen so a disable/re-enable cancels a pending reset. Gate
+        // on actually OWNING a non-default source — not just the requested deviceKey —
+        // so that if the extra-device bind failed and we fell back to source 0 (a
+        // primary input that's already warm), we DON'T wipe the first valid seconds of
+        // that fallback's hits and make the degraded path look broken.
+        if (_ndDeviceKey > 0 && _ndOwnsSource && sourceId != null && sourceId !== 0) {
+            const warmGen = sessionGen;
+            setTimeout(() => {
+                if (enabled && warmGen === sessionGen) resetScoring();
+            }, 2500);
+        }
 
         // Per-instance GC of noteResults — previously a module-level
         // setInterval; moving it into the closure lets each instance
@@ -7796,6 +7922,8 @@ function createNoteDetector(options = {}) {
             };
         },
         setChannel,
+        setVerifierOffset,
+        getVerifierOffset,
         injectButton,
         showSummary,
         // Diagnostic export (#254 follow-up). `downloadDiagnostic()`
@@ -8107,6 +8235,7 @@ function createNoteDetector(options = {}) {
             // have flipped detectPreference to false during the
             // timeout — in that case we'd be honouring a stale-by-now
             // preference and enabling against the user's wishes.
+            if (typeof window !== 'undefined' && window.__ndSuppressDefault) return;
             if (!enabled && detectPreference) enable().catch((e) => {
                 console.warn('[note_detect] auto-enable failed:', e && e.message ? e.message : e);
             });
@@ -8196,6 +8325,10 @@ function _ndInstallPlaySongHook() {
         // window.noteDetect.
         const def = window.noteDetect;
         if (def
+            // Respect split mode's suppression of the default singleton — otherwise a
+            // song switch re-arms the main detector on top of panel 1 (the same flag
+            // honored by the song:loaded re-arm + construct auto-enable).
+            && !(typeof window !== 'undefined' && window.__ndSuppressDefault)
             && typeof def.wantsDetect === 'function' && def.wantsDetect()
             && !def.isEnabled()) {
             // Fire-and-forget — enable() awaits getUserMedia which we
@@ -8228,6 +8361,29 @@ const _ndExistingDefault = (window.noteDetect && typeof window.noteDetect.inject
 const _ndDefaultInstance = _ndExistingDefault || createNoteDetector({ isDefault: true });
 window.noteDetect = _ndDefaultInstance;
 window.createNoteDetector = createNoteDetector;
+
+// A host that mounts its own per-panel detectors (e.g. split-screen) calls this to
+// SUPPRESS the default singleton while it owns detection — without it the singleton's
+// construct auto-enable / song:loaded re-arm / playSong re-arm would render a second
+// HUD + mic capture on top of the host's first panel. The internal guards read
+// window.__ndSuppressDefault; centralizing the assignment behind this setter keeps the
+// whole mechanism owned by, and complete within, this plugin.
+window.createNoteDetector.setDefaultSuppressed = function (suppressed) {
+    if (typeof window === 'undefined') return;
+    window.__ndSuppressDefault = !!suppressed;
+    // Flipping the guard only blocks FUTURE auto-enables/re-arms. If the singleton is
+    // already running when the host takes over, tear that session down now too —
+    // otherwise its live HUD + mic capture is exactly the duplicate state this is meant
+    // to prevent. (The host captures wantsDetect()/isEnabled() first if it needs to
+    // restore the singleton later.)
+    if (suppressed) {
+        const def = window.noteDetect;
+        if (def && typeof def.isEnabled === 'function' && def.isEnabled()
+            && typeof def.disable === 'function') {
+            try { def.disable(); } catch (_) { /* best-effort */ }
+        }
+    }
+};
 
 _ndInstallPlaySongHook();
 // Only inject on first evaluation — re-injecting on a subsequent load
