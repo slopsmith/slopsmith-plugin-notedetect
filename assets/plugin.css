@@ -65,8 +65,18 @@
     --nd-glow-current: 0 0 8px currentColor;
     --nd-radius: 10px;
     --nd-clip: none;
-    --nd-edge: none;               /* optional accent edge (esports)        */
-    --nd-bevel: 0 0 0 1px var(--nd-frame), 0 0 18px rgba(0, 240, 255, 0.22);
+    /* Animated glow ring — a conic-gradient border that sweeps around the
+       panel (rotation driven by the registered --nd-ring-angle property),
+       drawn twice: a sharp ring plus a blurred duplicate for the glow.
+       Skins theme the gradient stops, ring width, speed, and glow
+       strength; --nd-ring-animation: none freezes it to a static ring. */
+    --nd-ring-w: 2px;
+    --nd-ring-overhang: 3px;
+    --nd-ring-stops: #00f0ff, #7a4dff 25%, #ff2ec4 50%, #7a4dff 75%, #00f0ff;
+    --nd-ring-glow-blur: 10px;
+    --nd-ring-glow-opacity: 0.8;
+    --nd-ring-animation: nd-ring-spin 4s linear infinite;
+    --nd-bevel: 0 0 22px rgba(0, 240, 255, 0.14);
     --nd-texture: none;            /* optional panel texture (metal)        */
 }
 
@@ -86,9 +96,18 @@
     --nd-glow-accent: none;
     --nd-glow-current: none;
     --nd-radius: 0;
-    --nd-clip: polygon(0 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);
-    --nd-edge: 2px solid #e8b43a;
-    --nd-bevel: inset 0 0 0 1px rgba(232, 180, 58, 0.35);
+    --nd-clip: none;
+    /* Restrained sweep: a dim amber track with one bright comet segment
+       orbiting slowly. */
+    --nd-ring-w: 1px;
+    --nd-ring-overhang: 3px;
+    --nd-ring-stops: rgba(232, 180, 58, 0.22) 0deg,
+        rgba(232, 180, 58, 0.22) 290deg, #ffd372 322deg, #e8b43a 332deg,
+        rgba(232, 180, 58, 0.22) 352deg;
+    --nd-ring-glow-blur: 7px;
+    --nd-ring-glow-opacity: 0.55;
+    --nd-ring-animation: nd-ring-spin 7s linear infinite;
+    --nd-bevel: none;
     --nd-texture: none;
 }
 
@@ -110,7 +129,14 @@
     --nd-glow-current: 0 1px 0 rgba(0, 0, 0, 0.85);
     --nd-radius: 6px;
     --nd-clip: none;
-    --nd-edge: none;
+    /* Ember pulse: the steel bevel stays; an amber ring breathes instead
+       of rotating (nd-ring-pulse animates opacity, not the angle). */
+    --nd-ring-w: 2px;
+    --nd-ring-overhang: 2px;
+    --nd-ring-stops: #ffb347, #ff6b35 30%, #8a3c1a 50%, #ff6b35 70%, #ffb347;
+    --nd-ring-glow-blur: 8px;
+    --nd-ring-glow-opacity: 0.5;
+    --nd-ring-animation: nd-ring-pulse 2.8s ease-in-out infinite alternate;
     --nd-bevel: inset 0 1px 0 rgba(255, 255, 255, 0.14),
                 inset 0 -2px 5px rgba(0, 0, 0, 0.65),
                 0 0 0 1px #14161a,
@@ -139,9 +165,78 @@
     background-color: var(--nd-bg);
     background-image: var(--nd-texture);
     border-radius: var(--nd-radius);
-    border-left: var(--nd-edge);
     box-shadow: var(--nd-bevel);
     clip-path: var(--nd-clip);
+}
+
+/* v0.3.0 (fee[dB]ack v3) chrome — detected by its persistent Up-Next
+   pill, which only exists in the v3 player markup: tuck the HUD under
+   the pill stack and right-align with it. The pill's bottom lands at
+   ≈81px (#player-hud py-4 16 + time row 20 + gap 8 + pill ~37), and the
+   glow ring extends --nd-ring-overhang past the panel box on every
+   side, so both offsets compensate for the ring: the panel sits at 6rem
+   (sharp ring edge ≈93px → ~12px clear of the pill, the soft blur
+   fading inside that gap) and the ring's outer edge — the visual edge —
+   lines up with the pill's right inset. The legacy player keeps the
+   original spot above. */
+body:has(#v3-upnext) .nd-hud {
+    top: 7rem;
+    right: calc(1.25rem + var(--nd-ring-overhang));
+}
+
+/* ── Animated glow ring ───────────────────────────────────────────────
+   The registered custom property makes --nd-ring-angle interpolable, so
+   the conic gradient's start angle can be animated — the sweep orbits
+   the panel. (Without @property support the ring still renders, just
+   static.) The ring shape is the classic padding+mask trick: paint the
+   gradient over the whole box, then mask everything except the padding
+   band so only a --nd-ring-w-thick outline remains. Two layers per
+   panel: ::after (or .nd-sum-frame::after) is the sharp ring, ::before
+   the blurred glow copy. The HUD hosts its own pseudos; the results
+   panel scrolls, so its layers hang off the dedicated .nd-sum-frame
+   anchor inside the non-scrolling .nd-sum-shell wrapper. */
+@property --nd-ring-angle {
+    syntax: '<angle>';
+    inherits: false;
+    initial-value: 0deg;
+}
+
+.nd-sum-frame {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+}
+
+.nd-hud::before,
+.nd-hud::after,
+.nd-sum-frame::before,
+.nd-sum-frame::after {
+    content: '';
+    position: absolute;
+    inset: calc(-1 * var(--nd-ring-overhang));
+    border-radius: calc(var(--nd-radius) + 2px);
+    padding: var(--nd-ring-w);
+    background: conic-gradient(from var(--nd-ring-angle), var(--nd-ring-stops));
+    -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+    pointer-events: none;
+    animation: var(--nd-ring-animation);
+}
+
+.nd-hud::before,
+.nd-sum-frame::before {
+    filter: blur(var(--nd-ring-glow-blur));
+    opacity: var(--nd-ring-glow-opacity);
+}
+
+@keyframes nd-ring-spin {
+    to { --nd-ring-angle: 360deg; }
+}
+@keyframes nd-ring-pulse {
+    from { opacity: 0.3; }
+    to   { opacity: 0.85; }
 }
 
 .nd-hud-score {
@@ -278,6 +373,13 @@
     color: var(--nd-text);
 }
 
+/* Anchor for the frame overlay; the panel inside it scrolls, the frame
+   doesn't. */
+.nd-sum-shell {
+    position: relative;
+    max-width: 92vw;
+}
+
 .nd-sum-panel {
     width: 26rem;
     max-width: 92vw;
@@ -287,9 +389,18 @@
     background-color: var(--nd-bg);
     background-image: var(--nd-texture);
     border-radius: var(--nd-radius);
-    border-left: var(--nd-edge);
     box-shadow: var(--nd-bevel);
     clip-path: var(--nd-clip);
+}
+
+/* Accent hairline under the header — fades out toward both edges. */
+.nd-sum-header::after {
+    content: '';
+    display: block;
+    height: 2px;
+    margin-top: 0.35rem;
+    background: linear-gradient(90deg, transparent, var(--nd-accent), transparent);
+    opacity: 0.65;
 }
 
 .nd-sum-header {
@@ -533,6 +644,13 @@
     }
     .nd-sum-bar-fill {
         width: var(--nd-bar-w, 0%);
+        animation: none;
+    }
+    /* Glow rings freeze to a static colored border. */
+    .nd-hud::before,
+    .nd-hud::after,
+    .nd-sum-frame::before,
+    .nd-sum-frame::after {
         animation: none;
     }
 }

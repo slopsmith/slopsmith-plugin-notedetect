@@ -280,7 +280,7 @@ const _ND_AUTO_ENABLE_RETRY_MS = 1500;
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.14.0';
+const _ND_VERSION = '1.15.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -13817,7 +13817,11 @@ function createNoteDetector(options = {}) {
         try { overlay.setAttribute('data-nd-skin', _ndLoadSkin()); } catch (e) {}
         overlay.style.pointerEvents = 'auto';
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+        // .nd-sum-shell wraps the (scrollable) panel so the hand-drawn frame
+        // overlay (.nd-sum-frame) can sit absolutely over the panel's edges
+        // without scrolling with the content.
         overlay.innerHTML = `
+            <div class="nd-sum-shell">
             <div class="nd-sum-panel">
                 <div class="nd-sum-header">Song Complete</div>
                 <div class="nd-sum-grade-wrap">
@@ -13852,6 +13856,8 @@ function createNoteDetector(options = {}) {
                         Close
                     </button>
                 </div>
+            </div>
+            <div class="nd-sum-frame"></div>
             </div>
         `;
         const closeBtn = overlay.querySelector('.nd-summary-close');
