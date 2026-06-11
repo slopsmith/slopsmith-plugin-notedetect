@@ -49,6 +49,24 @@
         </p>
     </div>
 
+    <!-- Scoring HUD skin. Themes the live score/streak HUD (and the
+         highway's score FX palette; the end-of-song results screen joins
+         in the results-screen redesign). Stored under the standalone
+         'slopsmith_notedetect_skin' key so the highway renderer can read
+         it without parsing the settings blob. -->
+    <div class="bg-dark-700/40 border border-gray-800 rounded-xl p-4 mb-4">
+        <label class="block text-sm font-semibold text-gray-300 mb-1" for="nd-skin">Scoring HUD style</label>
+        <p class="text-[11px] text-gray-500 leading-relaxed mb-2">
+            Look of the live score/streak HUD. Applies immediately, mid-song included.
+        </p>
+        <select id="nd-skin"
+                class="w-full bg-dark-700 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 focus:ring-accent/40 focus:border-accent">
+            <option value="neon">Neon arcade — glowing rhythm-game look</option>
+            <option value="esports">Esports minimal — clean angled frames, single accent</option>
+            <option value="metal">Rock / metal — brushed steel, stencil type</option>
+        </select>
+    </div>
+
     <!-- Auto-record toggle. A normal user setting (not advanced): every
          play is captured to static/note_detect_recordings/ for later
          analysis. Off by default; opt in here. Persisted via the plugin's
@@ -721,6 +739,15 @@
         if (autoCalCb && autoCalCb.checked !== autoCal) autoCalCb.checked = autoCal;
         if (autoCalCb) autoCalCb.disabled = !nd;
 
+        // Scoring HUD skin select — value sourced from the plugin so it
+        // stays in sync if another surface (or another tab) switched it.
+        const skinSel2 = _q('nd-skin');
+        if (skinSel2) {
+            const skin = (nd && typeof nd.getSkin === 'function') ? nd.getSkin() : 'neon';
+            if (skinSel2.value !== skin) skinSel2.value = skin;
+            skinSel2.disabled = !nd;
+        }
+
         const tuning = !!(nd && typeof nd.isTuningMode === 'function' && nd.isTuningMode());
         const cb     = _q('nd-tuning-mode');
         const panels = _q('nd-tuning-panels');
@@ -890,6 +917,16 @@
         autoCalCb.onchange = () => {
             const nd = window.noteDetect;
             if (nd && typeof nd.setAutoCalibrate === 'function') nd.setAutoCalibrate(autoCalCb.checked);
+        };
+    }
+
+    // Scoring HUD skin — themes the live HUD + results screen (and the
+    // highway's FX palette). setSkin live-applies to every open root.
+    const skinSel = _q('nd-skin');
+    if (skinSel) {
+        skinSel.onchange = () => {
+            const nd = window.noteDetect;
+            if (nd && typeof nd.setSkin === 'function') nd.setSkin(skinSel.value);
         };
     }
 
