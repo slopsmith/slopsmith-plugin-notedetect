@@ -1716,6 +1716,11 @@ function createNoteDetector(options = {}) {
     let _calDetections = [];
     const _CAL_MAX = 8000;          // ~ caps memory on a long take
     let _calDoneThisPlay = false;   // calibrate at most once per play
+    // True between a song:pause and the next song:play, so song:play can tell
+    // a resume (keep the take's detections) from a fresh start (reset them).
+    // Without this, a replay or a stop-without-song:ended would sweep stale
+    // detections from the previous play.
+    let _calPaused = false;
     let _lastAvCalibration = null;  // { offsetMs, matched, total } for the UI
     const _diagPitchErrors  = [];   // cents,        sign = positive sharp / negative flat
     // Per-judgment event capture for the downloadable JSON. Capped at a
@@ -2489,6 +2494,11 @@ function createNoteDetector(options = {}) {
                                         && lp.confidence > detectionConfidenceMin) {
                                         detectedMidi = lp.midiNote;
                                         detectedConfidence = lp.confidence;
+                                        // This branch returns before matchNotes(),
+                                        // so log the calibration detection here or
+                                        // auto-calibrate would never see a sample
+                                        // under the engine verifier (dets stays 0).
+                                        _calLogDetection();
                                     } else {
                                         detectedMidi = -1;
                                         detectedConfidence = 0;
@@ -3738,13 +3748,10 @@ function createNoteDetector(options = {}) {
     async function matchNotes(frameBuffer) {
         const avOffsetSec = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
         const t = hw.getTime() + avOffsetSec - latencyOffset;
-        // A/V auto-calibration tap: log the detection offset-free (everything
-        // except av-offset) so a post-play sweep can re-match at any candidate
-        // offset. Gated on the setting + the default singleton so split panels
-        // and disabled-setting users don't accumulate.
-        if (autoCalibrate && isDefault && detectedMidi >= 0 && _calDetections.length < _CAL_MAX) {
-            _calDetections.push({ bt: hw.getTime() - latencyOffset, m: detectedMidi });
-        }
+        // A/V auto-calibration tap (browser + desktop-yin/ml paths). The
+        // engine-verifier path returns before matchNotes(), so it taps
+        // _calLogDetection() directly — see the poll loop.
+        _calLogDetection();
         // Don't bail on detectedMidi < 0 here — chord scoring uses the
         // raw audio buffer and doesn't need a confident monophonic pitch.
         // The single-note path below is gated on detectedMidi >= 0 and
@@ -7806,14 +7813,33 @@ function createNoteDetector(options = {}) {
     // ── A/V auto-calibrate lifecycle ──────────────────────────────────
     // On song-end, sweep the play's offset-free detections for the av-offset
     // that maximizes matched notes and apply it. At most once per play; the
-    // detection log + the once-guard reset on song:loaded. Bound from
-    // enableImpl() / unbound in disable()+destroy(), so the audio-less vm
-    // tests never register these listeners (keeps listener-count contracts).
+    // detection log + the once-guard reset on song:loaded AND on a fresh
+    // song:play (so a replay or a stop-without-song:ended re-calibrates rather
+    // than reusing the prior take), while a resume after song:pause keeps the
+    // take. Bound from enableImpl() / unbound in disable()+destroy(), so the
+    // audio-less vm tests never register these listeners (listener contracts).
     // Returns a short reason string (for the test/debug hook); the listeners
     // ignore it. The success path sets _lastAvCalibration + applies the offset.
+    // Log one offset-free detection ({ bt: hw.getTime()-latencyOffset, m })
+    // for the post-play sweep. Gated on the setting + the default singleton
+    // (split panels / disabled-setting users don't accumulate) and a confident
+    // pitch. Shared by matchNotes() and the engine-verifier poll, which returns
+    // before matchNotes() and so must tap this directly.
+    function _calLogDetection() {
+        if (autoCalibrate && isDefault && detectedMidi >= 0 && _calDetections.length < _CAL_MAX) {
+            _calDetections.push({ bt: hw.getTime() - latencyOffset, m: detectedMidi });
+        }
+    }
     function _ndRunAutoCalibrate() {
         if (!autoCalibrate) return 'autoCalibrate off';
         if (!isDefault) return 'not default';
+        // The cal listeners deliberately survive disable() (the host disables
+        // detection at song-end, sometimes before song:ended fires), so guard
+        // against a USER-initiated Detect-off here: detectPreference stays true
+        // across a host disable() but flips false when the user turns Detect
+        // off. Without this a late song:ended could move the global A/V offset
+        // from a half-finished take after the user switched detection off.
+        if (!detectPreference) return 'detect off (user)';
         if (_calDoneThisPlay) return 'already done this play';
         if (typeof window.setAvOffsetMs !== 'function') return 'no window.setAvOffsetMs';
         const notes = (hw && hw.getNotes) ? hw.getNotes() : null;
@@ -7832,17 +7858,33 @@ function createNoteDetector(options = {}) {
         } catch (e) { return 'setAvOffsetMs threw: ' + (e && e.message || e); }
         return 'OK ' + JSON.stringify(r);
     }
-    let _calOnLoaded = null, _calOnEnded = null, _calOnPause = null, _calSubscribed = false;
+    let _calOnLoaded = null, _calOnEnded = null, _calOnPause = null, _calOnPlay = null, _calSubscribed = false;
     function _calBindEvents() {
         if (!isDefault || _calSubscribed) return;
         if (!window.slopsmith || typeof window.slopsmith.on !== 'function') return;
-        _calOnLoaded = () => { _calDetections = []; _calDoneThisPlay = false; _lastAvCalibration = null; };
-        _calOnEnded  = () => { _ndRunAutoCalibrate(); };
-        // Also fire on pause — the host may end a take via pause (or stop)
-        // rather than a clean song:ended; once-per-play guards re-runs.
-        _calOnPause  = () => { _ndRunAutoCalibrate(); };
+        // New song → clean slate (incl. the UI's last-result display).
+        _calOnLoaded = () => {
+            _calDetections = []; _calDoneThisPlay = false; _lastAvCalibration = null; _calPaused = false;
+        };
+        // song:play is either a fresh take or a resume after a pause. On a fresh
+        // start, reset the take so a replay — or a stop that emitted no
+        // song:ended — doesn't sweep the previous play's detections, and so the
+        // once-per-play guard re-opens for the new take. On a resume, keep them.
+        _calOnPlay = () => {
+            if (_calPaused) { _calPaused = false; return; }   // resume — keep the take
+            _calDetections = []; _calDoneThisPlay = false;
+        };
+        // Pause is resumable: just remember we're paused. Do NOT calibrate here —
+        // a mid-song pause would lock in a partial-take offset and the
+        // once-per-play guard would then suppress the real song:ended sweep
+        // after the user resumes.
+        _calOnPause = () => { _calPaused = true; };
+        // Clean end of the take → sweep once. Clear _calPaused so a replay reads
+        // as a fresh start (resets) rather than a resume.
+        _calOnEnded = () => { _ndRunAutoCalibrate(); _calPaused = false; };
         try {
             window.slopsmith.on('song:loaded', _calOnLoaded);
+            window.slopsmith.on('song:play',   _calOnPlay);
             window.slopsmith.on('song:ended',  _calOnEnded);
             window.slopsmith.on('song:pause',  _calOnPause);
             _calSubscribed = true;
@@ -7851,10 +7893,11 @@ function createNoteDetector(options = {}) {
     function _calUnbindEvents() {
         if (window.slopsmith && typeof window.slopsmith.off === 'function') {
             if (_calOnLoaded) { try { window.slopsmith.off('song:loaded', _calOnLoaded); } catch (_) {} }
+            if (_calOnPlay)   { try { window.slopsmith.off('song:play',   _calOnPlay); } catch (_) {} }
             if (_calOnEnded)  { try { window.slopsmith.off('song:ended',  _calOnEnded); } catch (_) {} }
             if (_calOnPause)  { try { window.slopsmith.off('song:pause',  _calOnPause); } catch (_) {} }
         }
-        _calOnLoaded = _calOnEnded = _calOnPause = null;
+        _calOnLoaded = _calOnPlay = _calOnEnded = _calOnPause = null;
         _calSubscribed = false;
     }
 
@@ -8331,6 +8374,13 @@ function createNoteDetector(options = {}) {
         _calDebug: () => ({ detections: _calDetections.length, subscribed: _calSubscribed, autoCalibrate, isDefault, notes: (hw && hw.getNotes) ? (hw.getNotes() || []).length : -1 }),
         _calDetectionsDump: () => _calDetections.slice(),
         _runAutoCalibrate: () => _ndRunAutoCalibrate(),
+        // Lifecycle-test hooks: inspect/seed the calibration take without the
+        // audio pipeline, so the song:play/pause/loaded reset+resume rules are
+        // assertable. Production never calls these.
+        _calState: () => ({ detections: _calDetections.length, done: _calDoneThisPlay, paused: _calPaused }),
+        _calSeedForTest: (n = 5) => { for (let i = 0; i < n; i++) _calDetections.push({ bt: i, m: 40 }); },
+        _bindCalEvents: _calBindEvents,
+        _unbindCalEvents: _calUnbindEvents,
         // Test hook: run the offset sweep on a supplied detection log + notes
         // without the audio pipeline. Production calls _ndRunAutoCalibrate().
         _calibrateOffsetMs: (dets, notes, geom, winS, tolC, opts) =>

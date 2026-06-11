@@ -59,3 +59,76 @@ test('returns null without enough evidence', () => {
     const r = core.calibrateOffsetMs([{ bt: 1, m: 38 }], [{ t: 1, s: 1, f: 5 }], bassGeom(), 0.1, 60, {});
     assert.equal(r, null);
 });
+
+// ── Lifecycle (reset / resume / once-per-play) ────────────────────────
+// The sweep above is pure; these cover the song-event wiring that feeds it:
+// a fresh play must reset the take (so a replay / stop-without-song:ended
+// re-calibrates), a resume after pause must KEEP it, and pause must not run
+// calibration (which would lock in a partial-take offset).
+
+test('lifecycle: fresh play resets the take; resume after pause keeps it', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindCalEvents();
+    det._calSeedForTest(5);
+    assert.equal(det._calState().detections, 5);
+    // pause → play is a RESUME: the take is preserved.
+    core.slopsmith._fire('song:pause', {});
+    assert.equal(det._calState().paused, true);
+    core.slopsmith._fire('song:play', {});
+    assert.equal(det._calState().paused, false);
+    assert.equal(det._calState().detections, 5, 'resume keeps the take');
+    // a play NOT preceded by a pause is a FRESH start: the take is reset.
+    core.slopsmith._fire('song:play', {});
+    assert.equal(det._calState().detections, 0, 'fresh play resets the take');
+    det.destroy();
+});
+
+test('lifecycle: pause does not calibrate or mark the take done', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindCalEvents();
+    det._calSeedForTest(5);
+    core.slopsmith._fire('song:pause', {});
+    const st = det._calState();
+    assert.equal(st.done, false, 'pause must not mark the take calibrated');
+    assert.equal(st.detections, 5, 'pause must not drop the take');
+    assert.equal(st.paused, true);
+    det.destroy();
+});
+
+test('lifecycle: song:loaded clears the take and the paused flag', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindCalEvents();
+    det._calSeedForTest(5);
+    core.slopsmith._fire('song:pause', {});
+    core.slopsmith._fire('song:loaded', { filename: 'x.psarc' });
+    const st = det._calState();
+    assert.equal(st.detections, 0);
+    assert.equal(st.done, false);
+    assert.equal(st.paused, false);
+    det.destroy();
+});
+
+test('lifecycle: binds loaded/play/ended/pause once; unbind removes all', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindCalEvents();
+    for (const ev of ['song:loaded', 'song:play', 'song:ended', 'song:pause'])
+        assert.equal(core.slopsmith._listenerCount(ev), 1, ev);
+    det._bindCalEvents(); // idempotent
+    assert.equal(core.slopsmith._listenerCount('song:play'), 1, 'still one after re-bind');
+    det._unbindCalEvents();
+    for (const ev of ['song:loaded', 'song:play', 'song:ended', 'song:pause'])
+        assert.equal(core.slopsmith._listenerCount(ev), 0, ev);
+    det.destroy();
+});
+
+test('lifecycle: non-default instance never binds calibrate listeners', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector(); // isDefault:false
+    det._bindCalEvents();
+    assert.equal(core.slopsmith._listenerCount('song:ended'), 0, 'splitscreen panel does not calibrate');
+    det.destroy();
+});

@@ -54,7 +54,7 @@ Click the gear icon when detection is active to access:
 
 On the **Settings → Note Detection** page (not the gear popover):
 
-- **Auto-record every play** — on by default. Each play with detection enabled is captured to a WAV in `static/note_detect_recordings/` (auto-saved on song-end or pause) so you can replay it through the headless harness or analyse it later — no manual arming. Turn off to stop saving recordings.
+- **Auto-record every play** — off by default. Turn it on to capture each play with detection enabled to a WAV in `static/note_detect_recordings/` (auto-saved on song-end or pause) so you can replay it through the headless harness or analyse it later — no manual arming.
 - **Auto-calibrate A/V offset** — on by default. After each play, the detections are swept for the audio/video offset that matches the most chart notes, and that offset is applied automatically — compensating the detector's real-time processing latency so you never hand-set the A/V slider. One play is usually enough to converge.
 
 Advanced (persisted setting, no dedicated control yet — set via `window.noteDetect.applySettings` / localStorage):
