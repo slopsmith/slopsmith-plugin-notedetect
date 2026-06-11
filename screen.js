@@ -217,7 +217,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.12.0';
+const _ND_VERSION = '1.13.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -514,6 +514,21 @@ function _ndMultiplierForStreak(streak) {
 // upper tier boundaries, then every full hundred.
 function _ndIsStreakMilestone(streak) {
     return streak === 25 || streak === 50 || (streak >= 100 && streak % 100 === 0);
+}
+
+// Scoring-UI skin. One global preference shared by every instance (and read
+// by the highway renderer for its FX palette), stored under a standalone
+// key so non-notedetect consumers don't have to parse the settings blob.
+const ND_SKINS = ['neon', 'esports', 'metal'];
+const ND_SKIN_STORAGE_KEY = 'slopsmith_notedetect_skin';
+
+function _ndLoadSkin() {
+    try {
+        const v = localStorage.getItem(ND_SKIN_STORAGE_KEY);
+        return ND_SKINS.indexOf(v) !== -1 ? v : 'neon';
+    } catch (e) {
+        return 'neon';
+    }
 }
 
 // Letter grade from accuracy percentage (0–100). Full combo is a separate
@@ -2317,12 +2332,22 @@ function createNoteDetector(options = {}) {
     // Visual-feedback tracking
     let lastHitCount = 0;
     let lastMissCount = 0;
+    // HUD animation state: eased score readout + last-seen multiplier tier /
+    // streak so the 33 ms tick can fire pop/shake/flash classes exactly on
+    // transitions instead of every frame.
+    let displayScore = 0;
+    let lastMultTier = 1;
+    let lastStreakVal = 0;
 
     // DOM refs
     const container = opts.container || document.getElementById('player');
     const instanceRoot = document.createElement('div');
     instanceRoot.className = 'nd-instance-root';
     instanceRoot.style.cssText = 'position:absolute;inset:0;pointer-events:none;';
+    // Skin attribute drives every nd-* component's CSS custom properties
+    // (assets/plugin.css). Stamped per instance — splitscreen panels stay
+    // independent of <body>-level state.
+    try { instanceRoot.setAttribute('data-nd-skin', _ndLoadSkin()); } catch (e) {}
     let detectBtn = null;
     let gearBtn = null;
 
@@ -5201,16 +5226,26 @@ function createNoteDetector(options = {}) {
     // ── HUD ───────────────────────────────────────────────────────────
     function createHUD() {
         if (instanceRoot.querySelector('.nd-hud')) return;
+        // Re-stamp the skin on (re)create — another instance (or the
+        // settings screen) may have switched it while this HUD was down.
+        try { instanceRoot.setAttribute('data-nd-skin', _ndLoadSkin()); } catch (e) {}
         const hud = document.createElement('div');
-        hud.className = 'nd-hud absolute top-3 right-16 z-[20] pointer-events-none text-right';
+        // All layout/typography lives in assets/plugin.css, themed by the
+        // instanceRoot's data-nd-skin attribute. Class names queried by
+        // updateHUD()/_drillRender() are load-bearing — keep them stable.
+        hud.className = 'nd-hud';
         hud.innerHTML = `
-            <div class="nd-hud-accuracy text-xl font-bold" style="text-shadow:0 0 8px currentColor"></div>
-            <div class="nd-hud-streak text-xs text-gray-400 mt-0.5"></div>
-            <div class="nd-hud-counts text-[10px] text-gray-600 mt-0.5"></div>
-            <div class="nd-hud-detected text-[10px] text-cyan-400 mt-1 font-mono"></div>
-            <div class="nd-drill mt-2 hidden text-right">
-                <div class="nd-drill-header text-[10px] text-amber-300 font-mono"></div>
-                <div class="nd-drill-list text-[10px] text-gray-500 font-mono leading-tight mt-0.5"></div>
+            <div class="nd-hud-score">0</div>
+            <div class="nd-hud-mainrow">
+                <span class="nd-hud-accuracy"></span>
+                <span class="nd-hud-mult" data-tier="1">×1</span>
+            </div>
+            <div class="nd-hud-streak"></div>
+            <div class="nd-hud-counts"></div>
+            <div class="nd-hud-detected"></div>
+            <div class="nd-drill hidden">
+                <div class="nd-drill-header"></div>
+                <div class="nd-drill-list"></div>
             </div>
         `;
         instanceRoot.appendChild(hud);
@@ -5236,6 +5271,20 @@ function createNoteDetector(options = {}) {
         createFlashOverlay();
         lastHitCount = 0;
         lastMissCount = 0;
+        // Sync animation state to the live counters so a mid-song re-enable
+        // doesn't replay a count-up / multiplier pop for ground it already
+        // covered. The badge DOM must be seeded too — createHUD's template
+        // hard-codes ×1, and updateHUD only rewrites it on tier CHANGES, so
+        // syncing lastMultTier alone would leave a recreated HUD stuck at
+        // ×1 while a >1 multiplier is live.
+        displayScore = score;
+        lastMultTier = multiplier;
+        lastStreakVal = streak;
+        const multEl = instanceRoot.querySelector('.nd-hud-mult');
+        if (multEl) {
+            multEl.setAttribute('data-tier', String(multiplier));
+            multEl.textContent = '×' + multiplier;
+        }
         if (hudInterval) clearInterval(hudInterval);
         hudInterval = setInterval(updateHUD, 33);
     }
@@ -5259,6 +5308,30 @@ function createNoteDetector(options = {}) {
         const countsEl = instanceRoot.querySelector('.nd-hud-counts');
         const detectedEl = instanceRoot.querySelector('.nd-hud-detected');
         const flashEl = instanceRoot.querySelector('.nd-flash-overlay');
+        const scoreEl = instanceRoot.querySelector('.nd-hud-score');
+        const multEl = instanceRoot.querySelector('.nd-hud-mult');
+
+        if (scoreEl) {
+            // Eased count-up toward the live score; snap instantly downward
+            // (a reset/new song should not "count down" from the old total).
+            if (score < displayScore) displayScore = score;
+            const diff = score - displayScore;
+            displayScore = diff < 1 ? score : displayScore + diff * 0.25;
+            scoreEl.textContent = String(Math.round(displayScore));
+        }
+
+        if (multEl && multiplier !== lastMultTier) {
+            multEl.setAttribute('data-tier', String(multiplier));
+            multEl.textContent = '×' + multiplier;
+            if (multiplier > lastMultTier) {
+                // Remove + reflow + re-add so consecutive tier-ups retrigger
+                // the one-shot keyframe.
+                multEl.classList.remove('nd-pop');
+                void multEl.offsetWidth;
+                multEl.classList.add('nd-pop');
+            }
+            lastMultTier = multiplier;
+        }
 
         if (accEl && total > 0) {
             const accuracy = Math.round((hits / total) * 100);
@@ -5273,6 +5346,20 @@ function createNoteDetector(options = {}) {
             let text = streak > 0 ? `${streak} streak` : '';
             if (bestStreak > 0) text += `  best: ${bestStreak}`;
             streakEl.textContent = text;
+            if (streak === 0 && lastStreakVal >= 10) {
+                // A multiplier-worthy streak just broke — shake the panel.
+                const hudEl = instanceRoot.querySelector('.nd-hud');
+                if (hudEl) {
+                    hudEl.classList.remove('nd-shake');
+                    void hudEl.offsetWidth;
+                    hudEl.classList.add('nd-shake');
+                }
+            } else if (streak > lastStreakVal && _ndIsStreakMilestone(streak)) {
+                streakEl.classList.remove('nd-flash');
+                void streakEl.offsetWidth;
+                streakEl.classList.add('nd-flash');
+            }
+            lastStreakVal = streak;
         }
 
         if (countsEl && total > 0) {
@@ -8969,6 +9056,24 @@ function createNoteDetector(options = {}) {
             if (next === autoRecord) return;
             autoRecord = next;
             saveSettings();
+        },
+        // Scoring-UI skin (neon | esports | metal). Global preference: one
+        // localStorage key shared by all instances; setSkin live-restamps
+        // every open notedetect root (splitscreen panels, summary overlay)
+        // and announces the change on the bus so the highway renderer can
+        // refresh its FX palette.
+        getSkin: () => _ndLoadSkin(),
+        setSkin: (skin) => {
+            if (ND_SKINS.indexOf(skin) === -1) return false;
+            try { localStorage.setItem(ND_SKIN_STORAGE_KEY, skin); } catch (e) {}
+            try {
+                document.querySelectorAll('.nd-instance-root, .nd-summary-overlay')
+                    .forEach(el => el.setAttribute('data-nd-skin', skin));
+            } catch (e) {}
+            if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+                try { window.slopsmith.emit('notedetect:skin', { skin }); } catch (e) {}
+            }
+            return true;
         },
         // A/V auto-calibrate opt-out + last result for the Settings UI.
         isAutoCalibrate: () => autoCalibrate,
