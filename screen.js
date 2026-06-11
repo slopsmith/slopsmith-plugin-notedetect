@@ -8195,8 +8195,7 @@ function createNoteDetector(options = {}) {
     }
 
     function _calLabCanProbe() {
-        return !!(enabled && usingDesktopBridge && bridgeDesktop && bridgeDesktop.audio
-            && typeof bridgeDesktop.audio.scoreChord === 'function');
+        return !!(enabled && usingDesktopBridge && _ndBridgeScoreAvailable());
     }
 
     async function _calLabRunScoreProbe(notes) {
@@ -8222,7 +8221,7 @@ function createNoteDetector(options = {}) {
             })),
         };
         try {
-            return await bridgeDesktop.audio.scoreChord(ctx);
+            return await _ndBridgeScoreChord(ctx);
         } catch (e) {
             console.warn('[note_detect] cal lab scoreChord:', e);
             return null;
