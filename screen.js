@@ -7756,6 +7756,11 @@ function createNoteDetector(options = {}) {
         _autoRecOnLoaded = async () => {
             if (!autoRecord || !detectPreference) return;
             if (_recArmedForTraining) return;
+            // A prior pause/end save that FAILED disarms but keeps _recChunks
+            // (retained for a manual retry). With nothing armed we'd otherwise
+            // fall through to armRecording(), which wipes that preserved take
+            // and its error — bail and leave it intact for the retry.
+            if (!_recArmed && _recChunks.length > 0) return;
             if (_recArmed) {
                 if (_recChunks.length > 0) {
                     // saveRecordingNow() returns null and KEEPS _recChunks
@@ -7852,6 +7857,10 @@ function createNoteDetector(options = {}) {
         try {
             window.setAvOffsetMs(r.offsetMs);
             console.log(`[note_detect] A/V auto-calibrated to ${r.offsetMs} ms (${r.matched}/${r.total} notes matched)`);
+            // Dispatch on the normal detector event path (window + instanceRoot),
+            // matching notedetect:verify/notedetect:session, so consumers that
+            // don't listen on the slopsmith bus still receive it.
+            dispatchInstanceEvent('notedetect:calibrated', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
             if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
                 window.slopsmith.emit('notedetect:calibrated', { offsetMs: r.offsetMs, matched: r.matched, total: r.total });
             }
@@ -8257,9 +8266,22 @@ function createNoteDetector(options = {}) {
         // separate get round-trip.
         applySettings: (partial) => {
             partial = partial || {};
+            // Restart the audio graph at the end if a structural setting (one
+            // baked into the ScriptProcessor at startAudio) changed while live.
+            let restartNeeded = false;
             if (typeof partial.method === 'string' && ['yin', 'hps', 'crepe'].includes(partial.method)) {
                 detectionMethod = partial.method;
                 detectionMethodUserSet = true;  // explicit choice — disable bass auto-HPS
+            }
+            if (partial.frameSize !== undefined) {
+                // The README documents tuning this via applySettings; the
+                // ScriptProcessor buffer is fixed at startAudio, so a change
+                // while detection is live only takes effect after a restart.
+                const nextFrameSize = _ndClampFrameSize(partial.frameSize);
+                if (nextFrameSize !== frameSize) {
+                    frameSize = nextFrameSize;
+                    restartNeeded = enabled;
+                }
             }
             if (Number.isFinite(partial.timingTolerance)) {
                 timingTolerance = Math.max(0.03, Math.min(0.3, partial.timingTolerance));
@@ -8306,8 +8328,13 @@ function createNoteDetector(options = {}) {
             if (chordTimingHitThreshold < timingHitThreshold) chordTimingHitThreshold = timingHitThreshold;
             if (chordTimingHitThreshold > timingTolerance)    chordTimingHitThreshold = timingTolerance;
             saveSettings();
+            // Recreate the ScriptProcessor with the new buffer size. Done after
+            // saveSettings() so the persisted value is correct even if the
+            // restart races; fire-and-forget, matching the other call sites.
+            if (restartNeeded) restartAudio();
             return {
                 method: detectionMethod,
+                frameSize,
                 timingTolerance,
                 pitchTolerance,
                 timingHitThreshold,

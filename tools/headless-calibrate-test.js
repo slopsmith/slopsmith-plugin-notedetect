@@ -61,6 +61,21 @@ const ARR = parseInt(process.env.ARRANGEMENT || '2', 10);
       };
     }, { SONG, ARR });
     console.log(JSON.stringify(out, null, 2));
+    // Fail loudly instead of false-greening: the page not throwing doesn't
+    // mean calibration worked. Require that detections actually accumulated
+    // AND a usable offset was produced.
+    const failures = [];
+    const maxDet = Array.isArray(out.detSamples)
+      ? Math.max(0, ...out.detSamples.map(v => Number(v) || 0))
+      : 0;
+    if (maxDet === 0) failures.push('no detections captured');
+    const cal = out.lastCalibration;
+    if (!(cal && typeof cal === 'object' && Number.isFinite(Number(cal.offsetMs))))
+      failures.push('no calibration result produced');
+    if (failures.length) {
+      console.error('CALIBRATE CHECK FAILED:', failures.join('; '));
+      process.exitCode = 1;
+    }
   } finally {
     if (browser) { try { await browser.close(); } catch (_) {} }
   }
