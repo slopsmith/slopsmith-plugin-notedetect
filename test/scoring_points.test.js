@@ -248,3 +248,65 @@ test('_submitSongXp swallows a rejecting submitRun', async () => {
     await assert.doesNotReject(() => det._submitSongXp());
     det.destroy();
 });
+
+test('_submitSongXp is once-per-take idempotent at the function level', async () => {
+    let calls = 0;
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sandbox) => {
+            sandbox.slopsmithMinigames = {
+                submitRun: async () => { calls++; return { ok: true, xp_gained: 1, profile: { level: 1 } }; },
+            };
+        },
+    });
+    const det = core.createNoteDetector();
+    det._recordJudgment('k0', judgment(true));
+    await det._submitSongXp();
+    await det._submitSongXp();
+    assert.equal(calls, 1, 'second call within the same take is a no-op');
+    // A new take (resetScoring) re-arms the guard.
+    det._resetScoring();
+    det._recordJudgment('k1', judgment(true));
+    await det._submitSongXp();
+    assert.equal(calls, 2);
+    det.destroy();
+});
+
+test('an ambiguous submitRun failure HOLDS the claim (no double-credit retry)', async () => {
+    // A rejection can land after the backend already persisted the award,
+    // so a same-take retry could double-credit the profile — the claim
+    // stays held on the caught-error path.
+    let calls = 0;
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sandbox) => {
+            sandbox.slopsmithMinigames = {
+                submitRun: async () => { calls++; throw new Error('timeout — outcome unknown'); },
+            };
+        },
+    });
+    const det = core.createNoteDetector();
+    det._recordJudgment('k0', judgment(true));
+    await det._submitSongXp();   // rejects ambiguously → claim held
+    await det._submitSongXp();   // must NOT re-attempt
+    assert.equal(calls, 1);
+    det.destroy();
+});
+
+test('the deterministic no-SDK path releases the claim', async () => {
+    // SDK absent = provably nothing submitted — a later call within the
+    // same take (e.g. the SDK finished loading) may still award it.
+    let calls = 0;
+    let sb = null;
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sandbox) => { sb = sandbox; },
+    });
+    const det = core.createNoteDetector();
+    det._recordJudgment('k0', judgment(true));
+    await det._submitSongXp();   // no SDK → claim released
+    sb.slopsmithMinigames = {
+        submitRun: async () => { calls++; return { ok: true, xp_gained: 1, profile: { level: 1 } }; },
+    };
+    await det._submitSongXp();   // released claim → this one submits
+    await det._submitSongXp();   // success → now held
+    assert.equal(calls, 1);
+    det.destroy();
+});

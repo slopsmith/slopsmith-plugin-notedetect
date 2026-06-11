@@ -6625,10 +6625,8 @@ function createNoteDetector(options = {}) {
             // api.showSummary() calls deliberately don't award (they can
             // fire repeatedly for one take). Gated on `built` so the same
             // <5-judgment takes that skip the summary also skip XP.
-            if (built && !_xpSubmittedTake) {
-                _xpSubmittedTake = true;
-                _submitSongXp();
-            }
+            // Idempotency lives inside _submitSongXp().
+            if (built) _submitSongXp();
         } catch (e) {
             console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
         }
@@ -6640,9 +6638,25 @@ function createNoteDetector(options = {}) {
     // the request fails) this is a silent no-op: XP is a bonus layered on
     // top of the summary, never something that can break it. On success,
     // fill the summary's XP row (.nd-sum-xp) if the overlay carries one.
+    // Once-per-take guard lives HERE (not just at the call site) so any
+    // other caller of the exposed hook can't double-award a take;
+    // resetScoring() re-arms it on every song switch / retry.
     async function _submitSongXp() {
+        if (_xpSubmittedTake) return;
+        // Claim the take up-front (dedupes a concurrent duplicate
+        // song:ended while the request is in flight). The claim is
+        // RELEASED only on the deterministic no-op below (SDK absent —
+        // provably nothing was submitted) and HELD on a caught rejection:
+        // an error from submitRun is ambiguous (a timeout can land after
+        // the backend already persisted the award), and double-crediting
+        // the profile is worse than occasionally losing one transient
+        // take. resetScoring() re-arms per take as always.
+        _xpSubmittedTake = true;
         const mg = window.slopsmithMinigames;
-        if (!mg || typeof mg.submitRun !== 'function') return;
+        if (!mg || typeof mg.submitRun !== 'function') {
+            _xpSubmittedTake = false;
+            return;
+        }
         const currentHw = resolveHw();
         const info = currentHw && currentHw.getSongInfo ? currentHw.getSongInfo() : null;
         const total = hits + misses;
@@ -6669,7 +6683,9 @@ function createNoteDetector(options = {}) {
             _fillSummaryXpRow(res);
         } catch (e) {
             // Swallow — offline backend, killed request, profile-save race:
-            // none of these should surface as a summary failure.
+            // none of these should surface as a summary failure. The claim
+            // stays held (see above): the failure is ambiguous and a retry
+            // could double-credit the profile.
         }
     }
 
