@@ -522,13 +522,21 @@ function _ndIsStreakMilestone(streak) {
 const ND_SKINS = ['neon', 'esports', 'metal'];
 const ND_SKIN_STORAGE_KEY = 'slopsmith_notedetect_skin';
 
+// Runtime mirror of the skin preference. Keeps getSkin()/setSkin()
+// coherent for the session when localStorage is unavailable (private
+// mode, quota): readable storage wins, the mirror is the fallback — so a
+// setSkin() whose persist failed still themes consistently until reload.
+let _ndSkinRuntime = 'neon';
+
 function _ndLoadSkin() {
     try {
         const v = localStorage.getItem(ND_SKIN_STORAGE_KEY);
-        return ND_SKINS.indexOf(v) !== -1 ? v : 'neon';
-    } catch (e) {
-        return 'neon';
-    }
+        if (ND_SKINS.indexOf(v) !== -1) {
+            _ndSkinRuntime = v;
+            return v;
+        }
+    } catch (e) { /* storage unavailable — fall through to the mirror */ }
+    return _ndSkinRuntime;
 }
 
 // Letter grade from accuracy percentage (0–100). Full combo is a separate
@@ -9065,6 +9073,9 @@ function createNoteDetector(options = {}) {
         getSkin: () => _ndLoadSkin(),
         setSkin: (skin) => {
             if (ND_SKINS.indexOf(skin) === -1) return false;
+            // Mirror first — persistence below is best-effort (see
+            // _ndSkinRuntime), the session state must not depend on it.
+            _ndSkinRuntime = skin;
             try { localStorage.setItem(ND_SKIN_STORAGE_KEY, skin); } catch (e) {}
             try {
                 document.querySelectorAll('.nd-instance-root, .nd-summary-overlay')

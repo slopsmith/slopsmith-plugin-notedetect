@@ -57,3 +57,21 @@ test('setSkin accepts only known skins and persists + announces the change', () 
     assert.equal(det.getSkin(), 'metal');
     det.destroy();
 });
+
+test('setSkin stays coherent with getSkin when persistence throws', () => {
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sandbox) => {
+            sandbox.localStorage = {
+                getItem: () => { throw new Error('storage unavailable'); },
+                setItem: () => { throw new Error('storage unavailable'); },
+                removeItem: () => {},
+            };
+        },
+    });
+    const det = core.createNoteDetector();
+    assert.equal(det.getSkin(), 'neon');
+    assert.equal(det.setSkin('metal'), true);
+    // The runtime mirror keeps the session coherent despite the failed write.
+    assert.equal(det.getSkin(), 'metal');
+    det.destroy();
+});
