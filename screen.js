@@ -182,13 +182,24 @@ const _ndShared = (window.__ndShared = window.__ndShared || {
     // wrapper so the training-bundle manifest can populate the CDLC
     // File Name field that getSongInfo can't supply on its own.
     currentFilename: null,
-    // Token of the detector instance that currently owns the single engine
-    // chart slot for a contained-playback verifier (setContainedChart). The
-    // engine has ONE chart slot; a contained chart and the host-song chart
-    // contend for it, and so do two detector instances (split-screen). This
-    // cross-instance guard lets setContainedChart refuse when another instance
-    // already holds the slot, so two plugins can't clobber each other's chart.
-    containedSlotOwner: null,
+    // Token of the detector instance that currently owns an engine chart slot
+    // for a contained-playback verifier (setContainedChart), plus the engine
+    // SOURCE that slot belongs to. The engine has one chart slot PER source; a
+    // contained chart and the host-song chart contend for the same slot, and so
+    // do two detector instances bound to the SAME source (split-screen). These
+    // cross-instance fields let setContainedChart refuse a second arm on that
+    // source, AND let every instance on that source skip its own host-chart
+    // pushes/drains while another instance holds the contained slot — so a
+    // non-owning instance can't overwrite the contained chart. Instances bound
+    // to a DIFFERENT source use a different slot and are unaffected.
+    // Map of engine sourceId (null = default source 0) -> the detector instance
+    // that owns the contained chart slot on THAT source. Keyed per source because
+    // each source has its own engine chart slot — two instances on the same
+    // source contend (only one may hold the contained slot), but instances on
+    // different sources don't. setContainedChart refuses a second arm on a source
+    // already owned, and every instance on a source skips its own host-chart
+    // pushes/drains while another instance owns that source's contained slot.
+    containedSlotOwners: new Map(),
 });
 // Local aliases — kept for readability of the rest of the file, but
 // they're the same objects as `window.__ndShared.*`.
@@ -2401,7 +2412,10 @@ function createNoteDetector(options = {}) {
                             // own tick via pushContainedPlayhead — this loop
                             // must do nothing that touches the chart slot or
                             // re-pushes the host chart over the contained one.
-                            if (_ndHostChartSuspended) return;
+                            // _ndHostChartSuspended covers THIS instance when it
+                            // owns the slot; _ndOtherOwnsOurSlot() covers a
+                            // sibling instance on the same engine source.
+                            if (_ndHostChartSuspended || _ndOtherOwnsOurSlot()) return;
                             // Engine-verifier path: the engine scores the
                             // pushed chart on its own background thread, so
                             // this loop just drains finalized verdicts and
@@ -5623,8 +5637,9 @@ function createNoteDetector(options = {}) {
         // host chart over the contained one, nor wipe the host verifier state
         // we restore on release — so bail before touching anything. The
         // restore path (_ndRestoreHostChart) clears the flag first, so its own
-        // re-push proceeds normally.
-        if (_ndHostChartSuspended) return;
+        // re-push proceeds normally. Also bail when a SIBLING instance owns the
+        // contained slot on our source (it isn't suspended on our flag).
+        if (_ndHostChartSuspended || _ndOtherOwnsOurSlot()) return;
         _ndUsingEngineVerifier = false;
         _ndVerifierChartById = new Map();
         _ndVerifierChords = new Map();
@@ -6040,6 +6055,17 @@ function createNoteDetector(options = {}) {
         return usingDesktopBridge && _ndBridgeVerifierAvailable();
     }
 
+    // True when ANOTHER detector instance owns the contained slot on the SAME
+    // engine source this instance pushes to — so we must NOT touch that shared
+    // slot (re-push our host chart, drain host verdicts) or we'd overwrite its
+    // contained chart. _ndHostChartSuspended only covers the OWNING instance;
+    // this covers the others on that source. A different source = a different
+    // slot = no contention.
+    function _ndOtherOwnsOurSlot() {
+        const owner = _ndShared.containedSlotOwners.get(sourceId);
+        return !!owner && owner !== api;
+    }
+
     // Park host-song scoring while a contained chart owns the engine slot.
     // Flips the suspend gate BEFORE any await in the caller, so an interleaving
     // detect tick already sees it.
@@ -6057,6 +6083,9 @@ function createNoteDetector(options = {}) {
     async function _ndRestoreHostChart() {
         if (!_ndHostChartSuspended) return;
         _ndHostChartSuspended = false;
+        // If a sibling instance grabbed the contained slot on our source in the
+        // meantime, don't re-push our host chart over its contained chart.
+        if (_ndOtherOwnsOurSlot()) return;
         // Force a re-push: the signature guard in the detect loop compares
         // against _ndVerifierChartSig, which _ndPushChartToBridge resets, so a
         // direct call here re-pushes the host chart over the contained one.
@@ -6083,14 +6112,15 @@ function createNoteDetector(options = {}) {
             // also CANCELS an in-flight arm (release bumps _ndContainedGen, which
             // makes that arm's resume bail). Checking _ndContainedActive alone
             // would miss the in-flight window (active is false until success).
-            if (_ndContainedActive || _ndHostChartSuspended || _ndShared.containedSlotOwner === api) {
+            if (_ndContainedActive || _ndHostChartSuspended || _ndShared.containedSlotOwners.get(sourceId) === api) {
                 await _ndReleaseContainedChart();
             }
             return false;
         }
-        // One engine chart slot, shared across detector instances. Refuse if a
-        // DIFFERENT instance holds it (our own re-arm is fine).
-        if (_ndShared.containedSlotOwner && _ndShared.containedSlotOwner !== api) {
+        // One chart slot PER engine source. Refuse if a DIFFERENT instance holds
+        // the slot on OUR source (our own re-arm is fine; a different source is a
+        // different slot, so it doesn't contend).
+        if (_ndOtherOwnsOurSlot()) {
             return false;
         }
 
@@ -6132,7 +6162,7 @@ function createNoteDetector(options = {}) {
         // and stamp a generation so a release/disable/newer-arm during the
         // setChart IPC invalidates this continuation.
         const myGen = ++_ndContainedGen;
-        _ndShared.containedSlotOwner = api;
+        _ndShared.containedSlotOwners.set(sourceId, api);   // claim the slot on our source
         // Re-arm safety: mark NOT-active until the new chart is confirmed. On a
         // re-arm by the same instance the previous chart was still active, and a
         // pushContainedPlayhead during the new setChart IPC would otherwise drain
@@ -6169,10 +6199,20 @@ function createNoteDetector(options = {}) {
         // Superseded while the setChart IPC was in flight (a release/disable, or
         // a newer arm)? Don't resurrect contained mode. If a release ran, OUR
         // chart may have landed on the engine slot AFTER its host re-push — so
-        // when we no longer own the slot and host scoring isn't suspended, force
-        // the host chart back so the slot can't be left holding our stale chart.
+        // force the host chart back, but ONLY when our slot is now unowned: if a
+        // newer arm (ours) or another instance owns it, leave it to them (don't
+        // clobber). A different-source owner doesn't own OUR slot, so we still
+        // restore.
+        //
+        // Note on two arms racing the SAME source within one IPC round-trip: the
+        // newer owner is whoever called setChart last, and `audio:setChart` rides
+        // a single ordered ipcRenderer.invoke channel, so the newer arm's chart
+        // lands last on the slot. We rely on that ordering rather than a per-source
+        // IPC lock — and in practice the only contained consumer is the default
+        // singleton (one source), so two same-source arms don't occur.
         if (myGen !== _ndContainedGen) {
-            if (_ndShared.containedSlotOwner !== api && !_ndHostChartSuspended) {
+            const slotOwnedHere = !!_ndShared.containedSlotOwners.get(sourceId);
+            if (!slotOwnedHere && !_ndHostChartSuspended) {
                 try { _ndVerifierChartSig = ''; await _ndPushChartToBridge(); } catch (_) {}
             }
             return false;
@@ -6180,7 +6220,7 @@ function createNoteDetector(options = {}) {
         if (ok === null || ok === false) {
             // Push failed (downlevel / error) — release the slot claim and undo
             // the suspend so host scoring resumes cleanly.
-            if (_ndShared.containedSlotOwner === api) _ndShared.containedSlotOwner = null;
+            if (_ndShared.containedSlotOwners.get(sourceId) === api) _ndShared.containedSlotOwners.delete(sourceId);
             await _ndRestoreHostChart();
             return ok;
         }
@@ -6203,7 +6243,7 @@ function createNoteDetector(options = {}) {
         // Only the slot owner drives the engine, and only while armed — a stale
         // instance (lost the owner race, or released) must not advance/drain the
         // shared verifier against another consumer's chart.
-        if (!_ndContainedActive || _ndShared.containedSlotOwner !== api) return;
+        if (!_ndContainedActive || _ndShared.containedSlotOwners.get(sourceId) !== api) return;
         const myGen = _ndContainedGen;
         const songTime = Number.isFinite(t) ? t : 0;
         // Backward jump (drill loop / restart): drop buffered verdicts for
@@ -6258,7 +6298,7 @@ function createNoteDetector(options = {}) {
         _ndContainedCtx = null;
         _ndContainedVerdictBuf = [];
         _ndContainedLastPlayhead = 0;
-        if (_ndShared.containedSlotOwner === api) _ndShared.containedSlotOwner = null;
+        if (_ndShared.containedSlotOwners.get(sourceId) === api) _ndShared.containedSlotOwners.delete(sourceId);
         await _ndRestoreHostChart();
     }
 
@@ -6742,7 +6782,7 @@ function createNoteDetector(options = {}) {
             _ndContainedVerdictBuf = [];
             _ndContainedLastPlayhead = 0;
             _ndHostChartSuspended = false;
-            if (_ndShared.containedSlotOwner === api) _ndShared.containedSlotOwner = null;
+            if (_ndShared.containedSlotOwners.get(sourceId) === api) _ndShared.containedSlotOwners.delete(sourceId);
         }
         // Invalidate any CREPE inference currently awaited in
         // processFrame — it captured the previous sessionGen and will
@@ -8203,10 +8243,10 @@ function createNoteDetector(options = {}) {
         // suspended while a contained chart is armed (one engine chart slot).
         //
         // Usage (per the consumer's own RAF tick):
-        //   if (api.setContainedChart(notes, ctx) === true) { … }   // arm once
-        //   await api.pushContainedPlayhead(exerciseTime, playing); // each tick
-        //   for (const v of api.drainContainedVerdicts()) { … }     // each tick
-        //   api.releaseContainedChart();                            // on stop
+        //   if (await api.setContainedChart(notes, ctx)) { … }      // arm once (async)
+        //   await api.pushContainedPlayhead(exerciseTime, playing); // each tick (async)
+        //   for (const v of api.drainContainedVerdicts()) { … }     // each tick (sync)
+        //   await api.releaseContainedChart();                      // on stop (async)
         // `notes`: [{ id, t, s, f, sus?, ho?, po?, b?, sl?, hm? }] — `id` is a
         // caller-chosen stable key echoed back on each verdict. `ctx`: optional
         // tuning override (see setVerifyTarget / _ndSanitizeVerifyCtx).
