@@ -177,6 +177,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_ndStringBandHz', '_ndBandEnergy',
         '_ndConstraintCheckString', '_ndScoreChord',
         '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
+        '_ndMultiplierForStreak', '_ndIsStreakMilestone', '_ndGradeFor',
         'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -293,6 +294,10 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
             };
         },
         calibrateOffsetMs: sandbox._ndCalibrateOffsetMs,
+        // Game-scoring pure helpers (points / multiplier / grade layer).
+        multiplierForStreak: sandbox._ndMultiplierForStreak,
+        isStreakMilestone: sandbox._ndIsStreakMilestone,
+        gradeFor: sandbox._ndGradeFor,
         createNoteDetector: sandbox.createNoteDetector,
         // Drill-mode tests: expose the slopsmith stub so tests can
         // drive synthetic `loop:restart` etc. and toggle the loop

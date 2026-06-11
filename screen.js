@@ -496,6 +496,37 @@ function _ndClassifyPitch(pitchErrorCents, pitchThresholdCents) {
         : (pitchErrorCents > 0 ? 'SHARP' : 'FLAT');
 }
 
+// ── Game-scoring layer: points / multiplier / grade ─────────────────────
+// Pure helpers shared by the live HUD, the end-of-song summary, and the
+// highway FX contract. Kept top-level (not in the factory closure) so the
+// vm test loader can exercise them directly.
+
+// Base point values per clean hit, before the streak multiplier.
+const ND_BASE_SINGLE = 50;
+const ND_BASE_CHORD  = 100;
+
+// Streak-tier multiplier: ×1 → ×2 at 10, ×3 at 25, ×4 at 50.
+function _ndMultiplierForStreak(streak) {
+    return streak >= 50 ? 4 : streak >= 25 ? 3 : streak >= 10 ? 2 : 1;
+}
+
+// Streak counts that warrant a celebration burst on the highway: the two
+// upper tier boundaries, then every full hundred.
+function _ndIsStreakMilestone(streak) {
+    return streak === 25 || streak === 50 || (streak >= 100 && streak % 100 === 0);
+}
+
+// Letter grade from accuracy percentage (0–100). Full combo is a separate
+// badge (misses === 0), not a grade change.
+function _ndGradeFor(accuracy) {
+    return accuracy >= 96 ? 'S'
+        : accuracy >= 90 ? 'A'
+        : accuracy >= 80 ? 'B'
+        : accuracy >= 70 ? 'C'
+        : accuracy >= 60 ? 'D'
+        : 'F';
+}
+
 function _ndMakeJudgment(opts) {
     const o = opts || {};
     const matched = !!o.matched;
@@ -1691,6 +1722,13 @@ function createNoteDetector(options = {}) {
     let misses = 0;
     let streak = 0;
     let bestStreak = 0;
+    // Game points (base × streak multiplier per clean hit) and the
+    // multiplier tier itself — see the top-level _ndMultiplierForStreak /
+    // ND_BASE_* helpers. maxMultiplier is the session high-water mark for
+    // the end-of-song summary.
+    let score = 0;
+    let multiplier = 1;
+    let maxMultiplier = 1;
     let sectionStats = [];   // [{name, hits, misses}]
     let currentSection = null;
     const noteResults = new Map(); // key -> judgment object
@@ -1862,6 +1900,12 @@ function createNoteDetector(options = {}) {
     // the summary so the two modals don't stack; _runDeferredSummary()
     // shows it once the consent flow closes.
     let _summaryDeferred = false;
+    // One XP submission per take: set when _endOfSongOnEnded successfully
+    // hands the session score to the minigames profile, cleared by
+    // resetScoring() (which the playSong wrapper runs on every song switch
+    // / retry). Guards against a duplicate award if song:ended ever fires
+    // twice for one take.
+    let _xpSubmittedTake = false;
     // Parallel getUserMedia capture for training takes when the desktop
     // bridge is active. The bridge intentionally does NOT open a JS-side
     // audio chain (the native JUCE engine owns the device), so the
@@ -3374,6 +3418,22 @@ function createNoteDetector(options = {}) {
             ? Math.max(chartTime, j._ndDisplayFrom) : chartTime;
 
         if (j.hit) {
+            // Score-pop channel for the renderer: per-note points stamped by
+            // recordJudgment. Chord MEMBER judgments carry no points of their
+            // own — the chord-level judgment (keyed `<t>_chord`) owns the
+            // value — so fall back to it and hand back ITS key as popKey,
+            // letting the renderer dedupe to one pop per chord instead of
+            // one per gem. Singles use their own key.
+            let points = j._ndPoints, mult = j._ndMult, popKey = key;
+            if (points === undefined) {
+                const chordKey = `${chartTime.toFixed(3)}_chord`;
+                const cj = noteResults.get(chordKey);
+                if (cj && cj.hit && cj._ndPoints !== undefined) {
+                    points = cj._ndPoints;
+                    mult = cj._ndMult;
+                    popKey = chordKey;
+                }
+            }
             const sus = +note.sus || 0;
             // Sustained note still inside its ring window AND still audibly
             // ringing on-pitch → hold it lit, brightness tracking the live
@@ -3381,15 +3441,15 @@ function createNoteDetector(options = {}) {
             // post-strike hit fade (the note has decayed / been muted).
             if (sus > 0.05 && songT < chartTime + sus + 0.05 && _sustainStillHeld(key, note)) {
                 const a = _ndSustainGlowAlpha();
-                if (a > 0) return { state: 'active', alpha: a, live: true };
+                if (a > 0) return { state: 'active', alpha: a, live: true, points, mult, popKey };
             }
             // Otherwise: brief post-strike glow that fades out over
             // hitGlowDuration (measured from when the verdict landed).
             const age = songT - dispAnchor;
-            if (age < 0) return { state: 'hit', alpha: 1 };  // struck a hair early
+            if (age < 0) return { state: 'hit', alpha: 1, points, mult, popKey };  // struck a hair early
             const glowDur = Math.max(0.1, hitGlowDuration);
             if (age >= glowDur) return null;
-            return { state: 'hit', alpha: 1 - age / glowDur };
+            return { state: 'hit', alpha: 1 - age / glowDur, points, mult, popKey };
         }
         // Missed (timing window expired, or matched-but-not-clean).
         const age = songT - dispAnchor;
@@ -3453,6 +3513,26 @@ function createNoteDetector(options = {}) {
     function dispatchJudgment(judgment) {
         dispatchInstanceEvent(judgment.hit ? 'notedetect:hit' : 'notedetect:miss', judgment);
         emitSlopsmithJudgment(judgment);
+    }
+
+    // Session-level FX broadcast for renderers (multiplier tier changes,
+    // streak milestones, streak breaks). Fires both as a bubbling DOM
+    // CustomEvent (dispatchInstanceEvent — lets splitscreen renderers scope
+    // to their own panel via the event path) and on the slopsmith bus for
+    // bus-only consumers. Fields per fxType:
+    //   multiplier  — { mult, prevMult, streak }
+    //   milestone   — { streak, mult }
+    //   streakBreak — { lostStreak, prevMult }
+    // All events also carry { isDefault, ts }. Additive-only contract: new
+    // fxTypes/fields may appear, existing ones never change meaning.
+    function dispatchFx(detail) {
+        detail.isDefault = isDefault;
+        detail.ts = (typeof performance !== 'undefined' && performance.now)
+            ? performance.now() : Date.now();
+        dispatchInstanceEvent('notedetect:fx', detail);
+        if (window.slopsmith && typeof window.slopsmith.emit === 'function') {
+            try { window.slopsmith.emit('notedetect:fx', detail); } catch (e) {}
+        }
     }
 
     // The `extra.chord ? chordTimingHitThreshold : timingHitThreshold`
@@ -3715,10 +3795,34 @@ function createNoteDetector(options = {}) {
                 hits++;
                 streak++;
                 if (streak > bestStreak) bestStreak = streak;
+                const prevMult = multiplier;
+                multiplier = _ndMultiplierForStreak(streak);
+                if (multiplier > maxMultiplier) maxMultiplier = multiplier;
+                const pts = (judgment.chord ? ND_BASE_CHORD : ND_BASE_SINGLE) * multiplier;
+                score += pts;
+                // Stash the per-note value on the judgment so noteStateFor()
+                // can hand the highway renderer the score-pop amount without
+                // a second lookup. Underscore-prefixed: internal annotation,
+                // not part of the judgment's public shape.
+                judgment._ndPoints = pts;
+                judgment._ndMult = multiplier;
+                if (multiplier !== prevMult) {
+                    dispatchFx({ fxType: 'multiplier', mult: multiplier, prevMult, streak });
+                }
+                if (_ndIsStreakMilestone(streak)) {
+                    dispatchFx({ fxType: 'milestone', streak, mult: multiplier });
+                }
                 updateSectionStat('hit');
             } else {
+                const lostStreak = streak;
                 misses++;
                 streak = 0;
+                // Only celebrate-the-loss when there was a multiplier going —
+                // a miss at ×1 with a short streak isn't a "break" moment.
+                if (lostStreak >= 10) {
+                    dispatchFx({ fxType: 'streakBreak', lostStreak, prevMult: multiplier });
+                }
+                multiplier = 1;
                 updateSectionStat('miss');
             }
             // Mirror to drill counters. Independent state — global
@@ -5479,6 +5583,10 @@ function createNoteDetector(options = {}) {
         misses = 0;
         streak = 0;
         bestStreak = 0;
+        score = 0;
+        multiplier = 1;
+        maxMultiplier = 1;
+        _xpSubmittedTake = false;
         noteResults.clear();
         _susActiveUntil.clear();
         _chordLastResult.clear();
@@ -6512,10 +6620,79 @@ function createNoteDetector(options = {}) {
             // hidden — a <5-judgment take builds nothing, so there'd be
             // nothing for _runDeferredSummary() to reveal.
             if (_recArmedForTraining && built) _summaryDeferred = true;
+            // Award XP for the take through the minigames profile. Natural
+            // song end only — the disable()-triggered summary and manual
+            // api.showSummary() calls deliberately don't award (they can
+            // fire repeatedly for one take). Gated on `built` so the same
+            // <5-judgment takes that skip the summary also skip XP.
+            if (built && !_xpSubmittedTake) {
+                _xpSubmittedTake = true;
+                _submitSongXp();
+            }
         } catch (e) {
             console.warn('[note_detect] end-of-song summary failed:', e && e.message ? e.message : e);
         }
         try { disable({ silent: true }); } catch (e) {}
+    }
+
+    // Submit the finished take to the minigames XP/profile backend via its
+    // frontend SDK. minigames is an optional plugin — when it's absent (or
+    // the request fails) this is a silent no-op: XP is a bonus layered on
+    // top of the summary, never something that can break it. On success,
+    // fill the summary's XP row (.nd-sum-xp) if the overlay carries one.
+    async function _submitSongXp() {
+        const mg = window.slopsmithMinigames;
+        if (!mg || typeof mg.submitRun !== 'function') return;
+        const currentHw = resolveHw();
+        const info = currentHw && currentHw.getSongInfo ? currentHw.getSongInfo() : null;
+        const total = hits + misses;
+        const accuracy = total > 0 ? Math.round((hits / total) * 100) : 0;
+        try {
+            const res = await mg.submitRun({
+                game_id: 'song_play',
+                score,
+                duration_ms: (info && Number.isFinite(info.duration))
+                    ? Math.round(info.duration * 1000) : 0,
+                meta: {
+                    title: info && info.title || '',
+                    artist: info && info.artist || '',
+                    arrangement: info && info.arrangement || '',
+                    accuracy,
+                    hits,
+                    misses,
+                    bestStreak,
+                    maxMultiplier,
+                    grade: _ndGradeFor(accuracy),
+                    fullCombo: misses === 0,
+                },
+            });
+            _fillSummaryXpRow(res);
+        } catch (e) {
+            // Swallow — offline backend, killed request, profile-save race:
+            // none of these should surface as a summary failure.
+        }
+    }
+
+    // Surface the XP award on the open summary overlay. The redesigned
+    // results screen ships a styled .nd-sum-xp slot; when the overlay
+    // predates it (this scoring engine can land ahead of the visual
+    // redesign), append a minimal row to the panel so the award is still
+    // visible. No overlay at all (closed already) → quietly do nothing.
+    function _fillSummaryXpRow(res) {
+        if (!res || !res.ok) return;
+        const overlay = instanceRoot.querySelector('.nd-summary-overlay');
+        if (!overlay) return;
+        let row = overlay.querySelector('.nd-sum-xp');
+        if (!row) {
+            const panel = overlay.firstElementChild;
+            if (!panel) return;
+            row = document.createElement('div');
+            row.className = 'nd-sum-xp text-center text-sm text-green-400 mt-2';
+            panel.appendChild(row);
+        }
+        const lvl = res.profile && Number.isFinite(res.profile.level) ? res.profile.level : null;
+        row.textContent = `+${res.xp_gained} XP` + (lvl !== null ? ` · Level ${lvl}` : '');
+        row.classList.remove('hidden');
     }
 
     // Reveal a summary overlay that was built hidden because a training
@@ -8478,6 +8655,12 @@ function createNoteDetector(options = {}) {
             hits,
             misses,
             bestStreak,
+            // Game-scoring additions (additive only — the practice journal
+            // and other consumers ignore unknown keys).
+            score,
+            maxMultiplier,
+            grade: _ndGradeFor(accuracy),
+            fullCombo: misses === 0,
             sections: sectionStats.map(s => ({
                 name: s.name,
                 accuracy: (s.hits + s.misses) > 0 ? Math.round(s.hits / (s.hits + s.misses) * 100) : 0,
@@ -8583,11 +8766,16 @@ function createNoteDetector(options = {}) {
         // with the chart-verifier API). False on browser / downlevel.
         isContainedVerifierAvailable: () => _ndContainedVerifierAvailable(),
 
-        getStats: () => ({
-            hits, misses, streak, bestStreak,
-            accuracy: (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0,
-            sectionStats: sectionStats.map(s => ({ name: s.name, hits: s.hits, misses: s.misses })),
-        }),
+        getStats: () => {
+            const accuracy = (hits + misses) > 0 ? Math.round(hits / (hits + misses) * 100) : 0;
+            return {
+                hits, misses, streak, bestStreak,
+                accuracy,
+                score, multiplier, maxMultiplier,
+                grade: _ndGradeFor(accuracy),
+                sectionStats: sectionStats.map(s => ({ name: s.name, hits: s.hits, misses: s.misses })),
+            };
+        },
         // The user's most-recently-expressed preference: did they last
         // click Detect to turn it ON? Distinct from isEnabled(), which
         // is the live runtime state and goes false on every song-switch
@@ -8868,6 +9056,10 @@ function createNoteDetector(options = {}) {
         // bind from enableImpl() and unbind from destroy().
         _bindEndOfSongEvents: _endOfSongBindEvents,
         _unbindEndOfSongEvents: _endOfSongUnbindEvents,
+        // XP-submission test hook — the natural path runs from
+        // _endOfSongOnEnded, which tests can't reach without enable()'s
+        // audio pipeline. Production code never calls this directly.
+        _submitSongXp: _submitSongXp,
         // Chart-state sync test hooks — same rationale as the drill
         // hooks. _getChartState lets tests assert the closure-private
         // currentArrangement/currentStringCount/tuningOffsets/capo
