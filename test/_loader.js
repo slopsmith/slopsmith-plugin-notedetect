@@ -178,6 +178,9 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_ndConstraintCheckString', '_ndScoreChord',
         '_ndClassifyTiming', '_ndClassifyPitch', '_ndMakeJudgment',
         '_ndMultiplierForStreak', '_ndIsStreakMilestone', '_ndGradeFor',
+        '_buildDiagnosticMissCauseAnalysis', '_summarizeDiagnosticCategoryCause',
+        '_analyzePowerChordAttempt', '_formatDiagnosticCauseForMusician',
+        '_renderDiagnosticMissCauseHtml', '_diagMissCauseFromSingleEvent',
         'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -298,6 +301,12 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         multiplierForStreak: sandbox._ndMultiplierForStreak,
         isStreakMilestone: sandbox._ndIsStreakMilestone,
         gradeFor: sandbox._ndGradeFor,
+        buildDiagnosticMissCauseAnalysis: sandbox._buildDiagnosticMissCauseAnalysis,
+        summarizeDiagnosticCategoryCause: sandbox._summarizeDiagnosticCategoryCause,
+        analyzePowerChordAttempt: sandbox._analyzePowerChordAttempt,
+        formatDiagnosticCauseForMusician: sandbox._formatDiagnosticCauseForMusician,
+        renderDiagnosticMissCauseHtml: sandbox._renderDiagnosticMissCauseHtml,
+        missCauseFromSingleEvent: sandbox._diagMissCauseFromSingleEvent,
         createNoteDetector: sandbox.createNoteDetector,
         // Drill-mode tests: expose the slopsmith stub so tests can
         // drive synthetic `loop:restart` etc. and toggle the loop

@@ -696,6 +696,420 @@ function _ndMakeJudgment(opts) {
     };
 }
 
+// ── Basic Guitar Diagnostic miss-cause analysis (read-only, post-hoc) ──
+// Explains likely WHY judgments missed using data already recorded during
+// play — no scoring/threshold changes.
+
+const _DIAG_CAUSE_PRIORITY = [
+    'silence_or_gate',
+    'timing_early', 'timing_late',
+    'pitch_sharp', 'pitch_flat',
+    'power_chord_root_heard_fifth_weak', 'power_chord_fifth_heard_root_weak',
+    'power_chord_partial_one_of_two',
+    'power_chord_not_clear',
+    'repeat_inconsistency',
+    'input_channel_or_tone_suspected',
+    'unknown',
+];
+
+function _diagMatchProfileEvent(events, spec, matchTolS) {
+    const tol = matchTolS != null ? matchTolS : 0.075;
+    for (const ev of events || []) {
+        if (!ev || !Number.isFinite(ev.t)) continue;
+        if (Math.abs(ev.t - spec.t) > tol) continue;
+        if (!!ev.chord !== !!spec.chord) continue;
+        if (!spec.chord) {
+            if (ev.s !== spec.s || ev.f !== spec.f) continue;
+        }
+        return ev;
+    }
+    return null;
+}
+
+function _diagFindRejectNear(rejects, t, toleranceS) {
+    const tol = toleranceS != null ? toleranceS : 0.075;
+    if (!rejects || !Number.isFinite(t)) return null;
+    let best = null;
+    let bestDt = Infinity;
+    for (const r of rejects) {
+        if (!r || !Number.isFinite(r.noteTime)) continue;
+        const dt = Math.abs(r.noteTime - t);
+        if (dt > tol) continue;
+        if (dt < bestDt) { bestDt = dt; best = r; }
+    }
+    return best;
+}
+
+function _diagLookupConstituentJudgments(noteResults, t, voicing, toleranceS) {
+    const tol = toleranceS != null ? toleranceS : 0.075;
+    if (!voicing || !voicing.length || !Number.isFinite(t)) return [];
+    let entries = [];
+    if (noteResults instanceof Map) {
+        entries = [...noteResults.values()];
+    } else if (Array.isArray(noteResults)) {
+        entries = noteResults;
+    } else if (noteResults && typeof noteResults === 'object') {
+        entries = Object.values(noteResults);
+    }
+    return voicing.map((roleEntry) => {
+        const { s, f, role } = roleEntry;
+        let best = null;
+        let bestDt = Infinity;
+        for (const j of entries) {
+            if (!j) continue;
+            const cn = j.chartNote || j.note;
+            if (!cn || cn.s !== s || cn.f !== f) continue;
+            const nt = j.noteTime;
+            if (!Number.isFinite(nt)) continue;
+            const dt = Math.abs(nt - t);
+            if (dt > tol) continue;
+            if (dt < bestDt) { bestDt = dt; best = j; }
+        }
+        return { role, s, f, judgment: best, hit: !!(best && best.hit) };
+    });
+}
+
+function _diagMissCauseNextStep(type) {
+    const steps = {
+        timing_early: 'Calibration Wizard → timing step',
+        timing_late: 'Calibration Wizard → timing step',
+        pitch_sharp: 'Check tuning or Calibration Wizard',
+        pitch_flat: 'Check tuning or Calibration Wizard',
+        silence_or_gate: 'Check input device, channel, and gain',
+        power_chord_root_heard_fifth_weak: 'Advanced Signal Check → power chord root/fifth',
+        power_chord_fifth_heard_root_weak: 'Advanced Signal Check → power chord root/fifth',
+        power_chord_partial_one_of_two: 'Advanced Signal Check → power chord root/fifth',
+        power_chord_not_clear: 'Check input gain or play louder',
+        input_channel_or_tone_suspected: 'Try mono input or a cleaner tone',
+        repeat_inconsistency: 'Replay the repeat section with steadier timing',
+        unknown: null,
+    };
+    return steps[type] || null;
+}
+
+function _formatDiagnosticCauseForMusician(cause) {
+    if (!cause || !cause.type) return 'Not enough detail to say why';
+    const labels = {
+        timing_early: 'Likely played too early',
+        timing_late: 'Likely played too late',
+        pitch_sharp: 'Pitch may have been sharp',
+        pitch_flat: 'Pitch may have been flat',
+        silence_or_gate: 'Slopsmith did not hear enough signal',
+        power_chord_root_heard_fifth_weak: 'Likely root heard; fifth string may be weak or masked',
+        power_chord_fifth_heard_root_weak: 'Likely upper string heard; low string may be weak',
+        power_chord_partial_one_of_two: 'Slopsmith heard 1 of 2 strings',
+        power_chord_not_clear: 'Power chord was not heard clearly',
+        input_channel_or_tone_suspected: 'Several misses may be input channel or tone related',
+        repeat_inconsistency: 'Same note worked earlier but missed on repeat',
+        unknown: 'Not enough detail to say why',
+    };
+    const base = labels[cause.type] || labels.unknown;
+    if (cause.detail) return `${base} (${cause.detail})`;
+    return base;
+}
+
+function _diagPickPrimaryCause(causes) {
+    if (!causes || !causes.length) return { type: 'unknown' };
+    for (const p of _DIAG_CAUSE_PRIORITY) {
+        const found = causes.find((c) => c.type === p);
+        if (found) return found;
+    }
+    return causes[0];
+}
+
+function _diagMissCauseFromSingleEvent(ev, reject) {
+    if (!ev || ev.hit) return null;
+    const rejectSilence = reject && (
+        reject.reason === 'SILENCE_GATE'
+        || reject.reason === 'NO_VERDICT'
+        || reject.reason === 'RETIRE_NO_MATCH'
+    );
+    if (rejectSilence || (ev.dx == null && ev.ts == null && ev.ps == null)) {
+        let detail = null;
+        const peak = reject && Number.isFinite(reject.strikePeakPct)
+            ? reject.strikePeakPct
+            : (reject && Number.isFinite(reject.inputPeakPct) ? reject.inputPeakPct : null);
+        if (Number.isFinite(peak) && peak < 8) {
+            detail = `signal at strike ${Math.round(peak)}%`;
+        }
+        return { type: 'silence_or_gate', detail };
+    }
+    if (ev.ts === 'EARLY' || (Number.isFinite(ev.te) && ev.te < -15)) {
+        const ms = Number.isFinite(ev.te) ? Math.abs(Math.round(ev.te)) : null;
+        return { type: 'timing_early', detail: ms != null ? `about ${ms} ms early` : null };
+    }
+    if (ev.ts === 'LATE' || (Number.isFinite(ev.te) && ev.te > 15)) {
+        const ms = Number.isFinite(ev.te) ? Math.round(ev.te) : null;
+        return { type: 'timing_late', detail: ms != null ? `about ${ms} ms late` : null };
+    }
+    if (ev.ps === 'SHARP' || (Number.isFinite(ev.pe) && ev.pe > 15)) {
+        const cents = Number.isFinite(ev.pe) ? Math.round(ev.pe) : null;
+        return { type: 'pitch_sharp', detail: cents != null ? `about ${cents} cents sharp` : null };
+    }
+    if (ev.ps === 'FLAT' || (Number.isFinite(ev.pe) && ev.pe < -15)) {
+        const cents = Number.isFinite(ev.pe) ? Math.abs(Math.round(ev.pe)) : null;
+        return { type: 'pitch_flat', detail: cents != null ? `about ${cents} cents flat` : null };
+    }
+    return { type: 'unknown' };
+}
+
+function _analyzePowerChordAttempt(chordEvent, constituents, rejects, voicing, toleranceS) {
+    if (!chordEvent) return null;
+    const hs = Number.isFinite(chordEvent.hs) ? chordEvent.hs : null;
+    const tt = Number.isFinite(chordEvent.tt) ? chordEvent.tt : 2;
+    if (chordEvent.hit && hs != null && hs >= tt) return null;
+
+    const t = chordEvent.t;
+    const reject = _diagFindRejectNear(rejects, t, toleranceS);
+    const rows = (constituents && constituents.length)
+        ? constituents
+        : _diagLookupConstituentJudgments(null, t, voicing, toleranceS);
+
+    if (rows.length >= 2) {
+        const root = rows.find((c) => c.role === 'root');
+        const fifth = rows.find((c) => c.role === 'fifth');
+        if (root && fifth && (root.judgment || fifth.judgment)) {
+            if (root.hit && !fifth.hit) {
+                return { type: 'power_chord_root_heard_fifth_weak' };
+            }
+            if (!root.hit && fifth.hit) {
+                return { type: 'power_chord_fifth_heard_root_weak' };
+            }
+            if (!root.hit && !fifth.hit) {
+                return _diagMissCauseFromSingleEvent(
+                    { ...chordEvent, hit: false, dx: null },
+                    reject,
+                ) || { type: 'power_chord_not_clear' };
+            }
+        }
+    }
+
+    if (hs === 1 && tt >= 2) {
+        return { type: 'power_chord_partial_one_of_two' };
+    }
+    if (hs === 0 || hs == null) {
+        if (reject && reject.reason === 'SILENCE_GATE') {
+            return { type: 'silence_or_gate' };
+        }
+        return { type: 'power_chord_not_clear' };
+    }
+    if (!chordEvent.hit) {
+        if (chordEvent.ts === 'EARLY' || chordEvent.ts === 'LATE') {
+            const ms = Number.isFinite(chordEvent.te) ? Math.abs(Math.round(chordEvent.te)) : null;
+            return {
+                type: chordEvent.ts === 'EARLY' ? 'timing_early' : 'timing_late',
+                detail: ms != null ? `about ${ms} ms` : null,
+            };
+        }
+        return { type: 'power_chord_not_clear' };
+    }
+    if (hs != null && hs < tt) {
+        return { type: 'power_chord_partial_one_of_two' };
+    }
+    return { type: 'unknown' };
+}
+
+function _summarizeDiagnosticCategoryCause(categoryId, categoryReport, specs, events, diagnosticPayload, opts) {
+    if (!categoryReport || categoryReport.misses === 0 || !specs || !specs.length) {
+        return null;
+    }
+    opts = opts || {};
+    const matchTolS = opts.matchTolS != null ? opts.matchTolS : 0.075;
+    const rejects = opts.verifierRejects || [];
+    const noteResults = opts.noteResults || null;
+    const voicing = opts.chordVoicing || [];
+    const profile = opts.profile || {};
+    const powerChordCategoryId = profile.powerChordCategoryId || 'powerChords';
+    const causes = [];
+
+    if (categoryId === powerChordCategoryId) {
+        for (const spec of specs) {
+            const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+            if (!ev || ev.hit) continue;
+            const constituents = _diagLookupConstituentJudgments(
+                noteResults, spec.t, voicing, matchTolS,
+            );
+            const cause = _analyzePowerChordAttempt(
+                ev, constituents, rejects, voicing, matchTolS,
+            );
+            if (cause) causes.push(cause);
+        }
+    } else if (categoryId === 'repeatCheck') {
+        const baselineHits = opts.baselineHits || {};
+        const pwrBaseline = opts.powerChordBaseline || null;
+        for (const spec of specs) {
+            const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+            if (!ev || ev.hit) continue;
+            if (!spec.chord && Number.isInteger(spec.s) && Number.isInteger(spec.f)) {
+                const base = baselineHits[`${spec.s}_${spec.f}`];
+                if (base && base.hit) {
+                    causes.push({
+                        type: 'repeat_inconsistency',
+                        detail: `${base.label || 'earlier note'} was hit before`,
+                    });
+                    continue;
+                }
+            }
+            if (spec.chord && pwrBaseline && pwrBaseline.hadHits) {
+                const constituents = _diagLookupConstituentJudgments(
+                    noteResults, spec.t, voicing, matchTolS,
+                );
+                const cause = _analyzePowerChordAttempt(
+                    ev, constituents, rejects, voicing, matchTolS,
+                );
+                if (cause) {
+                    causes.push({
+                        type: 'repeat_inconsistency',
+                        detail: 'power chords worked earlier in the song',
+                    });
+                    continue;
+                }
+            }
+            if (spec.chord) {
+                const constituents = _diagLookupConstituentJudgments(
+                    noteResults, spec.t, voicing, matchTolS,
+                );
+                const cause = _analyzePowerChordAttempt(
+                    ev, constituents, rejects, voicing, matchTolS,
+                );
+                if (cause) causes.push(cause);
+            } else {
+                const reject = _diagFindRejectNear(rejects, spec.t, matchTolS);
+                const cause = _diagMissCauseFromSingleEvent(ev, reject);
+                if (cause) causes.push(cause);
+            }
+        }
+    } else {
+        for (const spec of specs) {
+            const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+            if (!ev || ev.hit) continue;
+            const reject = _diagFindRejectNear(rejects, spec.t, matchTolS);
+            const cause = _diagMissCauseFromSingleEvent(ev, reject);
+            if (cause) causes.push(cause);
+        }
+    }
+
+    const primary = _diagPickPrimaryCause(causes);
+    return {
+        label: categoryReport.label,
+        cause: primary,
+        line: _formatDiagnosticCauseForMusician(primary),
+        nextStep: _diagMissCauseNextStep(primary.type),
+    };
+}
+
+function _buildDiagnosticMissCauseAnalysis(report, diagnosticPayload, opts) {
+    opts = opts || {};
+    const profile = opts.profile;
+    if (!report || !report.categories || !profile) {
+        return { summary: null, categories: {}, hasIssues: false };
+    }
+
+    const events = opts.events || (diagnosticPayload && diagnosticPayload.events) || [];
+    const matchTolS = profile.matchTolS != null ? profile.matchTolS : 0.075;
+    const chartEvents = profile.events || [];
+    const categories = {};
+    const typeCounts = {};
+    let hasIssues = false;
+
+    const baselineHits = {};
+    for (const spec of chartEvents) {
+        if (spec.category === 'repeatCheck') continue;
+        const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+        if (ev && ev.hit && !spec.chord) {
+            const catMeta = (profile.categories || {})[spec.category];
+            baselineHits[`${spec.s}_${spec.f}`] = {
+                hit: true,
+                label: (catMeta && catMeta.label) || spec.label,
+            };
+        }
+    }
+    const pwrId = profile.powerChordCategoryId || 'powerChords';
+    const pwrReport = report.categories[pwrId];
+    const powerChordBaseline = {
+        hadHits: !!(pwrReport && pwrReport.hits > 0),
+    };
+
+    const sharedOpts = {
+        matchTolS,
+        verifierRejects: opts.verifierRejects || [],
+        noteResults: opts.noteResults || null,
+        chordVoicing: profile.chordVoicing || [],
+        profile,
+        baselineHits,
+        powerChordBaseline,
+    };
+
+    for (const catId of Object.keys(report.categories)) {
+        const catReport = report.categories[catId];
+        if (!catReport || catReport.misses === 0) continue;
+        hasIssues = true;
+        const specs = chartEvents.filter((s) => s.category === catId);
+        const summary = _summarizeDiagnosticCategoryCause(
+            catId, catReport, specs, events, diagnosticPayload, sharedOpts,
+        );
+        if (summary) {
+            categories[catId] = summary;
+            const t = summary.cause && summary.cause.type;
+            if (t) typeCounts[t] = (typeCounts[t] || 0) + 1;
+        }
+    }
+
+    const bk = diagnosticPayload && diagnosticPayload.miss_breakdown;
+    const totalMisses = (report.overall && report.overall.misses) || 0;
+    const pureFrac = bk && totalMisses > 0 ? (bk.pure || 0) / totalMisses : 0;
+    const partialCount = (bk && bk.chordPartial) || 0;
+
+    let summary = null;
+    if (!hasIssues) {
+        summary = 'No major miss pattern found';
+    } else if (pureFrac >= 0.4 && totalMisses >= 2) {
+        summary = 'Several misses looked like silence or gate rejects — check input device, channel, and gain.';
+    } else if (partialCount >= 2 && partialCount >= totalMisses / 2) {
+        summary = 'Power chord partials may be tone or channel related — try a cleaner tone or mono input.';
+    } else {
+        let bestType = null;
+        let bestN = 0;
+        for (const [k, n] of Object.entries(typeCounts)) {
+            if (n > bestN) { bestN = n; bestType = k; }
+        }
+        if (bestType) {
+            summary = `Most likely: ${_formatDiagnosticCauseForMusician({ type: bestType }).toLowerCase()}`;
+        } else {
+            summary = 'Review the category notes below';
+        }
+    }
+
+    return { summary, categories, hasIssues };
+}
+
+function _renderDiagnosticMissCauseHtml(analysis) {
+    if (!analysis) return '';
+    const { summary, categories, hasIssues } = analysis;
+    if (!hasIssues) {
+        return '<div class="mt-2 text-[10px] text-gray-500">'
+            + 'Why notes may have missed: No major miss pattern found.'
+            + '</div>';
+    }
+    let html = '<div class="mt-2 pt-2 border-t border-gray-700/80">'
+        + '<div class="text-gray-300 text-[11px] font-semibold mb-1">Why notes may have missed</div>';
+    if (summary) {
+        html += `<div class="text-[10px] text-gray-400 mb-1.5">${summary}</div>`;
+    }
+    for (const catId of Object.keys(categories)) {
+        const c = categories[catId];
+        if (!c) continue;
+        html += '<div class="text-[10px] text-gray-400 mb-1">'
+            + `<span class="text-gray-300">${c.label}:</span> ${c.line}`;
+        if (c.nextStep) {
+            html += `<span class="text-gray-500"> · Next: ${c.nextStep}</span>`;
+        }
+        html += '</div>';
+    }
+    html += '</div>';
+    return html;
+}
+
 function _ndMidiToStringFret(midiNote, arrangement, stringCount, offsets, capo) {
     // Pure geometric fallback: walk strings 0..N and return the first position
     // that matches the pitch. Used when there is no chart context available
@@ -13659,6 +14073,10 @@ function createNoteDetector(options = {}) {
             matchTolS: 0.075,
             powerChordCategoryId: 'powerChords',
             expectedChordStrings: 2,
+            chordVoicing: [
+                { s: 0, f: 0, role: 'root' },
+                { s: 1, f: 2, role: 'fifth' },
+            ],
             displayOrder: ['openLow', 'openNext', 'fretted', 'powerChords', 'repeatCheck'],
             singleHitMissCategories: ['openLow', 'openNext', 'fretted'],
             events: [
@@ -13701,19 +14119,6 @@ function createNoteDetector(options = {}) {
                 && info.arrangement === track.arrangement) {
                 return track;
             }
-        }
-        return null;
-    }
-
-    function _diagMatchProfileEvent(events, spec, matchTolS) {
-        for (const ev of events) {
-            if (!ev || !Number.isFinite(ev.t)) continue;
-            if (Math.abs(ev.t - spec.t) > matchTolS) continue;
-            if (!!ev.chord !== !!spec.chord) continue;
-            if (!spec.chord) {
-                if (ev.s !== spec.s || ev.f !== spec.f) continue;
-            }
-            return ev;
         }
         return null;
     }
@@ -13897,19 +14302,26 @@ function createNoteDetector(options = {}) {
 
         if (!rows) return '';
 
-        let notes = '<p class="text-[10px] text-gray-500 mt-2">'
+        let missCauseHtml = '';
+        try {
+            const diagnosticPayload = _buildDiagnosticPayload();
+            const analysis = _buildDiagnosticMissCauseAnalysis(report, diagnosticPayload, {
+                profile,
+                events: _diagEvents.slice(),
+                noteResults,
+                verifierRejects: _ndVerifierRejects.slice(),
+            });
+            missCauseHtml = _renderDiagnosticMissCauseHtml(analysis);
+        } catch (_) { /* read-only report */ }
+
+        const notes = '<p class="text-[10px] text-gray-500 mt-2">'
             + 'This diagnostic report did not change gameplay settings.'
             + '</p>';
-        if (report.hasPartialPowerChords) {
-            notes += '<p class="text-[10px] text-gray-500 mt-1">'
-                + 'Power chords were partly heard. Try a cleaner/drier channel or run '
-                + 'Technique Assessment for root/fifth detail.'
-                + '</p>';
-        }
 
         return `<div class="mt-3 text-xs border-t border-gray-600 pt-3">`
             + `<div class="text-gray-200 text-xs font-semibold mb-2">Diagnostic Results</div>`
             + rows
+            + missCauseHtml
             + notes
             + `</div>`;
     }
