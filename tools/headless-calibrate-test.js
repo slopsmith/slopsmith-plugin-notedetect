@@ -65,10 +65,12 @@ const ARR = parseInt(process.env.ARRANGEMENT || '2', 10);
     // mean calibration worked. Require that detections actually accumulated
     // AND a usable offset was produced.
     const failures = [];
-    const maxDet = Array.isArray(out.detSamples)
-      ? Math.max(0, ...out.detSamples.map(v => Number(v) || 0))
-      : 0;
-    if (maxDet === 0) failures.push('no detections captured');
+    // detSamples holds _calDebug().detections (a count), but tolerate an array
+    // shape too so a future _calDebug change can't silently false-fail here.
+    const hasDetections = Array.isArray(out.detSamples) && out.detSamples.some(v =>
+      Array.isArray(v) ? v.length > 0 : Number(v) > 0
+    );
+    if (!hasDetections) failures.push('no detections captured');
     const cal = out.lastCalibration;
     if (!(cal && typeof cal === 'object' && Number.isFinite(Number(cal.offsetMs))))
       failures.push('no calibration result produced');
