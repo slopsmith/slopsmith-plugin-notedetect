@@ -262,3 +262,277 @@
     0%   { filter: brightness(2.4); }
     100% { filter: brightness(1); }
 }
+
+/* ── End-of-song results screen ───────────────────────────────────────── */
+
+.nd-summary-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(0, 0, 0, 0.62);
+    backdrop-filter: blur(5px);
+    font-family: var(--nd-font-display);
+    color: var(--nd-text);
+}
+
+.nd-sum-panel {
+    width: 26rem;
+    max-width: 92vw;
+    max-height: 88vh;
+    overflow-y: auto;
+    padding: 1.4rem 1.5rem 1.2rem;
+    background-color: var(--nd-bg);
+    background-image: var(--nd-texture);
+    border-radius: var(--nd-radius);
+    border-left: var(--nd-edge);
+    box-shadow: var(--nd-bevel);
+    clip-path: var(--nd-clip);
+}
+
+.nd-sum-header {
+    text-align: center;
+    font-size: 0.78rem;
+    letter-spacing: 0.35em;
+    text-transform: uppercase;
+    color: var(--nd-dim);
+    margin-bottom: 0.5rem;
+}
+
+/* Grade stamp + full-combo callout + confetti layer. The stamp starts
+   oversized/invisible and slams in 1.2 s into the reveal. */
+.nd-sum-grade-wrap {
+    position: relative;
+    text-align: center;
+    min-height: 7rem;
+    margin-bottom: 0.3rem;
+}
+.nd-sum-confetti {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+.nd-sum-grade {
+    display: inline-block;
+    margin-top: 0.5rem;
+    font-family: var(--nd-font-grade);
+    font-size: 4.6rem;
+    line-height: 1;
+    color: var(--nd-accent);
+    text-shadow: var(--nd-glow-accent);
+    opacity: 0;
+    transform: scale(2.4) rotate(-6deg);
+}
+.nd-sum-grade[data-grade="S"] { color: var(--nd-accent2); }
+.nd-sum-grade[data-grade="D"],
+.nd-sum-grade[data-grade="F"] { color: var(--nd-miss); }
+.nd-sum-fc {
+    margin-top: 0.25rem;
+    font-size: 0.7rem;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+    color: var(--nd-hit);
+    text-shadow: var(--nd-glow-current);
+    opacity: 0;
+}
+.nd-revealed .nd-sum-grade {
+    animation: nd-grade-stamp 0.5s cubic-bezier(0.2, 1.4, 0.4, 1) 1.2s forwards;
+}
+.nd-revealed .nd-sum-fc {
+    animation: nd-fade-in 0.4s ease-out 1.7s forwards;
+}
+@keyframes nd-grade-stamp {
+    from { opacity: 0; transform: scale(2.4) rotate(-6deg); }
+    to   { opacity: 1; transform: scale(1) rotate(0); }
+}
+@keyframes nd-fade-in {
+    to { opacity: 1; }
+}
+
+/* Headline: accuracy % + score, count-up driven from JS. */
+.nd-sum-headline {
+    display: flex;
+    justify-content: center;
+    gap: 2.4rem;
+    margin: 0.3rem 0 0.9rem;
+    text-align: center;
+}
+.nd-sum-acc,
+.nd-sum-score {
+    font-size: 2rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+.nd-sum-score {
+    color: var(--nd-accent);
+    text-shadow: var(--nd-glow-accent);
+}
+.nd-sum-label {
+    margin-top: 0.1rem;
+    font-size: 0.6rem;
+    font-weight: 400;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--nd-dim);
+}
+
+/* Stat rows — staggered slide-in via per-row --row-i delays. */
+.nd-sum-stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.4rem 0.9rem;
+    margin-bottom: 0.6rem;
+}
+.nd-sum-stat {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 0.32rem 0.6rem;
+    background: rgba(255, 255, 255, 0.045);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: calc(var(--nd-radius) * 0.6 + 2px);
+    opacity: 0;
+    transform: translateY(6px);
+}
+.nd-revealed .nd-sum-stat {
+    animation: nd-row-in 0.35s ease-out forwards;
+    animation-delay: calc(0.25s + var(--row-i, 0) * 0.12s);
+}
+@keyframes nd-row-in {
+    to { opacity: 1; transform: translateY(0); }
+}
+.nd-sum-stat-label {
+    font-size: 0.66rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--nd-dim);
+}
+.nd-sum-stat-val {
+    font-size: 0.95rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+.nd-val-good   { color: var(--nd-hit); }
+.nd-val-bad    { color: var(--nd-miss); }
+.nd-val-accent { color: var(--nd-accent); }
+
+/* XP award row — hidden until the minigames response lands. */
+.nd-sum-xp {
+    margin: -0.1rem 0 0.55rem;
+    text-align: center;
+    font-size: 0.8rem;
+    letter-spacing: 0.06em;
+    color: var(--nd-hit);
+    text-shadow: var(--nd-glow-current);
+}
+
+/* Per-section / miss-breakdown bars. */
+.nd-sum-subhead {
+    margin: 0.55rem 0 0.3rem;
+    font-size: 0.62rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--nd-dim);
+}
+.nd-sum-bar-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.28rem;
+    font-size: 0.66rem;
+}
+.nd-sum-bar-label {
+    width: 6.4rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: left;
+    color: var(--nd-text);
+    opacity: 0.85;
+}
+.nd-sum-bar-track {
+    flex: 1;
+    height: 0.42rem;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 99px;
+    overflow: hidden;
+}
+.nd-sum-bar-fill {
+    height: 100%;
+    width: 0;
+    border-radius: 99px;
+}
+.nd-revealed .nd-sum-bar-fill {
+    animation: nd-bar-fill 0.7s ease-out 0.55s forwards;
+}
+@keyframes nd-bar-fill {
+    to { width: var(--nd-bar-w, 0%); }
+}
+.nd-bar-good { background: var(--nd-hit); }
+.nd-bar-mid  { background: var(--nd-warn); }
+.nd-bar-bad  { background: var(--nd-miss); }
+.nd-bar-dim  { background: var(--nd-dim); }
+.nd-bar-alt  { background: var(--nd-accent2); }
+.nd-bar-cool { background: var(--nd-accent); }
+
+.nd-sum-note {
+    margin-top: 0.4rem;
+    font-size: 0.6rem;
+    line-height: 1.5;
+    color: var(--nd-dim);
+}
+
+/* Action buttons. */
+.nd-sum-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 1rem;
+}
+.nd-btn {
+    flex: 1;
+    pointer-events: auto;
+    cursor: pointer;
+    padding: 0.5rem 0.8rem;
+    font-family: var(--nd-font-display);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--nd-text);
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: calc(var(--nd-radius) * 0.7 + 2px);
+    transition: background 0.15s, border-color 0.15s, filter 0.15s;
+}
+.nd-btn:hover { background: rgba(255, 255, 255, 0.13); }
+.nd-btn:focus-visible {
+    outline: 2px solid var(--nd-accent);
+    outline-offset: 2px;
+    border-color: var(--nd-accent);
+}
+.nd-btn-primary {
+    color: #fff;
+    background: linear-gradient(135deg, var(--nd-accent), var(--nd-accent2));
+    border-color: transparent;
+}
+.nd-btn-primary:hover { filter: brightness(1.12); }
+
+/* Reduced motion: reveal-gated elements must still become visible when the
+   keyframes are off. */
+@media (prefers-reduced-motion: reduce) {
+    .nd-sum-grade,
+    .nd-sum-fc,
+    .nd-sum-stat {
+        opacity: 1;
+        transform: none;
+        animation: none;
+    }
+    .nd-sum-bar-fill {
+        width: var(--nd-bar-w, 0%);
+        animation: none;
+    }
+}

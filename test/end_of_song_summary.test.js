@@ -73,3 +73,65 @@ test('song:ended on a disabled instance does not throw', () => {
     });
     det.destroy();
 });
+
+// ── Results-screen rewrite (game-grade summary) ─────────────────────────
+// The rewritten showSummary is defensive about absent DOM (vm stubs), so
+// the build path itself plus the notedetect:session payload are now
+// assertable headlessly. Visual reveal/confetti are browser-only.
+
+function _judgment(hit, extra = {}) {
+    return { hit, note: { s: 1, f: 0 }, noteTime: 0, judgedAt: 0, ...extra };
+}
+
+test('showSummary returns false under 5 judgments, true at 5+', () => {
+    const core = loadDetectionCore();
+    const det = core.createNoteDetector();
+    for (let i = 0; i < 4; i++) det._recordJudgment(`k${i}`, _judgment(true));
+    assert.equal(det.showSummary(), false);
+    det._recordJudgment('k4', _judgment(true));
+    assert.equal(det.showSummary(), true);
+    det.destroy();
+});
+
+test('notedetect:session carries the game-scoring additions', () => {
+    const events = [];
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sandbox) => {
+            // dispatchInstanceEvent tries window.dispatchEvent first; give the
+            // sandbox one so the session payload is observable.
+            sandbox.dispatchEvent = (ev) => events.push(ev);
+        },
+    });
+    const det = core.createNoteDetector();
+    for (let i = 0; i < 9; i++) det._recordJudgment(`k${i}`, _judgment(true));
+    det._recordJudgment('m0', _judgment(false));
+    assert.equal(det.showSummary(), true);
+    const session = events.find(e => e.type === 'notedetect:session');
+    assert.ok(session, 'session event published');
+    const d = session.detail;
+    assert.equal(d.accuracy, 90);
+    assert.equal(d.score, 9 * 50);
+    assert.equal(d.grade, 'A');
+    assert.equal(d.fullCombo, false);
+    assert.equal(d.maxMultiplier, 1);
+    // Pre-existing fields survive untouched.
+    assert.equal(d.hits, 9);
+    assert.equal(d.misses, 1);
+    assert.equal(d.bestStreak, 9);
+    det.destroy();
+});
+
+test('a clean take publishes fullCombo: true', () => {
+    const events = [];
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sandbox) => { sandbox.dispatchEvent = (ev) => events.push(ev); },
+    });
+    const det = core.createNoteDetector();
+    for (let i = 0; i < 12; i++) det._recordJudgment(`k${i}`, _judgment(true));
+    assert.equal(det.showSummary(), true);
+    const session = events.find(e => e.type === 'notedetect:session');
+    assert.ok(session);
+    assert.equal(session.detail.fullCombo, true);
+    assert.equal(session.detail.maxMultiplier, 2);
+    det.destroy();
+});

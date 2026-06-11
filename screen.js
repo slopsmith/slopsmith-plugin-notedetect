@@ -217,7 +217,7 @@ const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.13.0';
+const _ND_VERSION = '1.14.0';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -537,6 +537,14 @@ function _ndLoadSkin() {
         }
     } catch (e) { /* storage unavailable — fall through to the mirror */ }
     return _ndSkinRuntime;
+}
+
+// Minimal HTML escaper for chart-sourced strings (section names) that get
+// interpolated into summary innerHTML.
+function _ndEscapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
 }
 
 // Letter grade from accuracy percentage (0–100). Full combo is a separate
@@ -6814,7 +6822,13 @@ function createNoteDetector(options = {}) {
         _summaryDeferred = false;
         if (!isDefault) return;
         const overlay = instanceRoot.querySelector('.nd-summary-overlay');
-        if (overlay) overlay.style.display = '';
+        if (overlay) {
+            overlay.style.display = '';
+            // Play the reveal sequence now that the overlay is actually
+            // visible, using the stats captured at build time (the live
+            // counters may already belong to the next song).
+            _animateSummary(overlay, overlay._ndReveal);
+        }
     }
 
     function _endOfSongBindEvents() {
@@ -8631,21 +8645,21 @@ function createNoteDetector(options = {}) {
         if (existing) existing.remove();
 
         const accuracy = Math.round((hits / total) * 100);
+        const grade = _ndGradeFor(accuracy);
+        const fullCombo = misses === 0;
 
         let sectionHtml = '';
         if (sectionStats.length > 0) {
-            sectionHtml = '<div class="mt-3 text-xs"><div class="text-gray-400 mb-1">Per Section:</div>';
+            sectionHtml = '<div class="nd-sum-sections"><div class="nd-sum-subhead">Per Section</div>';
             for (const sec of sectionStats) {
                 const secTotal = sec.hits + sec.misses;
                 const secAcc = secTotal > 0 ? Math.round((sec.hits / secTotal) * 100) : 0;
-                const barColor = secAcc >= 90 ? 'bg-green-500' : secAcc >= 70 ? 'bg-yellow-500' : 'bg-red-500';
+                const cls = secAcc >= 90 ? 'nd-bar-good' : secAcc >= 70 ? 'nd-bar-mid' : 'nd-bar-bad';
                 sectionHtml += `
-                    <div class="flex items-center gap-2 mb-1">
-                        <span class="w-24 truncate text-gray-300">${sec.name}</span>
-                        <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
-                            <div class="${barColor} h-full rounded" style="width:${secAcc}%"></div>
-                        </div>
-                        <span class="w-10 text-right text-gray-400">${secAcc}%</span>
+                    <div class="nd-sum-bar-row">
+                        <span class="nd-sum-bar-label">${_ndEscapeHtml(sec.name)}</span>
+                        <div class="nd-sum-bar-track"><div class="nd-sum-bar-fill ${cls}" style="--nd-bar-w:${secAcc}%"></div></div>
+                        <span class="nd-sum-bar-val">${secAcc}%</span>
                     </div>
                 `;
             }
@@ -8654,37 +8668,35 @@ function createNoteDetector(options = {}) {
 
         // Miss-category breakdown (#254 follow-up) — bars sum to total misses
         // so the dominant failure mode is visible at a glance. Tuning mode
-        // only — normal play sees just the original hits/misses/streak +
+        // only — normal play sees just the score/grade headline +
         // per-section bars.
         let breakdownHtml = '';
         if (tuningMode && misses > 0) {
             const labels = {
-                pure:         ['Pure (no pitch)',    'bg-gray-500'],
-                chordPartial: ['Chord — partial',    'bg-purple-500'],
-                early:        ['Timing — early',     'bg-orange-500'],
-                late:         ['Timing — late',      'bg-orange-500'],
-                sharp:        ['Pitch — sharp',      'bg-cyan-500'],
-                flat:         ['Pitch — flat',       'bg-cyan-500'],
+                pure:         ['Pure (no pitch)',    'nd-bar-dim'],
+                chordPartial: ['Chord — partial',    'nd-bar-alt'],
+                early:        ['Timing — early',     'nd-bar-mid'],
+                late:         ['Timing — late',      'nd-bar-mid'],
+                sharp:        ['Pitch — sharp',      'nd-bar-cool'],
+                flat:         ['Pitch — flat',       'nd-bar-cool'],
             };
-            breakdownHtml = '<div class="mt-3 text-xs"><div class="text-gray-400 mb-1">Miss Breakdown:</div>';
+            breakdownHtml = '<div class="nd-sum-sections"><div class="nd-sum-subhead">Miss Breakdown</div>';
             for (const k of Object.keys(labels)) {
                 const v = _diagBreakdown[k] || 0;
                 if (v === 0) continue;
                 const pct = Math.round((v / misses) * 100);
                 breakdownHtml += `
-                    <div class="flex items-center gap-2 mb-1">
-                        <span class="w-24 text-gray-300">${labels[k][0]}</span>
-                        <div class="flex-1 h-2 bg-dark-600 rounded overflow-hidden">
-                            <div class="${labels[k][1]} h-full rounded" style="width:${pct}%"></div>
-                        </div>
-                        <span class="w-12 text-right text-gray-400">${v} <span class="text-gray-600">(${pct}%)</span></span>
+                    <div class="nd-sum-bar-row">
+                        <span class="nd-sum-bar-label">${labels[k][0]}</span>
+                        <div class="nd-sum-bar-track"><div class="nd-sum-bar-fill ${labels[k][1]}" style="--nd-bar-w:${pct}%"></div></div>
+                        <span class="nd-sum-bar-val">${v} (${pct}%)</span>
                     </div>
                 `;
             }
             const timingMed = _diagPercentile(_diagTimingErrors, 50);
             const pitchMed  = _diagPercentile(_diagPitchErrors, 50);
             if (timingMed != null || pitchMed != null) {
-                breakdownHtml += '<div class="mt-2 text-[10px] text-gray-500">';
+                breakdownHtml += '<div class="nd-sum-note">';
                 if (timingMed != null) {
                     const tp10 = _diagPercentile(_diagTimingErrors, 10);
                     const tp90 = _diagPercentile(_diagTimingErrors, 90);
@@ -8701,53 +8713,174 @@ function createNoteDetector(options = {}) {
         }
 
         const overlay = document.createElement('div');
-        overlay.className = 'nd-summary-overlay fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+        overlay.className = 'nd-summary-overlay';
+        // Skin attribute mirrors the instance root's so the overlay (a
+        // separate top-level nd root in the CSS) themes identically.
+        try { overlay.setAttribute('data-nd-skin', _ndLoadSkin()); } catch (e) {}
         overlay.style.pointerEvents = 'auto';
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
         overlay.innerHTML = `
-            <div class="bg-dark-700 border border-gray-600 rounded-2xl p-6 w-96 max-h-[88vh] overflow-y-auto shadow-2xl">
-                <div class="text-center mb-4">
-                    <div class="text-3xl font-bold ${accuracy >= 90 ? 'text-green-400' : accuracy >= 70 ? 'text-yellow-400' : 'text-red-400'}">${accuracy}%</div>
-                    <div class="text-gray-400 text-sm">Accuracy</div>
+            <div class="nd-sum-panel">
+                <div class="nd-sum-header">Song Complete</div>
+                <div class="nd-sum-grade-wrap">
+                    <canvas class="nd-sum-confetti"></canvas>
+                    <div class="nd-sum-grade" data-grade="${grade}">${grade}</div>
+                    ${fullCombo ? '<div class="nd-sum-fc">Full Combo</div>' : ''}
                 </div>
-                <div class="grid grid-cols-3 gap-3 text-center text-sm mb-3">
-                    <div>
-                        <div class="text-green-400 font-bold">${hits}</div>
-                        <div class="text-gray-500 text-xs">Hits</div>
-                    </div>
-                    <div>
-                        <div class="text-red-400 font-bold">${misses}</div>
-                        <div class="text-gray-500 text-xs">Misses</div>
-                    </div>
-                    <div>
-                        <div class="text-blue-400 font-bold">${bestStreak}</div>
-                        <div class="text-gray-500 text-xs">Best Streak</div>
-                    </div>
+                <div class="nd-sum-headline">
+                    <div class="nd-sum-acc"><span class="nd-sum-acc-n">0</span>%<div class="nd-sum-label">Accuracy</div></div>
+                    <div class="nd-sum-score"><span class="nd-sum-score-n">0</span><div class="nd-sum-label">Score</div></div>
                 </div>
+                <div class="nd-sum-stats">
+                    <div class="nd-sum-stat" style="--row-i:0"><span class="nd-sum-stat-label">Hits</span><span class="nd-sum-stat-val nd-val-good">${hits}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:1"><span class="nd-sum-stat-label">Misses</span><span class="nd-sum-stat-val nd-val-bad">${misses}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:2"><span class="nd-sum-stat-label">Best Streak</span><span class="nd-sum-stat-val nd-val-accent">${bestStreak}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:3"><span class="nd-sum-stat-label">Max Multiplier</span><span class="nd-sum-stat-val nd-val-accent">×${maxMultiplier}</span></div>
+                </div>
+                <div class="nd-sum-xp hidden"></div>
                 ${breakdownHtml}
                 ${sectionHtml}
-                <div class="mt-4 flex gap-2">
+                <div class="nd-sum-actions">
                     ${tuningMode ? `
-                    <button class="nd-summary-download flex-1 py-2 bg-accent hover:bg-accent-light rounded-lg text-sm font-semibold text-white transition">
+                    <button class="nd-summary-download nd-btn nd-btn-primary">
                         Download Diagnostic JSON
                     </button>` : ''}
-                    <button class="nd-summary-close ${tuningMode ? 'px-4' : 'flex-1'} py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300 transition">
+                    <button class="nd-summary-close nd-btn">
                         Close
                     </button>
                 </div>
             </div>
         `;
-        overlay.querySelector('.nd-summary-close').onclick = () => overlay.remove();
+        const closeBtn = overlay.querySelector('.nd-summary-close');
+        if (closeBtn) closeBtn.onclick = () => overlay.remove();
         const dlBtn = overlay.querySelector('.nd-summary-download');
         if (dlBtn) dlBtn.onclick = () => _downloadDiagnostic();
+        // Capture the reveal-animation targets at BUILD time: a deferred
+        // (startHidden) summary is revealed after a new song's playSong hook
+        // may have reset the live counters, so _runDeferredSummary() must
+        // not re-read them.
+        overlay._ndReveal = { accuracy, score, grade };
         // startHidden: built now (so the stats are this song's) but kept
         // out of view until _runDeferredSummary() reveals it — used when
         // a training consent modal is taking the screen on song:ended.
         if (opts && opts.startHidden) overlay.style.display = 'none';
         instanceRoot.appendChild(overlay);
+        if (!(opts && opts.startHidden)) _animateSummary(overlay, overlay._ndReveal);
 
         publishToJournal(accuracy);
         return true;
+    }
+
+    // Reveal sequence for the results panel: adds .nd-revealed (which fires
+    // the CSS-side staggered row/bar/grade animations) and runs a single rAF
+    // count-up for the accuracy % and score headline. Under reduced motion
+    // (or without rAF) the final values land immediately and the CSS side is
+    // neutralized by the stylesheet's reduced-motion block.
+    function _animateSummary(overlay, vals) {
+        if (!overlay || !vals) return;
+        const accEl = overlay.querySelector('.nd-sum-acc-n');
+        const scoreEl = overlay.querySelector('.nd-sum-score-n');
+        const setFinal = () => {
+            if (accEl) accEl.textContent = String(vals.accuracy);
+            if (scoreEl) scoreEl.textContent = String(vals.score);
+        };
+        let reduced = false;
+        try {
+            reduced = !!(window.matchMedia
+                && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+        } catch (e) {}
+        const reveal = () => { try { overlay.classList.add('nd-revealed'); } catch (e) {} };
+        if (reduced || typeof requestAnimationFrame !== 'function') {
+            reveal();
+            setFinal();
+            return;
+        }
+        // Double-rAF so the panel has a laid-out first frame before the
+        // staggered animations start (single rAF can coalesce with the
+        // append and skip the from-state).
+        requestAnimationFrame(() => requestAnimationFrame(reveal));
+        const DUR_MS = 1400;
+        let start = null;
+        const tick = (now) => {
+            if (overlay.isConnected === false) return;   // closed mid-count
+            if (start === null) start = now;
+            const t = Math.min(1, (now - start) / DUR_MS);
+            const ease = 1 - Math.pow(1 - t, 3);
+            if (accEl) accEl.textContent = String(Math.round(vals.accuracy * ease));
+            if (scoreEl) scoreEl.textContent = String(Math.round(vals.score * ease));
+            if (t < 1) {
+                requestAnimationFrame(tick);
+            } else {
+                setFinal();
+                if (vals.grade === 'S' || vals.grade === 'A') _runConfetti(overlay);
+            }
+        };
+        requestAnimationFrame(tick);
+    }
+
+    // One-shot confetti burst over the grade stamp for S/A results. Pure
+    // canvas-2D, ~70 particles, self-terminating (~1.5 s), no listeners or
+    // timers left behind; bails under reduced motion or when the canvas is
+    // unavailable (vm tests, ancient browsers).
+    function _runConfetti(overlay) {
+        try {
+            if (window.matchMedia
+                && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+        } catch (e) {}
+        const canvas = overlay.querySelector('.nd-sum-confetti');
+        if (!canvas || typeof canvas.getContext !== 'function') return;
+        const wrap = canvas.parentElement;
+        const W = canvas.width = (wrap && wrap.clientWidth) || 360;
+        const H = canvas.height = (wrap && wrap.clientHeight) || 130;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        // Particle colors follow the active skin's accents.
+        let colors = ['#00f0ff', '#ff2ec4', '#00ff88', '#ffffff'];
+        try {
+            const cs = getComputedStyle(overlay);
+            const a = cs.getPropertyValue('--nd-accent').trim();
+            const b = cs.getPropertyValue('--nd-accent2').trim();
+            const h = cs.getPropertyValue('--nd-hit').trim();
+            if (a) colors = [a, b || a, h || a, '#ffffff'];
+        } catch (e) {}
+        const parts = [];
+        for (let i = 0; i < 70; i++) {
+            parts.push({
+                x: W / 2 + (Math.random() - 0.5) * W * 0.35,
+                y: H * 0.6,
+                vx: (Math.random() - 0.5) * 4.2,
+                vy: -(1.8 + Math.random() * 3.4),
+                rot: Math.random() * Math.PI,
+                vr: (Math.random() - 0.5) * 0.3,
+                size: 2.5 + Math.random() * 3.5,
+                color: colors[i % colors.length],
+            });
+        }
+        const LIFE_MS = 1500;
+        let t0 = null;
+        const frame = (now) => {
+            if (overlay.isConnected === false) return;
+            if (t0 === null) t0 = now;
+            const t = now - t0;
+            ctx.clearRect(0, 0, W, H);
+            if (t >= LIFE_MS) return;
+            const fade = 1 - t / LIFE_MS;
+            for (const p of parts) {
+                p.x += p.vx;
+                p.y += p.vy;
+                p.vy += 0.10;
+                p.rot += p.vr;
+                ctx.save();
+                ctx.globalAlpha = fade;
+                ctx.translate(p.x, p.y);
+                ctx.rotate(p.rot);
+                ctx.fillStyle = p.color;
+                ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size * 0.6);
+                ctx.restore();
+            }
+            requestAnimationFrame(frame);
+        };
+        requestAnimationFrame(frame);
     }
 
     function publishToJournal(accuracy) {
