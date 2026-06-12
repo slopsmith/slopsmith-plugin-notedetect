@@ -1813,6 +1813,15 @@ function createNoteDetector(options = {}) {
     let inputPeak = 0;
     let peakDecay = 0;
 
+    // Input-stream health. A USB interface (Scarlett etc.) can drop its input
+    // mid-session — a buffer underrun, power management, a sample-rate
+    // re-clock — which fires `mute`/`ended` on the getUserMedia track. Without
+    // watching for it the detector silently runs on dead audio (no input
+    // level, nothing scored, no idea why). `_inputLost` surfaces it on the
+    // Detect button and gates a single throttled re-acquire to recover.
+    let _inputLost = false;
+    let _lastInputRecover = 0;
+
     // Calibration Wizard v2 — system setup only (safe settings; no scoring thresholds)
     let _calWizardEl = null;
     let _calWizardTick = null;
@@ -3172,6 +3181,8 @@ function createNoteDetector(options = {}) {
 
             startLevelMeter();
             populateDevices();
+            _bindStreamHealth(stream);
+            _inputLost = false;
 
             return true;
         } catch (e) {
@@ -3198,7 +3209,46 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // Watch the live input track for the interface dropping out mid-session.
+    // `mute`/`ended` = the device stopped delivering audio (USB underrun,
+    // power management, re-clock, unplug). We surface it (so the user isn't
+    // left guessing why nothing scored) and, after a short grace for the
+    // device to self-heal, re-acquire ONCE — throttled so a flapping device
+    // can't thrash getUserMedia. `unmute` clears it without a re-acquire.
+    function _bindStreamHealth(s) {
+        if (!s || typeof s.getAudioTracks !== 'function') return;
+        const track = s.getAudioTracks()[0];
+        if (!track) return;
+        const markLost = (why) => {
+            if (_inputLost || !enabled) return;
+            _inputLost = true;
+            console.warn(`[note_detect] input ${why} — the audio interface dropped the input stream`);
+            try { updateButton(); } catch (_) {}
+            // Grace period: a transient mute often self-heals (unmute clears
+            // _inputLost). If still lost after it, re-acquire — but no more
+            // than once per 4 s so a USB glitch storm can't thrash the device.
+            setTimeout(() => {
+                if (!enabled || !_inputLost) return;
+                const now = (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
+                if (now - _lastInputRecover < 4000) return;
+                _lastInputRecover = now;
+                console.warn('[note_detect] re-acquiring input after drop');
+                try { restartAudio(); } catch (_) {}
+            }, 1500);
+        };
+        try {
+            track.addEventListener('ended', () => markLost('ended'));
+            track.addEventListener('mute', () => markLost('muted'));
+            track.addEventListener('unmute', () => {
+                if (!_inputLost) return;
+                _inputLost = false;
+                try { updateButton(); } catch (_) {}
+            });
+        } catch (_) { /* track event API unavailable */ }
+    }
+
     function stopAudio() {
+        _inputLost = false;
         stopLevelMeter();
         stopBridgeLevelMeter();
         if (detectInterval) { clearInterval(detectInterval); detectInterval = null; }
@@ -10385,6 +10435,11 @@ function createNoteDetector(options = {}) {
         if (loading) {
             detectBtn.textContent = 'Detect (loading model...)';
             detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-dark-600 rounded-lg text-xs text-gray-400 transition';
+        } else if (enabled && _inputLost) {
+            // Detection is on but the audio interface stopped delivering input
+            // \u2014 tell the user instead of silently scoring nothing.
+            detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-amber-900/50 rounded-lg text-xs text-amber-300 transition';
+            detectBtn.textContent = 'Detect \u2014 input lost';
         } else if (enabled) {
             detectBtn.className = 'nd-detect-btn px-3 py-1.5 bg-green-900/50 rounded-lg text-xs text-green-300 transition';
             detectBtn.textContent = 'Detect \u2713';
