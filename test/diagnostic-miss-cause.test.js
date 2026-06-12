@@ -150,6 +150,53 @@ test('unknown data → honest unknown wording', () => {
     assert.match(core.formatDiagnosticCauseForMusician(cause), /Not enough detail/i);
 });
 
+test('normal song bails showSummary gate when total judgments < 5', () => {
+    assert.equal(core.shouldBailShowSummaryForLowJudgments(false, 0), true);
+    assert.equal(core.shouldBailShowSummaryForLowJudgments(false, 4), true);
+    assert.equal(core.shouldBailShowSummaryForLowJudgments(false, 5), false);
+});
+
+test('diagnostic session bypasses showSummary gate when total judgments is 0', () => {
+    assert.equal(core.shouldBailShowSummaryForLowJudgments(true, 0), false);
+    assert.equal(core.shouldBailShowSummaryForLowJudgments(true, 4), false);
+});
+
+test('zero matched events synthesizes all-missed Basic Guitar report', () => {
+    const report = core.synthesizeZeroInputDiagnosticPlayReport(
+        BASIC_PROFILE,
+        'basic-guitar-v1',
+        { hits: 0, misses: 0, bestStreak: 0 },
+    );
+    assert.ok(report);
+    assert.equal(report.synthesizedZeroInput, true);
+    assert.equal(report.matchedCount, 0);
+    assert.equal(report.overall.hits, 0);
+    assert.equal(report.overall.misses, BASIC_PROFILE.events.length);
+    assert.equal(report.categories.openLow.attempts, 1);
+    assert.equal(report.categories.openLow.misses, 1);
+    assert.equal(report.categories.powerChords.attempts, 1);
+    assert.equal(report.categories.powerChords.chordMisses, 1);
+    assert.ok(report.categories.powerChords.perAttempt.length);
+});
+
+test('zero-input synthesized report explains no input in miss-cause HTML', () => {
+    const report = core.synthesizeZeroInputDiagnosticPlayReport(
+        BASIC_PROFILE,
+        'basic-guitar-v1',
+        { hits: 0, misses: 0, bestStreak: 0 },
+    );
+    const analysis = core.buildDiagnosticMissCauseAnalysis(report, {}, {
+        profile: BASIC_PROFILE,
+        events: [],
+    });
+    const html = core.renderDiagnosticMissCauseHtml(analysis);
+    assert.equal(analysis.hasIssues, true);
+    assert.match(analysis.summary, /No input was detected/i);
+    assert.match(html, /Why notes may have missed/);
+    assert.match(html, /No input was detected/i);
+    assert.match(html, /audio input device/i);
+});
+
 test('rendered report still says settings were not changed automatically', () => {
     const report = makeReport();
     const events = [

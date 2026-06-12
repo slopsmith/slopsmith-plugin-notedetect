@@ -726,6 +726,90 @@ function _diagMatchProfileEvent(events, spec, matchTolS) {
     return null;
 }
 
+// Normal songs skip the end-of-song summary when fewer than 5 judgments
+// landed. Diagnostic sloppaks bypass this — a no-input run should still
+// surface the read-only Diagnostic Results report.
+function _shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total) {
+    return !isDiagnosticSession && total < 5;
+}
+
+const _DIAG_ZERO_INPUT_MISS_CAUSE_SUMMARY =
+    'No input was detected during the diagnostic. Check the selected audio input device, channel, cable, gain, and whether your guitar/Spark is plugged in.';
+
+// Read-only fallback when the diagnostic finished with zero matched play
+// events (e.g. AudioEngine never delivered verdicts). Synthesizes category
+// rows from the static profile without touching gameplay score/verifier state.
+function _synthesizeZeroInputDiagnosticPlayReport(profile, reportProfileId, liveStats) {
+    liveStats = liveStats || {};
+    const chartEvents = profile.events || [];
+    const categoryMeta = profile.categories || {};
+    const powerChordCategoryId = profile.powerChordCategoryId || 'powerChords';
+    const expectedChordStrings = profile.expectedChordStrings != null
+        ? profile.expectedChordStrings
+        : 2;
+    const categories = {};
+
+    for (const catId of Object.keys(categoryMeta)) {
+        const specs = chartEvents.filter((s) => s.category === catId);
+        if (!specs.length) continue;
+        const chordAttempts = [];
+        for (const spec of specs) {
+            if (spec.chord) {
+                chordAttempts.push({ t: spec.t, hit: false, hs: null, tt: expectedChordStrings });
+            }
+        }
+        const cat = {
+            id: catId,
+            label: categoryMeta[catId].label,
+            attempts: specs.length,
+            hits: 0,
+            misses: specs.length,
+            accuracy: 0,
+            timingMedianMs: null,
+        };
+        if (catId === powerChordCategoryId && chordAttempts.length) {
+            cat.chordHits = 0;
+            cat.chordMisses = chordAttempts.length;
+            cat.avgStringsHeard = null;
+            cat.expectedStrings = expectedChordStrings;
+            cat.perAttempt = chordAttempts.map((c) => ({
+                t: c.t,
+                hit: false,
+                heardTxt: 'strings heard unknown',
+            }));
+        }
+        categories[catId] = cat;
+    }
+
+    const liveHits = liveStats.hits || 0;
+    const liveMisses = liveStats.misses || 0;
+    const playTotal = liveHits + liveMisses;
+    const synthMisses = chartEvents.length;
+    const overall = playTotal > 0
+        ? {
+            hits: liveHits,
+            misses: liveMisses,
+            accuracy: Math.round((liveHits / playTotal) * 100),
+            bestStreak: liveStats.bestStreak || 0,
+        }
+        : {
+            hits: 0,
+            misses: synthMisses,
+            accuracy: 0,
+            bestStreak: 0,
+        };
+
+    return {
+        reportProfile: reportProfileId,
+        overall,
+        categories,
+        matchedCount: 0,
+        synthesizedZeroInput: true,
+        hasPartialPowerChords: false,
+        sections: liveStats.sections || [],
+    };
+}
+
 function _diagFindRejectNear(rejects, t, toleranceS) {
     const tol = toleranceS != null ? toleranceS : 0.075;
     if (!rejects || !Number.isFinite(t)) return null;
@@ -1003,6 +1087,14 @@ function _buildDiagnosticMissCauseAnalysis(report, diagnosticPayload, opts) {
     const profile = opts.profile;
     if (!report || !report.categories || !profile) {
         return { summary: null, categories: {}, hasIssues: false };
+    }
+
+    if (report.synthesizedZeroInput) {
+        return {
+            summary: _DIAG_ZERO_INPUT_MISS_CAUSE_SUMMARY,
+            categories: {},
+            hasIssues: true,
+        };
     }
 
     const events = opts.events || (diagnosticPayload && diagnosticPayload.events) || [];
@@ -14131,7 +14223,21 @@ function createNoteDetector(options = {}) {
         for (const spec of chartEvents) {
             if (_diagMatchProfileEvent(events, spec, matchTolS)) matchedCount++;
         }
-        if (matchedCount === 0) return null;
+        if (matchedCount === 0) {
+            return _synthesizeZeroInputDiagnosticPlayReport(profile, reportProfileId, {
+                hits,
+                misses,
+                bestStreak,
+                sections: sectionStats.map((s) => ({
+                    name: s.name,
+                    hits: s.hits,
+                    misses: s.misses,
+                    accuracy: (s.hits + s.misses) > 0
+                        ? Math.round((s.hits / (s.hits + s.misses)) * 100)
+                        : 0,
+                })),
+            });
+        }
 
         const playTotal = hits + misses;
         const overall = {
@@ -14330,13 +14436,15 @@ function createNoteDetector(options = {}) {
     // (fewer than 5 judgments) — callers deferring the summary use this
     // to know whether there is actually an overlay to reveal later.
     function showSummary(opts) {
+        const diagnosticTrack = _getDiagnosticTrackForSession();
+        const isDiagnosticSession = !!diagnosticTrack;
         const total = hits + misses;
-        if (total < 5) return false;
+        if (_shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total)) return false;
 
         const existing = instanceRoot.querySelector('.nd-summary-overlay');
         if (existing) existing.remove();
 
-        const accuracy = Math.round((hits / total) * 100);
+        const accuracy = total > 0 ? Math.round((hits / total) * 100) : 0;
         const grade = _ndGradeFor(accuracy);
         const fullCombo = misses === 0;
 
@@ -14405,7 +14513,6 @@ function createNoteDetector(options = {}) {
         }
 
         let diagnosticPlayHtml = '';
-        const diagnosticTrack = _getDiagnosticTrackForSession();
         const diagnosticReport = diagnosticTrack
             ? _buildDiagnosticPlayReport(diagnosticTrack)
             : null;
