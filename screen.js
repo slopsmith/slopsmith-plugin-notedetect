@@ -2193,6 +2193,7 @@ function createNoteDetector(options = {}) {
     // (per instance — splitscreen has multiple detectors) and only re-resolve
     // when the cached node is missing/disconnected. `_vuPanelAbsent` latches
     // a confirmed-closed panel so we don't query 60×/sec while it's closed.
+    let _vuPanelEl = null;   // this instance's own settings panel (splitscreen-safe)
     let _vuBarEl = null;
     let _vuPeakEl = null;
     let _vuPanelAbsent = false;
@@ -3416,10 +3417,12 @@ function createNoteDetector(options = {}) {
     // teardown.
     function _vuSetPanel(panel) {
         if (panel) {
+            _vuPanelEl = panel;
             _vuBarEl = panel.querySelector('.nd-vu-bar');
             _vuPeakEl = panel.querySelector('.nd-vu-peak');
             _vuPanelAbsent = !_vuBarEl;
         } else {
+            _vuPanelEl = null;
             _vuBarEl = null;
             _vuPeakEl = null;
             _vuPanelAbsent = true;
@@ -3434,7 +3437,11 @@ function createNoteDetector(options = {}) {
         // loop doesn't querySelector every frame while it's closed.
         if (!bar || !bar.isConnected) {
             if (_vuPanelAbsent) return;
-            const panel = document.querySelector('.nd-settings-panel');
+            // Resolve ONLY against this instance's own panel ref — never a
+            // global document.querySelector, which in splitscreen could bind
+            // this detector to another instance's panel and drive the wrong
+            // VU meter (CodeRabbit). If our panel is gone, clear and return.
+            const panel = _vuPanelEl && _vuPanelEl.isConnected ? _vuPanelEl : null;
             if (!panel) { _vuSetPanel(null); return; }
             _vuSetPanel(panel);
             bar = _vuBarEl;
