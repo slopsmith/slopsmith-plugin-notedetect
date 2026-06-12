@@ -2185,6 +2185,17 @@ function createNoteDetector(options = {}) {
     // Timers
     let detectInterval = null;
     let levelRaf = null;
+    // Cached VU-meter element refs for drawSettingsVU(). The level-meter
+    // loop (startLevelMeter rAF + startBridgeLevelMeter 20Hz) runs always-on
+    // while detection is active, but the .nd-vu-bar only exists while the
+    // settings panel is open. A per-frame document.querySelector here showed
+    // up as ~2.5% main-thread CPU during 3D-highway playback. Cache the refs
+    // (per instance — splitscreen has multiple detectors) and only re-resolve
+    // when the cached node is missing/disconnected. `_vuPanelAbsent` latches
+    // a confirmed-closed panel so we don't query 60×/sec while it's closed.
+    let _vuBarEl = null;
+    let _vuPeakEl = null;
+    let _vuPanelAbsent = false;
     let bridgeLevelTimer = null;  // setInterval for the desktop-bridge level meter
     // Capability latch: true once we confirm the bridge engine has no
     // getLevels, so the sustain glow can fall back to a fixed alpha. Distinct
@@ -3398,10 +3409,38 @@ function createNoteDetector(options = {}) {
         }
     }
 
+    // Cache the VU-meter element refs for the currently-open settings panel.
+    // Called when the panel is (re)built in showSettings(); clears the
+    // "panel absent" latch so drawSettingsVU() resumes updating. Pass a
+    // panel element to resolve within it, or null to clear the cache on
+    // teardown.
+    function _vuSetPanel(panel) {
+        if (panel) {
+            _vuBarEl = panel.querySelector('.nd-vu-bar');
+            _vuPeakEl = panel.querySelector('.nd-vu-peak');
+            _vuPanelAbsent = !_vuBarEl;
+        } else {
+            _vuBarEl = null;
+            _vuPeakEl = null;
+            _vuPanelAbsent = true;
+        }
+    }
+
     function drawSettingsVU() {
-        const bar = document.querySelector('.nd-settings-panel .nd-vu-bar');
-        const peak = document.querySelector('.nd-settings-panel .nd-vu-peak');
-        if (!bar) return;
+        let bar = _vuBarEl;
+        // Re-resolve only when the cached node is gone (panel rebuilt by
+        // another instance, or refs not yet cached). Once we confirm the
+        // panel is absent we latch _vuPanelAbsent so the always-on level
+        // loop doesn't querySelector every frame while it's closed.
+        if (!bar || !bar.isConnected) {
+            if (_vuPanelAbsent) return;
+            const panel = document.querySelector('.nd-settings-panel');
+            if (!panel) { _vuSetPanel(null); return; }
+            _vuSetPanel(panel);
+            bar = _vuBarEl;
+            if (!bar) return;
+        }
+        const peak = _vuPeakEl && _vuPeakEl.isConnected ? _vuPeakEl : null;
         const pct = Math.round(inputLevel * 100);
         bar.style.width = pct + '%';
         bar.className = pct > 85 ? 'nd-vu-bar h-full rounded transition-all duration-75 bg-red-500'
@@ -9186,6 +9225,7 @@ function createNoteDetector(options = {}) {
                 clearInterval(panel._ndHealthTick);
                 panel._ndHealthTick = null;
             }
+            _vuSetPanel(null);
             if (panel.isConnected) {
                 panel.remove();
                 return;
@@ -9378,6 +9418,9 @@ function createNoteDetector(options = {}) {
         `;
 
         document.body.appendChild(panel);
+        // Cache the VU-meter refs for the always-on level loop so
+        // drawSettingsVU() stops querying the DOM every frame.
+        _vuSetPanel(panel);
 
         // Wire up controls
         panel.querySelector('.nd-settings-close').onclick = () => {
@@ -9385,6 +9428,7 @@ function createNoteDetector(options = {}) {
                 clearInterval(panel._ndHealthTick);
                 panel._ndHealthTick = null;
             }
+            _vuSetPanel(null);
             panel.remove();
         };
 
@@ -11849,6 +11893,7 @@ function createNoteDetector(options = {}) {
             }
             panel.remove();
         }
+        _vuSetPanel(null);
         calibrationWizardClose();
         calibrationLabClose();
 
