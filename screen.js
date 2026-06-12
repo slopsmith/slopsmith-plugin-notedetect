@@ -733,6 +733,80 @@ function _shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total) {
     return !isDiagnosticSession && total < 5;
 }
 
+// Summary overlay must mount on document.body — same as the calibration
+// wizard / lab modals. Appending under .nd-instance-root inside #player traps
+// position:fixed inside the player containing block, so only the panel footer
+// peeks out at the bottom-left behind the transport bar.
+function _ndSummaryOverlayMountNode() {
+    return document.body;
+}
+
+function _ndFindSummaryOverlay() {
+    return document.querySelector('.nd-summary-overlay');
+}
+
+// Read-only diagnostic rows for the end-of-song summary panel (nd-sum-* classes
+// so layout works without Tailwind inside the modal).
+function _buildDiagnosticBasicGuitarPlayHtml(report, profile, missCauseHtml) {
+    if (!report || !report.categories || !profile) return '';
+    const cats = report.categories;
+    let rows = '';
+
+    for (const id of (profile.singleHitMissCategories || [])) {
+        const c = cats[id];
+        if (!c || !c.attempts) continue;
+        rows += '<div class="nd-sum-bar-row">'
+            + `<span class="nd-sum-bar-label">${_ndEscapeHtml(c.label)}</span>`
+            + `<span class="nd-sum-bar-val ${c.hits > 0 ? 'nd-val-good' : 'nd-val-bad'}">`
+            + `${c.hits > 0 ? 'Hit' : 'Miss'}</span>`
+            + '</div>';
+    }
+
+    const pwr = cats[profile.powerChordCategoryId || 'powerChords'];
+    if (pwr && pwr.attempts) {
+        rows += '<div class="nd-sum-bar-row">'
+            + `<span class="nd-sum-bar-label">${_ndEscapeHtml(pwr.label)}</span>`
+            + `<span class="nd-sum-bar-val nd-val-bad">${pwr.hits}/${pwr.attempts} hit</span>`
+            + '</div>';
+        if (pwr.avgStringsHeard != null) {
+            rows += `<div class="nd-sum-note">${pwr.chordHits}/${pwr.attempts} hit`
+                + ` · avg heard ${pwr.avgStringsHeard.toFixed(1)} of ${pwr.expectedStrings} strings</div>`;
+        } else {
+            rows += `<div class="nd-sum-note">${pwr.hits}/${pwr.attempts} hit</div>`;
+        }
+        const partialLines = (pwr.perAttempt || [])
+            .filter((a) => a.heardTxt && (!a.hit || a.heardTxt.indexOf('heard 2 of 2') === -1))
+            .map((a) => {
+                const prefix = Number.isFinite(a.t) ? `${a.t}s: ` : '';
+                return `${prefix}${a.heardTxt}`;
+            });
+        if (partialLines.length) {
+            rows += `<div class="nd-sum-note">${partialLines.join('<br>')}</div>`;
+        }
+    }
+
+    const rep = cats.repeatCheck;
+    if (rep && rep.attempts) {
+        rows += '<div class="nd-sum-bar-row">'
+            + `<span class="nd-sum-bar-label">${_ndEscapeHtml(rep.label)}</span>`
+            + `<span class="nd-sum-bar-val nd-val-bad">${rep.hits}/${rep.attempts} hit</span>`
+            + '</div>';
+    }
+
+    if (!rows) return '';
+
+    const notes = '<p class="nd-sum-note">'
+        + 'This diagnostic report did not change gameplay settings.'
+        + '</p>';
+
+    return '<div class="nd-sum-sections">'
+        + '<div class="nd-sum-subhead">Diagnostic Results</div>'
+        + rows
+        + (missCauseHtml || '')
+        + notes
+        + '</div>';
+}
+
 const _DIAG_ZERO_INPUT_MISS_CAUSE_SUMMARY =
     'No input was detected during the diagnostic. Check the selected audio input device, channel, cable, gain, and whether your guitar/Spark is plugged in.';
 
@@ -12117,7 +12191,7 @@ function createNoteDetector(options = {}) {
     // visible. No overlay at all (closed already) → quietly do nothing.
     function _fillSummaryXpRow(res) {
         if (!res || !res.ok) return;
-        const overlay = instanceRoot.querySelector('.nd-summary-overlay');
+        const overlay = _ndFindSummaryOverlay();
         if (!overlay) return;
         let row = overlay.querySelector('.nd-sum-xp');
         if (!row) {
@@ -12141,7 +12215,7 @@ function createNoteDetector(options = {}) {
         if (!_summaryDeferred) return;
         _summaryDeferred = false;
         if (!isDefault) return;
-        const overlay = instanceRoot.querySelector('.nd-summary-overlay');
+        const overlay = _ndFindSummaryOverlay();
         if (overlay) {
             overlay.style.display = '';
             // Play the reveal sequence now that the overlay is actually
@@ -14340,12 +14414,6 @@ function createNoteDetector(options = {}) {
         return null;
     }
 
-    function _diagPlayReportHitMissHtml(hit) {
-        return hit
-            ? '<span class="text-green-400">Hit</span>'
-            : '<span class="text-red-400">Miss</span>';
-    }
-
     function _renderDiagnosticPlayHtml(report, reportProfileId) {
         if (!report || !report.categories) return '';
         if (reportProfileId === 'basic-guitar-v1') {
@@ -14357,56 +14425,6 @@ function createNoteDetector(options = {}) {
     function _renderDiagnosticBasicGuitarPlayHtml(report) {
         const profile = _DIAGNOSTIC_REPORT_PROFILES['basic-guitar-v1'];
         if (!report || !report.categories || !profile) return '';
-        const cats = report.categories;
-        let rows = '';
-
-        for (const id of (profile.singleHitMissCategories || [])) {
-            const c = cats[id];
-            if (!c || !c.attempts) continue;
-            rows += `<div class="flex justify-between gap-2 mb-1">`
-                + `<span class="text-gray-300">${c.label}</span>`
-                + _diagPlayReportHitMissHtml(c.hits > 0)
-                + `</div>`;
-        }
-
-        const pwr = cats[profile.powerChordCategoryId || 'powerChords'];
-        if (pwr && pwr.attempts) {
-            let pwrDetail = '';
-            if (pwr.avgStringsHeard != null) {
-                pwrDetail += `<div class="text-[10px] text-gray-500">`
-                    + `${pwr.chordHits}/${pwr.attempts} hit`
-                    + ` · avg heard ${pwr.avgStringsHeard.toFixed(1)} of ${pwr.expectedStrings} strings`
-                    + `</div>`;
-            } else {
-                pwrDetail += `<div class="text-[10px] text-gray-500">${pwr.hits}/${pwr.attempts} hit</div>`;
-            }
-            const partialLines = (pwr.perAttempt || [])
-                .filter((a) => a.heardTxt && (!a.hit || a.heardTxt.indexOf('heard 2 of 2') === -1))
-                .map((a) => {
-                    const prefix = Number.isFinite(a.t) ? `${a.t}s: ` : '';
-                    return `${prefix}${a.heardTxt}`;
-                });
-            if (partialLines.length) {
-                pwrDetail += `<div class="text-[10px] text-gray-500 mt-0.5">`
-                    + partialLines.join('<br>')
-                    + `</div>`;
-            }
-            rows += `<div class="mb-1">`
-                + `<div class="flex justify-between gap-2">`
-                + `<span class="text-gray-300">${pwr.label}</span>`
-                + `<span class="text-gray-400">${pwr.hits}/${pwr.attempts} hit</span>`
-                + `</div>${pwrDetail}</div>`;
-        }
-
-        const rep = cats.repeatCheck;
-        if (rep && rep.attempts) {
-            rows += `<div class="flex justify-between gap-2 mb-1">`
-                + `<span class="text-gray-300">${rep.label}</span>`
-                + `<span class="text-gray-400">${rep.hits}/${rep.attempts} hit</span>`
-                + `</div>`;
-        }
-
-        if (!rows) return '';
 
         let missCauseHtml = '';
         try {
@@ -14420,16 +14438,7 @@ function createNoteDetector(options = {}) {
             missCauseHtml = _renderDiagnosticMissCauseHtml(analysis);
         } catch (_) { /* read-only report */ }
 
-        const notes = '<p class="text-[10px] text-gray-500 mt-2">'
-            + 'This diagnostic report did not change gameplay settings.'
-            + '</p>';
-
-        return `<div class="mt-3 text-xs border-t border-gray-600 pt-3">`
-            + `<div class="text-gray-200 text-xs font-semibold mb-2">Diagnostic Results</div>`
-            + rows
-            + missCauseHtml
-            + notes
-            + `</div>`;
+        return _buildDiagnosticBasicGuitarPlayHtml(report, profile, missCauseHtml);
     }
 
     // Returns true if a summary overlay was created, false if it bailed
@@ -14441,12 +14450,25 @@ function createNoteDetector(options = {}) {
         const total = hits + misses;
         if (_shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total)) return false;
 
-        const existing = instanceRoot.querySelector('.nd-summary-overlay');
+        const diagnosticReport = diagnosticTrack
+            ? _buildDiagnosticPlayReport(diagnosticTrack)
+            : null;
+
+        const existing = _ndFindSummaryOverlay();
         if (existing) existing.remove();
 
-        const accuracy = total > 0 ? Math.round((hits / total) * 100) : 0;
+        const useDiagOverall = !!(isDiagnosticSession && diagnosticReport
+            && diagnosticReport.overall && total === 0);
+        const displayHits = useDiagOverall ? diagnosticReport.overall.hits : hits;
+        const displayMisses = useDiagOverall ? diagnosticReport.overall.misses : misses;
+        const displayBestStreak = useDiagOverall ? diagnosticReport.overall.bestStreak : bestStreak;
+        const displayTotal = displayHits + displayMisses;
+        const accuracy = displayTotal > 0
+            ? Math.round((displayHits / displayTotal) * 100)
+            : 0;
         const grade = _ndGradeFor(accuracy);
-        const fullCombo = misses === 0;
+        const fullCombo = displayMisses === 0 && displayTotal > 0;
+        const summaryHeader = isDiagnosticSession ? 'Diagnostic Complete' : 'Song Complete';
 
         let sectionHtml = '';
         if (sectionStats.length > 0) {
@@ -14513,9 +14535,6 @@ function createNoteDetector(options = {}) {
         }
 
         let diagnosticPlayHtml = '';
-        const diagnosticReport = diagnosticTrack
-            ? _buildDiagnosticPlayReport(diagnosticTrack)
-            : null;
         if (diagnosticReport) {
             diagnosticPlayHtml = _renderDiagnosticPlayHtml(
                 diagnosticReport,
@@ -14542,7 +14561,7 @@ function createNoteDetector(options = {}) {
         overlay.innerHTML = `
             <div class="nd-sum-shell">
             <div class="nd-sum-panel">
-                <div class="nd-sum-header">Song Complete</div>
+                <div class="nd-sum-header">${summaryHeader}</div>
                 <div class="nd-sum-grade-wrap">
                     <canvas class="nd-sum-confetti"></canvas>
                     <div class="nd-sum-grade" data-grade="${grade}">${grade}</div>
@@ -14553,9 +14572,9 @@ function createNoteDetector(options = {}) {
                     <div class="nd-sum-score"><span class="nd-sum-score-n">0</span><div class="nd-sum-label">Score</div></div>
                 </div>
                 <div class="nd-sum-stats">
-                    <div class="nd-sum-stat" style="--row-i:0"><span class="nd-sum-stat-label">Hits</span><span class="nd-sum-stat-val nd-val-good">${hits}</span></div>
-                    <div class="nd-sum-stat" style="--row-i:1"><span class="nd-sum-stat-label">Misses</span><span class="nd-sum-stat-val nd-val-bad">${misses}</span></div>
-                    <div class="nd-sum-stat" style="--row-i:2"><span class="nd-sum-stat-label">Best Streak</span><span class="nd-sum-stat-val nd-val-accent">${bestStreak}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:0"><span class="nd-sum-stat-label">Hits</span><span class="nd-sum-stat-val nd-val-good">${displayHits}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:1"><span class="nd-sum-stat-label">Misses</span><span class="nd-sum-stat-val nd-val-bad">${displayMisses}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:2"><span class="nd-sum-stat-label">Best Streak</span><span class="nd-sum-stat-val nd-val-accent">${displayBestStreak}</span></div>
                     <div class="nd-sum-stat" style="--row-i:3"><span class="nd-sum-stat-label">Max Multiplier</span><span class="nd-sum-stat-val nd-val-accent">×${maxMultiplier}</span></div>
                 </div>
                 <div class="nd-sum-xp hidden"></div>
@@ -14602,7 +14621,7 @@ function createNoteDetector(options = {}) {
         // out of view until _runDeferredSummary() reveals it — used when
         // a training consent modal is taking the screen on song:ended.
         if (opts && opts.startHidden) overlay.style.display = 'none';
-        instanceRoot.appendChild(overlay);
+        _ndSummaryOverlayMountNode().appendChild(overlay);
         if (!(opts && opts.startHidden)) _animateSummary(overlay, overlay._ndReveal);
 
         publishToJournal(accuracy);

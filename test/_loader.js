@@ -182,6 +182,7 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_analyzePowerChordAttempt', '_formatDiagnosticCauseForMusician',
         '_renderDiagnosticMissCauseHtml', '_diagMissCauseFromSingleEvent',
         '_shouldBailShowSummaryForLowJudgments', '_synthesizeZeroInputDiagnosticPlayReport',
+        '_buildDiagnosticBasicGuitarPlayHtml', '_ndSummaryOverlayMountNode',
         'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -310,6 +311,8 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         missCauseFromSingleEvent: sandbox._diagMissCauseFromSingleEvent,
         shouldBailShowSummaryForLowJudgments: sandbox._shouldBailShowSummaryForLowJudgments,
         synthesizeZeroInputDiagnosticPlayReport: sandbox._synthesizeZeroInputDiagnosticPlayReport,
+        buildDiagnosticBasicGuitarPlayHtml: sandbox._buildDiagnosticBasicGuitarPlayHtml,
+        summaryOverlayMountNode: sandbox._ndSummaryOverlayMountNode,
         createNoteDetector: sandbox.createNoteDetector,
         // Drill-mode tests: expose the slopsmith stub so tests can
         // drive synthetic `loop:restart` etc. and toggle the loop

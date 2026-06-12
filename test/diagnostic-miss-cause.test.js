@@ -18,6 +18,7 @@ const BASIC_PROFILE = {
         { t: 16, category: 'powerChords', label: 'Power chord', chord: true },
         { t: 32, category: 'repeatCheck', label: 'Repeat open low', chord: false, s: 0, f: 0 },
     ],
+    singleHitMissCategories: ['openLow', 'fretted'],
     categories: {
         openLow: { label: 'Open low string' },
         fretted: { label: 'Fretted note' },
@@ -177,6 +178,36 @@ test('zero matched events synthesizes all-missed Basic Guitar report', () => {
     assert.equal(report.categories.powerChords.attempts, 1);
     assert.equal(report.categories.powerChords.chordMisses, 1);
     assert.ok(report.categories.powerChords.perAttempt.length);
+});
+
+test('zero-input diagnostic HTML uses nd-sum modal sections and required copy', () => {
+    const report = core.synthesizeZeroInputDiagnosticPlayReport(
+        BASIC_PROFILE,
+        'basic-guitar-v1',
+        { hits: 0, misses: 0, bestStreak: 0 },
+    );
+    const analysis = core.buildDiagnosticMissCauseAnalysis(report, {}, {
+        profile: BASIC_PROFILE,
+        events: [],
+    });
+    const html = core.buildDiagnosticBasicGuitarPlayHtml(
+        report,
+        BASIC_PROFILE,
+        core.renderDiagnosticMissCauseHtml(analysis),
+    );
+    assert.match(html, /nd-sum-sections/);
+    assert.match(html, /nd-sum-subhead/);
+    assert.match(html, /Diagnostic Results/);
+    assert.match(html, /Why notes may have missed/);
+    assert.match(html, /No input was detected/i);
+    assert.match(html, /This diagnostic report did not change gameplay settings/);
+    assert.match(html, /Open low string/);
+    assert.match(html, /Power chords/);
+});
+
+test('summary overlay mount helper is available for viewport-fixed modal', () => {
+    assert.equal(typeof core.summaryOverlayMountNode, 'function');
+    assert.ok(core.summaryOverlayMountNode());
 });
 
 test('zero-input synthesized report explains no input in miss-cause HTML', () => {
