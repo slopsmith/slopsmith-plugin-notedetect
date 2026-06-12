@@ -280,7 +280,7 @@ const _ND_AUTO_ENABLE_RETRY_MS = 1500;
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.15.0';
+const _ND_VERSION = '1.15.2';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -11475,8 +11475,10 @@ function createNoteDetector(options = {}) {
             row.className = 'nd-sum-xp text-center text-sm text-green-400 mt-2';
             panel.appendChild(row);
         }
-        const lvl = res.profile && Number.isFinite(res.profile.level) ? res.profile.level : null;
-        row.textContent = `+${res.xp_gained} XP` + (lvl !== null ? ` · Level ${lvl}` : '');
+        // Progression (core spec 010): the earned currency is Decibels (dB);
+        // the XP-derived level is gone from the UI (Mastery Rank replaced it),
+        // so the old "· Level N" suffix is dropped rather than relabeled.
+        row.textContent = `+${res.xp_gained} dB`;
         row.classList.remove('hidden');
     }
 
