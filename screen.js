@@ -11475,8 +11475,10 @@ function createNoteDetector(options = {}) {
             row.className = 'nd-sum-xp text-center text-sm text-green-400 mt-2';
             panel.appendChild(row);
         }
-        const lvl = res.profile && Number.isFinite(res.profile.level) ? res.profile.level : null;
-        row.textContent = `+${res.xp_gained} XP` + (lvl !== null ? ` · Level ${lvl}` : '');
+        // Progression (core spec 010): the earned currency is Decibels (dB);
+        // the XP-derived level is gone from the UI (Mastery Rank replaced it),
+        // so the old "· Level N" suffix is dropped rather than relabeled.
+        row.textContent = `+${res.xp_gained} dB`;
         row.classList.remove('hidden');
     }
 
