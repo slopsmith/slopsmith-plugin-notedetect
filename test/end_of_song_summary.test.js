@@ -58,10 +58,8 @@ test('destroy() unbinds both drill and end-of-song listeners', () => {
 
 test('song:ended on a disabled instance does not throw', () => {
     // Detection disabled = no in-flight session. The handler is
-    // expected to bail early on `if (!enabled) return;` rather than
-    // try to render a summary against zeroed counters. Tests against
-    // a regression where the guard was removed and showSummary tried
-    // to DOM-write into the (stubbed) sandbox elements, which throws.
+    // expected to bail early on the enabled guard for normal songs
+    // rather than try to render a summary against zeroed counters.
     const core = loadDetectionCore();
     const det = core.createNoteDetector();
     det._bindEndOfSongEvents();
@@ -71,6 +69,39 @@ test('song:ended on a disabled instance does not throw', () => {
     assert.doesNotThrow(() => {
         core.slopsmith._fire('song:ended', {});
     });
+    det.destroy();
+});
+
+test('song:ended on disabled default instance without diagnostic does not publish summary', () => {
+    const events = [];
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sb) => { sb.dispatchEvent = (ev) => events.push(ev); },
+    });
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindEndOfSongEvents();
+    assert.equal(det.isEnabled(), false);
+    core.slopsmith._fire('song:ended', {});
+    assert.equal(events.find((e) => e.type === 'notedetect:session'), undefined);
+    det.destroy();
+});
+
+test('song:ended on disabled default instance with active diagnostic still publishes summary', () => {
+    const events = [];
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sb) => { sb.dispatchEvent = (ev) => events.push(ev); },
+    });
+    core.ndShared.currentFilename = 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak';
+    core.ndShared.diagnosticReturn.active = true;
+    core.ndShared.diagnosticReturn.previousFilename = 'previous-song.sloppak';
+    core.ndShared.diagnosticReturn.launchedTrackId = 'basic-guitar-v1';
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindEndOfSongEvents();
+    assert.equal(det.isEnabled(), false);
+    core.slopsmith._fire('song:ended', {});
+    assert.ok(
+        events.find((e) => e.type === 'notedetect:session'),
+        'diagnostic end handler should call showSummary even when host pre-disabled detection',
+    );
     det.destroy();
 });
 

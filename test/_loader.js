@@ -181,7 +181,8 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_buildDiagnosticMissCauseAnalysis', '_summarizeDiagnosticCategoryCause',
         '_analyzePowerChordAttempt', '_formatDiagnosticCauseForMusician',
         '_renderDiagnosticMissCauseHtml', '_diagMissCauseFromSingleEvent',
-        '_shouldBailShowSummaryForLowJudgments', '_synthesizeZeroInputDiagnosticPlayReport',
+        '_shouldBailShowSummaryForLowJudgments', '_shouldSkipEndSummaryWhenDisabled',
+        '_synthesizeZeroInputDiagnosticPlayReport',
         '_buildDiagnosticBasicGuitarPlayHtml', '_ndSummaryOverlayMountNode',
         'createNoteDetector',
     ];
@@ -310,6 +311,8 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         renderDiagnosticMissCauseHtml: sandbox._renderDiagnosticMissCauseHtml,
         missCauseFromSingleEvent: sandbox._diagMissCauseFromSingleEvent,
         shouldBailShowSummaryForLowJudgments: sandbox._shouldBailShowSummaryForLowJudgments,
+        shouldSkipEndSummaryWhenDisabled: sandbox._shouldSkipEndSummaryWhenDisabled,
+        ndShared: sandbox.window.__ndShared,
         synthesizeZeroInputDiagnosticPlayReport: sandbox._synthesizeZeroInputDiagnosticPlayReport,
         buildDiagnosticBasicGuitarPlayHtml: sandbox._buildDiagnosticBasicGuitarPlayHtml,
         summaryOverlayMountNode: sandbox._ndSummaryOverlayMountNode,

@@ -1,6 +1,10 @@
+const fs = require('node:fs');
+const path = require('node:path');
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { loadDetectionCore } = require('./_loader');
+
+const SCREEN_PATH = path.join(__dirname, '..', 'screen.js');
 
 const core = loadDetectionCore();
 
@@ -226,6 +230,27 @@ test('zero-input synthesized report explains no input in miss-cause HTML', () =>
     assert.match(html, /Why notes may have missed/);
     assert.match(html, /No input was detected/i);
     assert.match(html, /audio input device/i);
+});
+
+test('end handler skips summary when disabled on normal songs', () => {
+    assert.equal(core.shouldSkipEndSummaryWhenDisabled(false, false), true);
+    assert.equal(core.shouldSkipEndSummaryWhenDisabled(false, undefined), true);
+});
+
+test('end handler continues when disabled during diagnostic session', () => {
+    assert.equal(core.shouldSkipEndSummaryWhenDisabled(false, true), false);
+    assert.equal(core.shouldSkipEndSummaryWhenDisabled(true, false), false);
+    assert.equal(core.shouldSkipEndSummaryWhenDisabled(true, true), false);
+});
+
+test('zero-input diagnostic still bypasses low-judgment gate', () => {
+    assert.equal(core.shouldBailShowSummaryForLowJudgments(true, 0), false);
+    assert.equal(core.shouldBailShowSummaryForLowJudgments(false, 0), true);
+});
+
+test('screen.js has no temporary diagnostic end trace logs', () => {
+    const src = fs.readFileSync(SCREEN_PATH, 'utf8');
+    assert.doesNotMatch(src, /\[nd-diagnostic-end-trace\]/);
 });
 
 test('rendered report still says settings were not changed automatically', () => {

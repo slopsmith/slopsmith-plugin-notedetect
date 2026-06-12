@@ -733,6 +733,13 @@ function _shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total) {
     return !isDiagnosticSession && total < 5;
 }
 
+// Host may disable detection before the plugin's song:ended handler runs.
+// Normal songs keep the enabled guard; diagnostic playthroughs still surface
+// the read-only report.
+function _shouldSkipEndSummaryWhenDisabled(enabled, isDiagnosticSession) {
+    return !enabled && !isDiagnosticSession;
+}
+
 // Summary overlay must mount on document.body — same as the calibration
 // wizard / lab modals. Appending under .nd-instance-root inside #player traps
 // position:fixed inside the player containing block, so only the panel footer
@@ -12100,7 +12107,11 @@ function createNoteDetector(options = {}) {
     // wrapper silent-disables on song-switch regardless.
     function _endOfSongOnEnded() {
         if (!isDefault) return;
-        if (!enabled) return;
+        const diagnosticTrack = _getDiagnosticTrackForSession();
+        const diagnosticReturn = _ndShared && _ndShared.diagnosticReturn;
+        const isDiagnosticSession = !!diagnosticTrack
+            || !!(diagnosticReturn && diagnosticReturn.active);
+        if (_shouldSkipEndSummaryWhenDisabled(enabled, isDiagnosticSession)) return;
         // showSummary() has its own `total < 5` guard, so a song that
         // ended before the user played anything meaningful is silently
         // skipped. When a training take is armed, _recOnEnded opens the
