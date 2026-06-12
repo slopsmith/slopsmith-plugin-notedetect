@@ -9314,6 +9314,15 @@ function createNoteDetector(options = {}) {
         // (default / unbound source) or getSourceRawAudioFrame (source-bound /
         // splitscreen / multi-input), so the toggle is shown for any capable
         // desktop build regardless of audio session state.
+        //
+        // Edge case: a source-bound instance on an addon that has
+        // getRawAudioFrame but not getSourceRawAudioFrame would see the toggle
+        // even though it cannot enter native-frame mode (startAudio() requires
+        // getSourceRawAudioFrame for bound sources). This is accepted: in
+        // practice, source binding requires a newer addon that has BOTH APIs,
+        // so the scenario never arises in field builds. The alternative —
+        // hiding the toggle for all unbound instances on such an addon — is
+        // a worse trade-off.
         const _ndCanNativeFrames = (function () {
             const d = (typeof window !== 'undefined') ? window.slopsmithDesktop : null;
             const a = d && d.isDesktop && d.audio;
