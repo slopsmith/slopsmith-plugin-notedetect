@@ -212,6 +212,12 @@ const _ndInstances = _ndShared.instances;
 
 const _ND_STORAGE_KEY = 'slopsmith_notedetect';
 
+// How long the construct-time auto-enable waits before its single retry
+// when the first attempt fails (e.g. a USB interface that's enumerated but
+// not yet openable at first paint). Long enough for a slow device to settle,
+// short enough not to strand a persisted-on session.
+const _ND_AUTO_ENABLE_RETRY_MS = 1500;
+
 // Plugin semver — keep in sync with package.json / plugin.json. Stamped
 // into every diagnostic export so a JSON blob can be tied back to the
 // exact build that produced it. The script tag has no `import`/`fetch`
@@ -1485,6 +1491,15 @@ function createNoteDetector(options = {}) {
     // so this is the *intent* and `enabled` is the *current run state*.
     // The plugin auto-calls enable() on next tick if this is true.
     let detectPreference = true;
+    // Set only around the construct-time auto-enable's first (silent,
+    // automatic) attempt — the one with a delayed retry still in hand. In that
+    // window the open should be non-committal: startAudio() suppresses its
+    // user-facing failure alert (a transient not-ready device shouldn't pop a
+    // dialog on load) AND openInstrumentStream() preserves a saved deviceId
+    // that fails to match (it may just be mid-enumeration) instead of forgetting
+    // it. The retry and every user-initiated enable run with this false, so
+    // genuine failures surface and a genuinely stale device is forgotten.
+    let autoEnableTrial = false;
     // Session generation — incremented on every disable(). A frame
     // that captures the value at the start of processing and re-checks
     // after an `await _ndCrepeDetect(...)` can drop its result rather
@@ -2432,6 +2447,67 @@ function createNoteDetector(options = {}) {
         } catch (e) { /* unavailable */ }
     }
 
+    // Open an instrument capture stream, relaxing over-constrained inputs.
+    // Two device classes break a strict getUserMedia on macOS in particular:
+    //   - mono-only USB interfaces (e.g. the Rocksmith Real Tone Cable)
+    //     reject `channelCount: 2`;
+    //   - a stale saved `deviceId` (device unplugged since last session)
+    //     rejects `deviceId: { exact }`.
+    // OverconstrainedError.constraint names the offending constraint, so we
+    // drop exactly that one and retry rather than guessing — dropping the
+    // device when the real problem is the channel count would needlessly
+    // discard the user's chosen interface, and dropping channelCount for an
+    // unrelated constraint would mask the real failure. We therefore only
+    // relax the *named* constraint (the supported browsers — Chrome/Edge —
+    // always populate `e.constraint`); an unnamed failure is treated as the
+    // documented mono-only-device case since channelCount is the only other
+    // constraint we set that can over-constrain. Anything else rethrows. The
+    // loop relaxes one constraint per failure and is guaranteed to terminate
+    // (each branch deletes a still-present key or rethrows). Mutates
+    // `constraints` in place.
+    //
+    // `allowDeviceFallback` gates the *destructive* part of the deviceId
+    // path. A device that's still enumerating at startup (the exact race the
+    // auto-enable retry addresses) also fails the `deviceId: { exact }` match
+    // transiently — so forgetting the saved device on the first such failure
+    // would permanently switch a Real-Tone-Cable user back to the default
+    // input on a cold load. The construct-time auto-enable therefore passes
+    // `false` on its silent first attempt: a deviceId overconstraint is
+    // surfaced (not forgotten), letting the delayed retry try the real device
+    // again. User-initiated enables and the retry pass `true`, where a deviceId
+    // failure does mean a genuinely stale device → forget it and fall back.
+    async function openInstrumentStream(constraints, { allowDeviceFallback = true } = {}) {
+        for (;;) {
+            try {
+                return await navigator.mediaDevices.getUserMedia(constraints);
+            } catch (e) {
+                if (e.name !== 'OverconstrainedError') throw e;
+                if (e.constraint === 'deviceId' && constraints.audio.deviceId) {
+                    if (!allowDeviceFallback) {
+                        // Silent auto-enable attempt — the device may just be
+                        // mid-enumeration. Don't forget it or fall back; surface
+                        // the failure so the caller's delayed retry can re-try
+                        // the real device.
+                        throw e;
+                    }
+                    // Saved device is gone — forget it so future opens default.
+                    selectedDeviceId = '';
+                    saveSettings();
+                    delete constraints.audio.deviceId;
+                } else if ((e.constraint === 'channelCount' || !e.constraint)
+                           && constraints.audio.channelCount !== undefined) {
+                    // Mono-only device (e.g. Real Tone Cable): drop stereo and
+                    // keep the user's selected device.
+                    delete constraints.audio.channelCount;
+                } else {
+                    // A constraint we can't safely relax without discarding the
+                    // user's intent (or an already-relaxed one) — surface it.
+                    throw e;
+                }
+            }
+        }
+    }
+
     // ── Audio pipeline ────────────────────────────────────────────────
     async function startAudio() {
         try {
@@ -2819,23 +2895,12 @@ function createNoteDetector(options = {}) {
                         : 'Microphone access is not available in this browser. Use Chrome or Edge.';
                     throw new Error(msg);
                 }
-                try {
-                    stream = await navigator.mediaDevices.getUserMedia(constraints);
-                } catch (e) {
-                    if (e.name === 'OverconstrainedError' && selectedDeviceId) {
-                        // Saved device no longer available — fall back to default.
-                        selectedDeviceId = '';
-                        saveSettings();
-                        delete constraints.audio.deviceId;
-                        stream = await navigator.mediaDevices.getUserMedia(constraints);
-                    } else if (e.name === 'OverconstrainedError') {
-                        // Device rejects channelCount:2 (e.g. mono-only USB audio like Real Tone Cable).
-                        delete constraints.audio.channelCount;
-                        stream = await navigator.mediaDevices.getUserMedia(constraints);
-                    } else {
-                        throw e;
-                    }
-                }
+                // On the silent first auto-enable attempt, don't let a
+                // transiently-unmatched (still-enumerating) saved device be
+                // forgotten — the delayed retry re-tries the real device.
+                stream = await openInstrumentStream(constraints, {
+                    allowDeviceFallback: !autoEnableTrial,
+                });
             }
 
             // Acquire the context independently — a caller can supply
@@ -2925,8 +2990,10 @@ function createNoteDetector(options = {}) {
             // permission prompt was open). Surfacing an error the
             // user never asked to see in that case is just noise.
             // The console.error still goes to devtools for
-            // diagnostics.
-            if (enabled) {
+            // diagnostics. autoEnableTrial silences the automatic
+            // first auto-enable attempt (a transient not-ready USB device
+            // shouldn't pop a dialog on load — the retry surfaces it).
+            if (enabled && !autoEnableTrial) {
                 alert('Note Detection: Could not access audio input.\n\n' + e.message);
             }
             // Partial-init cleanup — if we got as far as acquiring the
@@ -7458,7 +7525,10 @@ function createNoteDetector(options = {}) {
         }
         let stream;
         try {
-            stream = await navigator.mediaDevices.getUserMedia(constraints);
+            // Share the main capture path's over-constrained fallback so a
+            // mono-only interface (Real Tone Cable) or stale saved device
+            // can still arm a parallel training take.
+            stream = await openInstrumentStream(constraints);
         } catch (e) {
             throw new Error('mic permission denied or device unavailable: ' + (e && e.message || e));
         }
@@ -9469,20 +9539,41 @@ function createNoteDetector(options = {}) {
         && (typeof window.AudioContext === 'function'
             || typeof window.webkitAudioContext === 'function');
     if (isDefault && detectPreference && _hasAudio) {
-        // Delay auto-enable slightly so USB audio devices (e.g. Real Tone Cable)
-        // have time to finish enumerating their channels before getUserMedia fires.
-        setTimeout(() => {
-            // Re-check BOTH enabled and detectPreference. A fast user
-            // click could have already enabled us (`enabled`), and
-            // another surface (settings sync, headless toggle) could
-            // have flipped detectPreference to false during the
-            // timeout — in that case we'd be honouring a stale-by-now
-            // preference and enabling against the user's wishes.
+        // Auto-enable immediately so a persisted-on session starts detecting
+        // the instant the page is ready — a blanket startup delay would miss
+        // the opening notes for every user just to accommodate one slow
+        // device class. USB interfaces (e.g. the Real Tone Cable) can be
+        // enumerated-but-not-yet-openable at first paint, which fails the
+        // stream open; in that case retry once after a short settle. The
+        // first (silent, automatic) attempt suppresses the failure alert so
+        // a transient not-ready device doesn't pop a dialog on load; the
+        // retry runs un-suppressed so a genuinely unusable device is still
+        // surfaced.
+        const autoEnableAttempt = (retriesLeft) => {
+            // Re-check BOTH enabled and detectPreference each attempt. A fast
+            // user click could have already enabled us (`enabled`), and
+            // another surface (settings sync, headless toggle) could have
+            // flipped detectPreference to false during the wait — honouring a
+            // stale-by-now preference would enable against the user's wishes.
             if (typeof window !== 'undefined' && window.__ndSuppressDefault) return;
-            if (!enabled && detectPreference) enable().catch((e) => {
+            if (enabled || !detectPreference) return;
+            // Only the first attempt (one with a retry still in hand) is a
+            // silent, non-committal trial — quiet alerts and a preserved device.
+            autoEnableTrial = retriesLeft > 0;
+            enable().then((ok) => {
+                autoEnableTrial = false;
+                // enable() resolves false on a failed/again-not-ready open
+                // (and on a late highway, which a retry also helps). Retry
+                // once if the preference is still live and we're still off.
+                if (!ok && retriesLeft > 0 && !enabled && detectPreference) {
+                    setTimeout(() => autoEnableAttempt(retriesLeft - 1), _ND_AUTO_ENABLE_RETRY_MS);
+                }
+            }).catch((e) => {
+                autoEnableTrial = false;
                 console.warn('[note_detect] auto-enable failed:', e && e.message ? e.message : e);
             });
-        }, 1500);
+        };
+        setTimeout(() => autoEnableAttempt(1), 0);
     }
 
     _ndInstances.add(api);
