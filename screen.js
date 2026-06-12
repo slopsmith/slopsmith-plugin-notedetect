@@ -9289,13 +9289,13 @@ function createNoteDetector(options = {}) {
         panel.style.maxHeight = 'calc(100vh - 5rem)';
         panel.style.overflowY = 'auto';
         // The native-frame detection toggle only does something on a desktop
-        // build whose engine exposes getRawAudioFrame — hide it entirely in the
-        // browser / on a downlevel addon so it can't read as a dead switch.
-        const _ndCanNativeFrames = (function () {
-            const d = (typeof window !== 'undefined') ? window.slopsmithDesktop : null;
-            const a = d && d.isDesktop && d.audio;
-            return !!(a && typeof a.getRawAudioFrame === 'function');
-        })();
+        // build whose engine exposes the raw-audio-frame pull this instance
+        // would use — hide it entirely in the browser / on a downlevel addon
+        // so it can't read as a dead switch.  Use _ndBridgeRawFramesAvailable()
+        // rather than a bare getRawAudioFrame check so source-bound instances
+        // (splitscreen, multi-input) route through getSourceRawAudioFrame and
+        // the UI gate matches the runtime gate in startAudio().
+        const _ndCanNativeFrames = _ndBridgeRawFramesAvailable();
         panel.innerHTML = `
             <div class="flex justify-between items-center mb-3">
                 <span class="text-gray-200 font-semibold">Note Detection Settings</span>
