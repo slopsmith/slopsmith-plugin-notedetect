@@ -1586,6 +1586,11 @@ function createNoteDetector(options = {}) {
     // _ndEffectiveDetectionMethod — since YIN locks onto the 2nd harmonic of a
     // weak-fundamental bass note and reports an octave high.
     let detectionMethodUserSet = false;
+    // Opt-in: on the desktop bridge, run note_detect's own pitch detector on
+    // engine-captured PCM (getRawAudioFrame) rather than the engine's
+    // verdicts. Default off — the engine verdict/verifier path stays the
+    // out-of-box behaviour. See `usingNativeFrames`.
+    let nativeDetection = false;
     let timingTolerance = 0.150;
     let pitchTolerance = 50;
     let timingHitThreshold = 0.100;
@@ -1716,6 +1721,7 @@ function createNoteDetector(options = {}) {
             if (s.autoRecord !== undefined) autoRecord = !!s.autoRecord;
             if (s.frameSize !== undefined) frameSize = _ndClampFrameSize(s.frameSize);
             if (s.autoCalibrate !== undefined) autoCalibrate = !!s.autoCalibrate;
+            if (s.nativeDetection !== undefined) nativeDetection = !!s.nativeDetection;
             // Persisted on/off preference. Absence keeps the default
             // (true), so fresh installs get Detect on out of the box.
             if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
@@ -2215,6 +2221,14 @@ function createNoteDetector(options = {}) {
     // existing Web-Audio teardown in stopAudio() is null-checked, so it
     // doesn't need its own branch on this flag.
     let usingDesktopBridge = false;
+    // Opt-in (gear toggle, `nativeDetection`) sub-mode of the desktop
+    // bridge: pull the engine's post-gate PCM via getRawAudioFrame and run
+    // note_detect's OWN YIN/HPS/CREPE on it, instead of consuming the
+    // engine's pitch verdicts. usingDesktopBridge stays true, so chords
+    // still score through the engine's harmonic-comb ChordScorer
+    // (scoreChord) and levels/source-binding are unchanged — only the
+    // per-frame monophonic detection moves in-plugin. Reset in stopAudio().
+    let usingNativeFrames = false;
     // Cached engine sample rate for the bridge path. There's no
     // audioCtx on this branch so any code that needs a sampleRate
     // reads it from here instead. Note that chord scoring on the
@@ -2319,6 +2333,28 @@ function createNoteDetector(options = {}) {
         if (typeof a.getRawPitch === 'function') return a.getRawPitch();
         if (typeof a.getPitchDetection === 'function') return a.getPitchDetection();
         return Promise.resolve(null);
+    }
+    // Pull a frame of post-gate mono PCM from the engine for the
+    // native-frame detection mode. Routes to the source-indexed pull for a
+    // bound (multi-input) source, else the default-source pull. Returns a
+    // Float32Array (up to `numSamples`, zero-padded on a cold ring) or null
+    // when the addon predates the API (caller then can't enter the mode).
+    function _ndBridgeRawAudioFrame(numSamples) {
+        const a = _ndBridgeAudio(); if (!a) return Promise.resolve(null);
+        if (sourceId != null) {
+            if (typeof a.getSourceRawAudioFrame === 'function') return a.getSourceRawAudioFrame(sourceId, numSamples);
+            return Promise.resolve(null);
+        }
+        if (typeof a.getRawAudioFrame === 'function') return a.getRawAudioFrame(numSamples);
+        return Promise.resolve(null);
+    }
+    // Whether the engine exposes the raw-audio-frame pull this instance
+    // would use (source-indexed when bound, default otherwise). Gates entry
+    // into native-frame detection — a downlevel addon keeps the verdict path.
+    function _ndBridgeRawFramesAvailable() {
+        const a = _ndBridgeAudio(); if (!a) return false;
+        if (sourceId != null) return typeof a.getSourceRawAudioFrame === 'function';
+        return typeof a.getRawAudioFrame === 'function';
     }
     // Active (ML-or-YIN) detection for the monophonic scoring branch.
     function _ndBridgePitch() {
@@ -2529,6 +2565,7 @@ function createNoteDetector(options = {}) {
                 // Explicit override flag so the loader can tell a deliberate
                 // method choice from the always-persisted default (see load).
                 methodUserSet: detectionMethodUserSet,
+                nativeDetection,
                 timingTolerance,
                 pitchTolerance,
                 timingHitThreshold,
@@ -2764,6 +2801,18 @@ function createNoteDetector(options = {}) {
                     // set is fixed for the session.
                     const hasDetectNotes = typeof desktop.audio.detectNotes === 'function';
 
+                    // Native-frame detection (gear opt-in): run note_detect's
+                    // own detector on engine-captured PCM instead of the
+                    // engine's verdicts. Requires the raw-audio-frame pull.
+                    // Captured per-session like hasDetectNotes — the gate is
+                    // re-evaluated on the next enable/restart, so flipping the
+                    // toggle takes effect after restartAudio().
+                    usingNativeFrames = nativeDetection && _ndBridgeRawFramesAvailable();
+                    if (usingNativeFrames) {
+                        console.log('[note_detect] native-frame detection active — local '
+                            + `${detectionMethod || 'yin'} on engine audio; chords via engine scoreChord`);
+                    }
+
                     detectInterval = setInterval(async () => {
                         if (!enabled || processingFrame) return;
                         processingFrame = true;
@@ -2780,6 +2829,44 @@ function createNoteDetector(options = {}) {
                             // owns the slot; _ndOtherOwnsOurSlot() covers a
                             // sibling instance on the same engine source.
                             if (_ndHostChartSuspended || _ndOtherOwnsOurSlot()) return;
+                            // Native-frame detection (gear opt-in): pull the
+                            // engine's post-gate mono PCM and run note_detect's
+                            // OWN YIN/HPS/CREPE on it via the SAME processFrame
+                            // → matchNotes pipeline the browser path uses. On
+                            // the bridge, matchNotes routes chords to the
+                            // engine's harmonic-comb ChordScorer (scoreChord),
+                            // so this is "own monophonic detector + engine
+                            // chord verifier" on engine-captured audio. The
+                            // engine-verifier path is suppressed in this mode
+                            // (_ndPushChartToBridge bails on usingNativeFrames),
+                            // so _ndUsingEngineVerifier is always false here.
+                            if (usingNativeFrames) {
+                                const want = _ndMinAnalysisSamples(currentArrangement, bridgeSampleRate);
+                                let frame = null;
+                                try { frame = await _ndBridgeRawAudioFrame(want); }
+                                catch (_) { frame = null; }
+                                if (!enabled || gen !== sessionGen) return;
+                                // processFrame derives its sample rate from
+                                // bridgeSampleRate when there's no audioCtx
+                                // (the bridge case), so the engine rate flows
+                                // through to YIN/HPS/FFT math unchanged.
+                                //
+                                // processFrame runs the selected YIN/HPS/CREPE on
+                                // the engine PCM, sets detectedMidi/detectedConfidence
+                                // for the live HUD/pitch-display, then calls
+                                // matchNotes(buffer). matchNotes routes single-note
+                                // and chord VERIFICATION through _ndBridgeScoreChord
+                                // (harmonic-comb engine) because usingDesktopBridge
+                                // is still true — this is intentional: the engine's
+                                // spectral verifier is more reliable for hit/miss than
+                                // a raw frequency estimate, and the feature goal is
+                                // "chosen detector for live HUD + engine verifier for
+                                // final scoring" (matching how getPitchDetection +
+                                // scoreChord work on the normal bridge path). It is NOT
+                                // a replacement verification backend.
+                                if (frame && frame.length >= want) await processFrame(frame);
+                                return;
+                            }
                             // Engine-verifier path: the engine scores the
                             // pushed chart on its own background thread, so
                             // this loop just drains finalized verdicts and
@@ -3121,6 +3208,7 @@ function createNoteDetector(options = {}) {
         // the cached preload reference and the flag so a subsequent
         // enable re-resolves window.slopsmithDesktop fresh.
         usingDesktopBridge = false;
+        usingNativeFrames = false;
         bridgeDesktop = null;
         // Drop the engine-verifier state — a subsequent enable re-pushes a
         // fresh chart via _ndPushChartToBridge(). Any chart still held by the
@@ -3525,11 +3613,16 @@ function createNoteDetector(options = {}) {
             detectedConfidence = result.confidence;
         }
 
-        // Stamp the detector identity for the diagnostic — web JS-DSP path.
-        // Use `detectorUsed` (the detector that actually ran this frame), so an
-        // auto-HPS bass frame reports as hps AND a crepe→yin low-confidence/
-        // missing-model fallback reports the real yin, not the requested crepe.
-        _diagDetector = { desktop_bridge: false, ml: false, path: 'web-' + (detectorUsed || activeMethod) };
+        // Stamp the detector identity for the diagnostic. Use `detectorUsed`
+        // (the detector that actually ran this frame), so an auto-HPS bass
+        // frame reports as hps AND a crepe→yin low-confidence/missing-model
+        // fallback reports the real yin, not the requested crepe. The same
+        // JS-DSP detector runs for both the browser path and the desktop
+        // native-frame mode; only the audio SOURCE differs, so distinguish
+        // them in the path tag (and flag desktop_bridge in native-frame mode).
+        _diagDetector = usingNativeFrames
+            ? { desktop_bridge: true, ml: false, path: 'desktop-native-' + (detectorUsed || activeMethod) }
+            : { desktop_bridge: false, ml: false, path: 'web-' + (detectorUsed || activeMethod) };
 
         // Pass the current frame's buffer through to matchNotes so the
         // chord scorer can run on the same audio that was just analysed
@@ -9256,6 +9349,34 @@ function createNoteDetector(options = {}) {
         panel.style.maxWidth = 'calc(100vw - 2rem)';
         panel.style.maxHeight = 'calc(100vh - 5rem)';
         panel.style.overflowY = 'auto';
+        // The native-frame detection toggle only does something on a desktop
+        // build whose engine exposes the raw-audio-frame pull this instance
+        // would use — hide it entirely in the browser / on a downlevel addon
+        // so it can't read as a dead switch.
+        //
+        // This check must be session-independent (the settings panel can open
+        // while Detect is off, when bridgeDesktop is null and
+        // _ndBridgeRawFramesAvailable() always returns false). Probe
+        // window.slopsmithDesktop directly and accept either getRawAudioFrame
+        // (default / unbound source) or getSourceRawAudioFrame (source-bound /
+        // splitscreen / multi-input), so the toggle is shown for any capable
+        // desktop build regardless of audio session state.
+        //
+        // Edge case: a source-bound instance on an addon that has
+        // getRawAudioFrame but not getSourceRawAudioFrame would see the toggle
+        // even though it cannot enter native-frame mode (startAudio() requires
+        // getSourceRawAudioFrame for bound sources). This is accepted: in
+        // practice, source binding requires a newer addon that has BOTH APIs,
+        // so the scenario never arises in field builds. The alternative —
+        // hiding the toggle for all unbound instances on such an addon — is
+        // a worse trade-off.
+        const _ndCanNativeFrames = (function () {
+            const d = (typeof window !== 'undefined') ? window.slopsmithDesktop : null;
+            const a = d && d.isDesktop && d.audio;
+            if (!a) return false;
+            return typeof a.getRawAudioFrame === 'function'
+                || typeof a.getSourceRawAudioFrame === 'function';
+        })();
         panel.innerHTML = `
             <div class="flex justify-between items-center mb-3">
                 <span class="text-gray-200 font-semibold">Note Detection Settings</span>
@@ -9386,6 +9507,15 @@ function createNoteDetector(options = {}) {
             <div class="text-[10px] text-gray-600 mb-3 leading-tight">
                 Minimum confidence to accept a YIN/HPS/CREPE frame. Lower this if too many notes register as "pure miss" with no detection — at the cost of more false positives on quiet/noisy signals.
             </div>
+
+            ${_ndCanNativeFrames ? `
+            <label class="flex items-center gap-2 text-gray-400 text-xs mb-1">
+                <input type="checkbox" class="nd-native-detect accent-purple-400" ${nativeDetection ? 'checked' : ''}>
+                Detect in-plugin (native audio)
+            </label>
+            <div class="text-[10px] text-gray-600 mb-3 leading-tight">
+                Desktop only. Runs note_detect's own ${'YIN/HPS/CREPE'} on the engine-captured guitar signal (instead of the engine's built-in detector), while chords are still verified by the engine's harmonic-comb scorer. Use this to pick HPS/CREPE on desktop. Takes effect immediately if Detect is currently on; otherwise on the next Detect toggle.
+            </div>` : ''}
 
             <label class="flex items-center gap-2 text-gray-400 text-xs mb-2">
                 <input type="checkbox" class="nd-show-timing accent-green-400" ${showTimingErrors ? 'checked' : ''}>
@@ -9668,6 +9798,18 @@ function createNoteDetector(options = {}) {
             panel.querySelector('.nd-conf-val').textContent = e.target.value;
             saveSettings();
         };
+        // Native-frame detection toggle — only present on a capable desktop
+        // build (see _ndCanNativeFrames), so null-guard the lookup. The mode is
+        // captured per-session in startAudio(), so restart the audio path if
+        // Detect is currently on for the change to take effect immediately.
+        const nativeDetectEl = panel.querySelector('.nd-native-detect');
+        if (nativeDetectEl) {
+            nativeDetectEl.onchange = (e) => {
+                nativeDetection = !!e.target.checked;
+                saveSettings();
+                if (enabled) restartAudio();
+            };
+        }
         panel.querySelector('.nd-show-timing').onchange = (e) => {
             showTimingErrors = !!e.target.checked;
             saveSettings();
@@ -10541,7 +10683,11 @@ function createNoteDetector(options = {}) {
         _ndPendingChords = new Map();
         _ndVerifierChartSig = '';
         _ndLastPushedPlayhead = 0;
-        if (!usingDesktopBridge || !bridgeDesktop || !bridgeDesktop.audio) return;
+        // Native-frame mode runs the local matchNotes pipeline (with engine
+        // scoreChord for chords), so the continuous engine chart-verifier is
+        // intentionally OFF — leave _ndUsingEngineVerifier false and don't
+        // push a chart for it.
+        if (!usingDesktopBridge || usingNativeFrames || !bridgeDesktop || !bridgeDesktop.audio) return;
         if (!_ndBridgeVerifierAvailable()) {
             // Downlevel addon (or, for a bound source, no source-indexed verifier
             // API) — fall back to the legacy matchNotes path.
