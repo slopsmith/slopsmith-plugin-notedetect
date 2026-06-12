@@ -9433,7 +9433,7 @@ function createNoteDetector(options = {}) {
                 Detect in-plugin (native audio)
             </label>
             <div class="text-[10px] text-gray-600 mb-3 leading-tight">
-                Desktop only. Runs note_detect's own ${'YIN/HPS/CREPE'} on the engine-captured guitar signal (instead of the engine's built-in detector), while chords are still verified by the engine's harmonic-comb scorer. Use this to pick HPS/CREPE on desktop. Takes effect when Detect is next toggled on.
+                Desktop only. Runs note_detect's own ${'YIN/HPS/CREPE'} on the engine-captured guitar signal (instead of the engine's built-in detector), while chords are still verified by the engine's harmonic-comb scorer. Use this to pick HPS/CREPE on desktop. Takes effect immediately if Detect is currently on; otherwise on the next Detect toggle.
             </div>` : ''}
 
             <label class="flex items-center gap-2 text-gray-400 text-xs mb-2">
