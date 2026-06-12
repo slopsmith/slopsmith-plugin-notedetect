@@ -2838,6 +2838,20 @@ function createNoteDetector(options = {}) {
                                 // bridgeSampleRate when there's no audioCtx
                                 // (the bridge case), so the engine rate flows
                                 // through to YIN/HPS/FFT math unchanged.
+                                //
+                                // processFrame runs the selected YIN/HPS/CREPE on
+                                // the engine PCM, sets detectedMidi/detectedConfidence
+                                // for the live HUD/pitch-display, then calls
+                                // matchNotes(buffer). matchNotes routes single-note
+                                // and chord VERIFICATION through _ndBridgeScoreChord
+                                // (harmonic-comb engine) because usingDesktopBridge
+                                // is still true — this is intentional: the engine's
+                                // spectral verifier is more reliable for hit/miss than
+                                // a raw frequency estimate, and the feature goal is
+                                // "chosen detector for live HUD + engine verifier for
+                                // final scoring" (matching how getPitchDetection +
+                                // scoreChord work on the normal bridge path). It is NOT
+                                // a replacement verification backend.
                                 if (frame && frame.length >= want) await processFrame(frame);
                                 return;
                             }
