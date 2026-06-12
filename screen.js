@@ -200,10 +200,67 @@ const _ndShared = (window.__ndShared = window.__ndShared || {
     // already owned, and every instance on a source skips its own host-chart
     // pushes/drains while another instance owns that source's contained slot.
     containedSlotOwners: new Map(),
+    // Snapshot for "Return to Previous Song" after a Detection Health
+    // diagnostic playthrough — one slot, screen.js only.
+    diagnosticReturn: {
+        active: false,
+        previousFilename: null,
+        previousArrangementIndex: null,
+        previousTitle: null,
+        previousArtist: null,
+        launchedTrackId: null,
+        diagnosticFilename: null,
+    },
 });
+// HMR / prior evaluations may lack diagnosticReturn on the reused object.
+if (!_ndShared.diagnosticReturn) {
+    _ndShared.diagnosticReturn = {
+        active: false,
+        previousFilename: null,
+        previousArrangementIndex: null,
+        previousTitle: null,
+        previousArtist: null,
+        launchedTrackId: null,
+        diagnosticFilename: null,
+    };
+}
 // Local aliases — kept for readability of the rest of the file, but
 // they're the same objects as `window.__ndShared.*`.
 const _ndInstances = _ndShared.instances;
+
+const _ND_DIAGNOSTIC_FILENAME_MARKERS = [
+    'slopsmith-diagnostic-basic-guitar.sloppak',
+];
+
+function _ndFilenameLooksDiagnostic(fn) {
+    const lower = String(fn || '').toLowerCase();
+    if (!lower) return false;
+    return _ND_DIAGNOSTIC_FILENAME_MARKERS.some((m) => lower.includes(m));
+}
+
+// Escape untrusted text before interpolating into an innerHTML string.
+// Used for values that can carry markup metacharacters (e.g. engine/device
+// error messages surfaced in the calibration wizard).
+function _ndEscapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function _ndClearDiagnosticReturnState() {
+    const r = _ndShared.diagnosticReturn;
+    if (!r) return;
+    r.active = false;
+    r.previousFilename = null;
+    r.previousArrangementIndex = null;
+    r.previousTitle = null;
+    r.previousArtist = null;
+    r.launchedTrackId = null;
+    r.diagnosticFilename = null;
+}
 
 // (The playSong wrapper's idempotency guard lives on the wrapper
 // function object itself — see `_ndInstallPlaySongHook()` below —
@@ -1664,7 +1721,7 @@ function createNoteDetector(options = {}) {
             if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
             if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
             if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
-            if (s.inputGain !== undefined) inputGain = s.inputGain;
+            if (Number.isFinite(s.inputGain)) inputGain = Math.max(0.1, Math.min(5, s.inputGain));
             if (s.latencyOffset !== undefined) latencyOffset = s.latencyOffset;
             // Clamp to the slider's range so a stale persisted value
             // (older build, manual edit) can't put scoring in a state the
@@ -1750,6 +1807,26 @@ function createNoteDetector(options = {}) {
     let inputPeak = 0;
     let peakDecay = 0;
 
+    // Calibration Wizard v2 — system setup only (safe settings; no scoring thresholds)
+    let _calWizardEl = null;
+    let _calWizardTick = null;
+    let _calWizardState = null;
+    const _CAL_WIZARD_NOTE_CHECK_DEFS = [
+        { id: 'lowE', string: 0, fallbackLabel: 'Low E', fallbackMidi: 40 },
+        { id: 'openA', string: 1, fallbackLabel: 'Open A', fallbackMidi: 45 },
+    ];
+    const _CAL_WIZARD_STEPS = [
+        { id: 'welcome', title: 'Welcome' },
+        { id: 'audio', title: 'Audio Input' },
+        { id: 'tuner', title: 'Tuner' },
+        { id: 'noise', title: 'Noise Floor' },
+        { id: 'signal', title: 'Signal Level' },
+        { id: 'notes', title: 'Note Detection' },
+        { id: 'timing', title: 'Timing / Latency' },
+        { id: 'review', title: 'Review' },
+        { id: 'apply', title: 'Apply' },
+    ];
+
     // Renderer-side silence gate. CREPE on this engine emits high-
     // confidence stuck-pitch output on silence (interference / induced
     // signal even with the guitar muted); the engine's verifier accepts
@@ -1795,6 +1872,22 @@ function createNoteDetector(options = {}) {
         late: 0,
         sharp: 0,
         flat: 0,
+    };
+
+    // Read-only verifier rejection log (last N chart-verify failures).
+    const _ND_VERIFIER_REJECT_MAX = 20;
+    const _ndVerifierRejects = [];
+    const _ndRejectDedup = new Set();   // note/chord keys already logged this session
+    const _ndVerifyFailSnap = new Map(); // noteKey -> last scoreChord !hit snapshot (legacy path)
+    const _ND_REJECT_REASON_LABEL = {
+        NO_VERDICT: 'engine no verdict',
+        SILENCE_GATE: 'silence gate',
+        STRING_VERIFY_FAIL: 'string verify fail',
+        CHORD_RATIO_FAIL: 'chord ratio fail',
+        TIMING_FAIL: 'timing fail',
+        PITCH_FAIL: 'pitch fail',
+        RETIRE_NO_MATCH: 'retire no match',
+        UNKNOWN: 'unknown',
     };
     const _diagSingles = { hits: 0, misses: 0 };
     const _diagChords  = { hits: 0, misses: 0 };
@@ -3306,8 +3399,8 @@ function createNoteDetector(options = {}) {
     }
 
     function drawSettingsVU() {
-        const bar = instanceRoot.querySelector('.nd-vu-bar');
-        const peak = instanceRoot.querySelector('.nd-vu-peak');
+        const bar = document.querySelector('.nd-settings-panel .nd-vu-bar');
+        const peak = document.querySelector('.nd-settings-panel .nd-vu-peak');
         if (!bar) return;
         const pct = Math.round(inputLevel * 100);
         bar.style.width = pct + '%';
@@ -3909,6 +4002,9 @@ function createNoteDetector(options = {}) {
         }
         noteResults.set(key, judgment);
         if (count) {
+            if (judgment && !judgment.hit) {
+                _ndLogVerifierRejectFromJudgmentIfNew(key, judgment);
+            }
             _recordDiagnostic(judgment);
             // No per-judgment sync — the host getLoop() poll would land
             // on the scoring hot path. Instead we sync at enable()
@@ -4278,7 +4374,21 @@ function createNoteDetector(options = {}) {
                 // Not verified on this frame (harmonic comb below the SNR
                 // threshold, or off-pitch) — leave the note for a later
                 // frame or for checkMisses() to retire.
-                if (!r || !r.hit) continue;
+                if (!r || !r.hit) {
+                    try {
+                        const expectedMidiSnap = _ndMidiFromStringFret(
+                            cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                        );
+                        _ndVerifyFailSnap.set(key, {
+                            noteTime: cn.t,
+                            string: cn.s,
+                            fret: cn.f,
+                            expectedMidi: expectedMidiSnap,
+                            pitchErrorCents: Number.isFinite(r && r.centsError) ? r.centsError : null,
+                        });
+                    } catch (_) { /* read-only */ }
+                    continue;
+                }
 
                 // Energy + pitch verified. Build the judgment at the current
                 // playhead, but COMMIT only when the timing is clean. An
@@ -4300,6 +4410,23 @@ function createNoteDetector(options = {}) {
                 );
                 if (judgment.hit) {
                     recordJudgment(key, judgment);
+                } else {
+                    const teReason = judgment.timingState === 'EARLY' || judgment.timingState === 'LATE'
+                        ? 'TIMING_FAIL'
+                        : (judgment.pitchState === 'SHARP' || judgment.pitchState === 'FLAT'
+                            ? 'PITCH_FAIL'
+                            : 'UNKNOWN');
+                    _ndLogVerifierRejectOnce(key, {
+                        reason: teReason,
+                        noteTime: cn.t,
+                        string: cn.s,
+                        fret: cn.f,
+                        expectedMidi,
+                        detectedMidi: detectedMidiForJudgment,
+                        confidence: detectedConfidence,
+                        timingErrorMs: judgment.timingError,
+                        pitchErrorCents: judgment.pitchError,
+                    });
                 }
             } else {
                 // ── Chord path: constraint-based per-string band analysis ──
@@ -4655,6 +4782,18 @@ function createNoteDetector(options = {}) {
                 const expectedMidi = _ndMidiFromStringFret(
                     chartNote.s, chartNote.f, currentArrangement, currentStringCount, tuningOffsets, capo
                 );
+                const snap = _ndVerifyFailSnap.get(key);
+                _ndLogVerifierRejectOnce(key, {
+                    reason: snap ? 'STRING_VERIFY_FAIL' : 'RETIRE_NO_MATCH',
+                    noteTime,
+                    string: chartNote.s,
+                    fret: chartNote.f,
+                    expectedMidi,
+                    pitchErrorCents: snap && Number.isFinite(snap.pitchErrorCents)
+                        ? snap.pitchErrorCents
+                        : null,
+                });
+                _ndVerifyFailSnap.delete(key);
                 recordJudgment(
                     key,
                     makeMissJudgment(chartNote, noteTime, t, expectedMidi)
@@ -4778,6 +4917,17 @@ function createNoteDetector(options = {}) {
                         score:        cachedChord ? cachedChord.score        : undefined,
                         lateGraceMs: chordLateGraceMs,
                     });
+                if (!voicingRescue) {
+                    _ndLogVerifierRejectOnce(chordKey, {
+                        reason: cachedChord ? 'CHORD_RATIO_FAIL' : 'RETIRE_NO_MATCH',
+                        noteTime: c.t,
+                        chord: true,
+                        expectedMidi,
+                        hitStrings: cachedChord ? cachedChord.hitStrings : null,
+                        totalStrings: cachedChord ? cachedChord.totalStrings : null,
+                        chordScore: cachedChord ? cachedChord.score : null,
+                    });
+                }
                 recordJudgment(chordKey, chordJudgment);
                 // Free the cache entry — we've consumed it, no further
                 // matchNotes frames will fire for this chord (it just
@@ -4828,20 +4978,4269 @@ function createNoteDetector(options = {}) {
         else sec.misses++;
     }
 
+    // ── Verifier reject diagnostics (read-only) ───────────────────────
+    function _ndVerifierPathLabel() {
+        if (_ndUsingEngineVerifier) return 'desktop-engine-verifier';
+        if (_diagDetector && _diagDetector.path) return String(_diagDetector.path);
+        if (usingDesktopBridge) return 'desktop-yin';
+        return 'web-' + (detectionMethod || 'yin');
+    }
+
+    // Level telemetry around a chart note's strike (visual clock ±200 ms).
+    function _ndStrikeLevelContext(noteTimeAudio) {
+        const levelAtLogPct = Math.round((inputLevel || 0) * 100);
+        if (!Number.isFinite(noteTimeAudio)) {
+            return {
+                levelAtLogPct,
+                strikePeakPct: Math.round((inputPeak || 0) * 100),
+                strikeSamplesInWindow: null,
+                silenceWouldTrigger: false,
+            };
+        }
+        const cnCenterVisualT = noteTimeAudio + latencyOffset;
+        let peakL = 0;
+        let inWindow = 0;
+        for (let i = _ndLevelSamples.length - 1; i >= 0; i--) {
+            const s = _ndLevelSamples[i];
+            if (!s || !Number.isFinite(s.songT)) continue;
+            if (s.songT > cnCenterVisualT + _ND_LEVEL_WIN_HALF) continue;
+            if (s.songT < cnCenterVisualT - _ND_LEVEL_WIN_HALF) break;
+            inWindow++;
+            if (s.level > peakL) peakL = s.level;
+        }
+        return {
+            levelAtLogPct,
+            strikePeakPct: inWindow > 0 ? Math.round(peakL * 100) : null,
+            strikeSamplesInWindow: inWindow,
+            silenceWouldTrigger: inWindow > 0 && peakL < _ND_SILENCE_THRESHOLD,
+        };
+    }
+
+    function _ndSnapshotEngineVerdict(v) {
+        if (!v || typeof v !== 'object') return null;
+        try {
+            const snap = {};
+            for (const k of Object.keys(v)) {
+                const val = v[k];
+                if (val === undefined || typeof val === 'function') continue;
+                if (typeof val === 'number' && Number.isFinite(val)) snap[k] = val;
+                else if (typeof val === 'boolean') snap[k] = val;
+                else if (typeof val === 'string') snap[k] = val;
+            }
+            return Object.keys(snap).length ? snap : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function _ndOpenDomainPitchFields() {
+        let detected = null;
+        let conf = null;
+        try {
+            if (detectedMidi >= 0 && detectedConfidence > detectionConfidenceMin) {
+                detected = Number.isFinite(detectedDisplayMidi) ? detectedDisplayMidi : detectedMidi;
+                conf = detectedConfidence;
+            }
+        } catch (_) { /* read-only */ }
+        return { detectedMidi: detected, confidence: conf };
+    }
+
+    function _ndPushVerifierReject(entry) {
+        try {
+            const row = entry && typeof entry === 'object' ? entry : {};
+            _ndVerifierRejects.push(row);
+            while (_ndVerifierRejects.length > _ND_VERIFIER_REJECT_MAX) {
+                _ndVerifierRejects.shift();
+            }
+        } catch (_) { /* never throw */ }
+    }
+
+    function _ndLogVerifierRejectOnce(dedupKey, partial) {
+        try {
+            if (!partial || typeof partial !== 'object') return;
+            if (dedupKey && _ndRejectDedup.has(dedupKey)) return;
+            const strikeCtx = Number.isFinite(partial.noteTime)
+                ? _ndStrikeLevelContext(partial.noteTime)
+                : _ndStrikeLevelContext(null);
+            const levels = {
+                levelPct: strikeCtx.levelAtLogPct,
+                peakPct: strikeCtx.strikePeakPct,
+            };
+            const skipOpenPitch = !!partial.skipOpenDomainPitchFallback
+                || partial.reason === 'NO_VERDICT'
+                || partial.reason === 'SILENCE_GATE';
+            const open = skipOpenPitch ? { detectedMidi: null, confidence: null } : _ndOpenDomainPitchFields();
+            const row = {
+                at: Date.now(),
+                path: partial.path || _ndVerifierPathLabel(),
+                reason: partial.reason || 'UNKNOWN',
+                noteTime: Number.isFinite(partial.noteTime) ? partial.noteTime : null,
+                string: Number.isInteger(partial.string) ? partial.string : null,
+                fret: Number.isInteger(partial.fret) ? partial.fret : null,
+                chord: !!partial.chord,
+                expectedMidi: Number.isFinite(partial.expectedMidi) ? partial.expectedMidi : null,
+                detectedMidi: Number.isFinite(partial.detectedMidi)
+                    ? partial.detectedMidi
+                    : open.detectedMidi,
+                confidence: Number.isFinite(partial.confidence)
+                    ? partial.confidence
+                    : open.confidence,
+                hitStrings: Number.isFinite(partial.hitStrings) ? partial.hitStrings : null,
+                totalStrings: Number.isFinite(partial.totalStrings) ? partial.totalStrings : null,
+                chordScore: Number.isFinite(partial.chordScore) ? partial.chordScore : null,
+                timingErrorMs: Number.isFinite(partial.timingErrorMs) ? partial.timingErrorMs : null,
+                pitchErrorCents: Number.isFinite(partial.pitchErrorCents) ? partial.pitchErrorCents : null,
+                inputLevelPct: Number.isFinite(partial.inputLevelPct)
+                    ? partial.inputLevelPct
+                    : levels.levelPct,
+                inputPeakPct: Number.isFinite(partial.inputPeakPct)
+                    ? partial.inputPeakPct
+                    : levels.peakPct,
+                // Enriched engine-verifier context (read-only telemetry).
+                verifierId: typeof partial.verifierId === 'string' ? partial.verifierId : null,
+                playheadAudio: Number.isFinite(partial.playheadAudio) ? partial.playheadAudio : null,
+                engineDetected: typeof partial.engineDetected === 'boolean' ? partial.engineDetected : null,
+                engineDetectedRaw: typeof partial.engineDetectedRaw === 'boolean'
+                    ? partial.engineDetectedRaw
+                    : null,
+                detectedSongTime: Number.isFinite(partial.detectedSongTime)
+                    ? partial.detectedSongTime
+                    : null,
+                silenceGateApplied: !!partial.silenceGateApplied,
+                strikePeakPct: Number.isFinite(partial.strikePeakPct)
+                    ? partial.strikePeakPct
+                    : levels.peakPct,
+                strikeSamplesInWindow: Number.isFinite(partial.strikeSamplesInWindow)
+                    ? partial.strikeSamplesInWindow
+                    : strikeCtx.strikeSamplesInWindow,
+                inputLevelAtLogPct: Number.isFinite(partial.inputLevelAtLogPct)
+                    ? partial.inputLevelAtLogPct
+                    : levels.levelPct,
+                rendererPitchPolled: partial.rendererPitchPolled !== undefined
+                    ? !!partial.rendererPitchPolled
+                    : !_ndUsingEngineVerifier,
+                engineVerdict: partial.engineVerdict && typeof partial.engineVerdict === 'object'
+                    ? { ...partial.engineVerdict }
+                    : null,
+            };
+            _ndPushVerifierReject(row);
+            if (dedupKey) _ndRejectDedup.add(dedupKey);
+        } catch (_) { /* never throw */ }
+    }
+
+    function _ndRejectReasonFromJudgment(judgment) {
+        if (!judgment) return 'UNKNOWN';
+        if (judgment.chord) return 'CHORD_RATIO_FAIL';
+        if (judgment.timingState === 'EARLY' || judgment.timingState === 'LATE') return 'TIMING_FAIL';
+        if (judgment.pitchState === 'SHARP' || judgment.pitchState === 'FLAT') return 'PITCH_FAIL';
+        if (judgment.detectedMidi == null) return 'RETIRE_NO_MATCH';
+        return 'UNKNOWN';
+    }
+
+    function _ndLogVerifierRejectFromJudgmentIfNew(key, judgment) {
+        try {
+            if (!key || _ndRejectDedup.has(key)) return;
+            const cn = judgment.chartNote || judgment.note || {};
+            _ndLogVerifierRejectOnce(key, {
+                reason: _ndRejectReasonFromJudgment(judgment),
+                noteTime: Number.isFinite(judgment.noteTime) ? judgment.noteTime : null,
+                string: Number.isInteger(cn.s) ? cn.s : null,
+                fret: Number.isInteger(cn.f) ? cn.f : null,
+                chord: !!judgment.chord,
+                expectedMidi: Number.isFinite(judgment.expectedMidi) ? judgment.expectedMidi : null,
+                detectedMidi: Number.isFinite(judgment.detectedMidi) ? judgment.detectedMidi : null,
+                confidence: Number.isFinite(judgment.confidence) ? judgment.confidence : null,
+                hitStrings: Number.isFinite(judgment.hitStrings) ? judgment.hitStrings : null,
+                totalStrings: Number.isFinite(judgment.totalStrings) ? judgment.totalStrings : null,
+                chordScore: Number.isFinite(judgment.score) ? judgment.score : null,
+                timingErrorMs: Number.isFinite(judgment.timingError) ? judgment.timingError : null,
+                pitchErrorCents: Number.isFinite(judgment.pitchError) ? judgment.pitchError : null,
+            });
+        } catch (_) { /* never throw */ }
+    }
+
+    function getVerifierRejects() {
+        try {
+            return _ndVerifierRejects.map((e) => ({ ...e }));
+        } catch (_) {
+            return [];
+        }
+    }
+
+    // ── Detection Health (read-only gear popover) ─────────────────────
+    function _ndFormatMs(n) {
+        if (n == null || !Number.isFinite(n)) return '—';
+        const r = Math.round(n);
+        return (r >= 0 ? '+' + r : String(r)) + ' ms';
+    }
+
+    function _ndFormatPercent(ratio) {
+        if (ratio == null || !Number.isFinite(ratio)) return '—';
+        return Math.round(ratio * 100) + '%';
+    }
+
+    // ── Musician-facing display helpers (copy only — no detection changes) ──
+    function _ndMusicianRejectHint(reason) {
+        const hints = {
+            NO_VERDICT: 'No detection at note time',
+            SILENCE_GATE: 'Input too quiet when the note struck',
+            STRING_VERIFY_FAIL: 'Something was heard but did not verify',
+            CHORD_RATIO_FAIL: 'Not enough strings heard for the chord',
+            TIMING_FAIL: 'Played outside the timing window',
+            PITCH_FAIL: 'Pitch was outside the allowed window',
+            RETIRE_NO_MATCH: 'No match before the note ended',
+            UNKNOWN: 'Could not verify this note',
+        };
+        return hints[reason] || hints.UNKNOWN;
+    }
+
+    function _ndFormatMusicianRejectLine(r) {
+        if (!r || typeof r !== 'object') return '—';
+        const parts = [_ndMusicianRejectHint(r.reason)];
+        if (Number.isFinite(r.hitStrings) && Number.isFinite(r.totalStrings)) {
+            parts.push(`${r.hitStrings} of ${r.totalStrings} strings heard`);
+        } else if (Number.isInteger(r.string) && Number.isInteger(r.fret)) {
+            parts.push(`string ${r.string + 1}, fret ${r.fret}`);
+        }
+        const strikePeak = Number.isFinite(r.strikePeakPct)
+            ? r.strikePeakPct
+            : (Number.isFinite(r.inputPeakPct) ? r.inputPeakPct : null);
+        if (Number.isFinite(strikePeak)) {
+            parts.push(`signal at strike ${strikePeak}%`);
+        }
+        if (Number.isFinite(r.timingErrorMs)) {
+            const te = Math.round(r.timingErrorMs);
+            parts.push(te >= 0 ? `${te} ms late` : `${Math.abs(te)} ms early`);
+        }
+        return parts.join(' · ');
+    }
+
+    function _ndHealthHearingForPanel() {
+        const line = _ndHealthDetectedLine();
+        if (line !== '—') return line;
+        if (!enabled) {
+            return 'Nothing yet — turn Detect on, then play a note or chord';
+        }
+        return 'Nothing yet — play a note or chord (stays blank when input is quiet)';
+    }
+
+    function _calWizardNoiseStatusDisplay(status) {
+        if (status === 'good') return 'Good — quiet room (under 5%)';
+        if (status === 'elevated') return 'Elevated — some background noise (5–15%)';
+        if (status === 'too_noisy') return 'Too noisy — over 15%; lower gain or quiet the room';
+        return status || '—';
+    }
+
+    function _calWizardSignalStatusDisplay(status) {
+        if (status === 'good') return 'Good — strong enough for detection';
+        if (status === 'too_low') return 'Too low — play louder or raise input gain';
+        if (status === 'too_hot') return 'Too hot — risk of clipping; lower input gain';
+        return status || '—';
+    }
+
+    function _calLabDominantFailLabel(fail) {
+        if (fail === 'SNR') return 'signal clarity';
+        if (fail === 'FUND') return 'main note';
+        if (fail === 'PITCH') return 'tuning match';
+        return fail || '—';
+    }
+
+    function _calLabGateChipsHtml(tick) {
+        if (!tick || typeof tick !== 'object') return '';
+        const chip = (label, ok) => {
+            const cls = ok ? 'text-green-300/90' : 'text-amber-200/90';
+            const mark = ok ? '✓' : '✗';
+            return `<span class="${cls}">${label}${mark}</span>`;
+        };
+        const snrOk = !!tick.passedSnr || (tick.gatePassCount >= 1 && !(tick.failedGateMask & 1));
+        const fundOk = !!tick.passedFundamental || (tick.gatePassCount >= 2 && !(tick.failedGateMask & 2));
+        const pitchOk = !!tick.passedPitch || tick.gatePassCount === 3;
+        if (tick.passedSnr === undefined && tick.gatePassCount != null) {
+            return `<span class="text-[9px] font-mono flex gap-1.5">`
+                + chip('Clarity', (tick.failedGateMask & 1) === 0 && tick.gatePassCount >= 1)
+                + chip('Main note', (tick.failedGateMask & 2) === 0 && tick.gatePassCount >= 2)
+                + chip('Tuning', tick.gatePassCount === 3)
+                + '</span>';
+        }
+        return `<span class="text-[9px] font-mono flex gap-1.5">`
+            + chip('Clarity', snrOk) + chip('Main note', fundOk) + chip('Tuning', pitchOk)
+            + '</span>';
+    }
+
+    function _ndDominantMissReason(breakdown, totalMisses) {
+        if (!breakdown || !totalMisses || totalMisses <= 0) return null;
+        const labels = {
+            pure: 'no note heard',
+            chordPartial: 'partial chord',
+            early: 'played too early',
+            late: 'played too late',
+            sharp: 'pitch too sharp',
+            flat: 'pitch too flat',
+        };
+        let bestKey = null;
+        let bestVal = 0;
+        for (const k of Object.keys(labels)) {
+            const v = breakdown[k] || 0;
+            if (v > bestVal) { bestVal = v; bestKey = k; }
+        }
+        if (!bestKey || bestVal === 0) return null;
+        return { key: bestKey, label: labels[bestKey], count: bestVal };
+    }
+
+    function _ndDetectionHealthHint(d, totalJudgments) {
+        if (inputLevel > 0.85) {
+            return 'Signal is hot — reduce input gain.';
+        }
+        if (!totalJudgments || totalJudgments < 5) {
+            return 'Not enough hits yet — play a few notes to collect data.';
+        }
+        const misses = (d && d.summary) ? (d.summary.misses || 0) : 0;
+        const bk = (d && d.miss_breakdown) ? d.miss_breakdown : {};
+        const teHits = (d && d.timing_error_ms_hits) ? d.timing_error_ms_hits : {};
+        const median = teHits.median;
+        const dom = _ndDominantMissReason(bk, misses);
+        if (dom) {
+            if (dom.key === 'late' || (Number.isFinite(median) && median > 25)) {
+                return 'Mostly late hits — timing offset may need calibration.';
+            }
+            if (dom.key === 'early' || (Number.isFinite(median) && median < -25)) {
+                return 'Mostly early hits — timing offset may need calibration.';
+            }
+            if (dom.key === 'pure') {
+                return 'Many pure misses — check input channel, gain, or detector confidence.';
+            }
+            if (dom.key === 'chordPartial') {
+                return 'Many chord partials — chord detection may be hearing only part of the chord.';
+            }
+            if (dom.key === 'sharp' || dom.key === 'flat') {
+                return 'Many pitch misses — check tuning, capo, or pitch tolerance.';
+            }
+        }
+        if (Number.isFinite(median) && Math.abs(median) >= 20) {
+            return 'Timing median is off — try the Calibration Wizard timing step or adjust chart sync (A/V offset) in main Settings.';
+        }
+        return null;
+    }
+
+    function _ndHealthDetectedLine() {
+        if (detectedString >= 0 && detectedConfidence > detectionConfidenceMin) {
+            const displayMidi = Number.isFinite(detectedDisplayMidi) ? detectedDisplayMidi : detectedMidi;
+            const name = Number.isFinite(displayMidi) ? _ndMidiToName(displayMidi) : '—';
+            const confPct = Math.round(detectedConfidence * 100);
+            return `${name} · string ${detectedString} fret ${detectedFret} · ${confPct}% conf`;
+        }
+        const currentHw = resolveHw();
+        if (lastChordScore !== null && currentHw && typeof currentHw.getTime === 'function') {
+            const songTime = currentHw.getTime() - latencyOffset
+                + (currentHw.getAvOffset ? currentHw.getAvOffset() / 1000 : 0);
+            if (songTime - lastChordTime <= 1.5) {
+                const pct = Math.round(lastChordScore * 100);
+                return `Chord ${lastChordHit}/${lastChordTotal} strings (${pct}%)`;
+            }
+        }
+        return '—';
+    }
+
+    function _ndHealthInputChannelLabel() {
+        if (selectedChannel === 'left') return 'Left (Ch 1)';
+        if (selectedChannel === 'right') return 'Right (Ch 2)';
+        return 'Mono';
+    }
+
+    function _ndHealthDetectorPathLabel() {
+        if (usingDesktopBridge) return 'Desktop audio engine';
+        if (_diagDetector && _diagDetector.path) return String(_diagDetector.path);
+        return 'Browser microphone';
+    }
+
+    function renderDetectionHealth(panel) {
+        if (!panel) return;
+        const set = (sel, text) => {
+            const el = panel.querySelector(sel);
+            if (el) el.textContent = text;
+        };
+        let d;
+        try {
+            d = _buildDiagnosticPayload();
+        } catch (e) {
+            d = null;
+        }
+        const summary = (d && d.summary) ? d.summary : {};
+        const total = summary.total || 0;
+        const hitsN = summary.hits || 0;
+        const missesN = summary.misses || 0;
+        const methodLabel = detectionMethod === 'crepe' && _ndShared.modelLoading
+            ? `${detectionMethod} (loading…)`
+            : (detectionMethod || '—');
+        const sr = audioCtx && audioCtx.sampleRate
+            ? Math.round(audioCtx.sampleRate)
+            : (bridgeSampleRate ? Math.round(bridgeSampleRate) : null);
+        const avMs = (resolveHw() && resolveHw().getAvOffset)
+            ? resolveHw().getAvOffset()
+            : null;
+        const teHits = (d && d.timing_error_ms_hits) ? d.timing_error_ms_hits : {};
+        const dom = _ndDominantMissReason((d && d.miss_breakdown) ? d.miss_breakdown : {}, missesN);
+        const levelPct = Math.round((inputLevel || 0) * 100);
+        let levelNote = `${levelPct}%`;
+        if (inputLevel > 0.85) levelNote += ' (hot)';
+        else if (inputLevel < 0.02) levelNote += ' (quiet)';
+
+        set('.nd-health-status',
+            enabled
+                ? `● Running · ${methodLabel} · ${_ndHealthDetectorPathLabel()}`
+                : '○ Detect is off');
+        set('.nd-health-input',
+            `Input: ${_ndHealthInputChannelLabel()}`
+            + (sr ? ` · ${sr} Hz` : '')
+            + (selectedDeviceId ? '' : ' · default device'));
+        set('.nd-health-hearing', `Now hearing: ${_ndHealthHearingForPanel()}`);
+        set('.nd-health-session',
+            total > 0
+                ? `This song: ${hitsN} hits · ${missesN} misses · ${_ndFormatPercent(summary.accuracy)}`
+                : 'This song: Not enough data yet');
+        set('.nd-health-top-miss',
+            dom
+                ? `Most common miss: ${dom.label} (${dom.count})`
+                : (missesN > 0 ? 'Most common miss: —' : 'Most common miss: none yet'));
+        const timingMed = teHits.median;
+        set('.nd-health-align',
+            `Sync: chart/video offset ${_ndFormatMs(avMs)} · detection delay ${Math.round(latencyOffset * 1000)} ms`
+            + (Number.isFinite(timingMed)
+                ? ` · your hits average ${_ndFormatMs(timingMed)} vs chart`
+                : ' · your hits: not enough data yet'));
+        set('.nd-health-level', `Input level: ${levelNote}`);
+        let rejectLines = '—';
+        try {
+            const recent = _ndVerifierRejects.slice(-3).reverse();
+            if (recent.length > 0) {
+                rejectLines = recent.map(_ndFormatMusicianRejectLine).join('\n');
+            }
+        } catch (_) { /* read-only */ }
+        set('.nd-health-rejects', rejectLines);
+        const hint = _ndDetectionHealthHint(d, total);
+        set('.nd-health-hint', hint ? `Tip: ${hint}` : 'Tip: —');
+    }
+
+    // ── Calibration Wizard v2 (system setup — safe settings only) ─────
+    function calibrationFormatLevel(levelPct, peakPct) {
+        const l = Number.isFinite(levelPct) ? Math.round(levelPct) : 0;
+        const p = Number.isFinite(peakPct) ? Math.round(peakPct) : l;
+        let s = `${l}%`;
+        if (p > l) s += ` (peak ${p}%)`;
+        if (l > 85) s += ' — hot';
+        else if (l < 2) s += ' — quiet';
+        return s;
+    }
+
+    const _CAL_WIZARD_CHANNEL_PROBE_MS = 3000;
+    const _CAL_WIZARD_CHANNEL_PROBE_INTERVAL_MS = 100;
+    const _CAL_WIZARD_CHANNEL_PROBE_SETTLE_MS = 250;
+    const _CAL_WIZARD_CHANNEL_PROBE_MIN_PEAK = 0.05;
+    const _CAL_WIZARD_CHANNEL_PROBE_MONO_TIE_RATIO = 0.10;
+    const _CAL_WIZARD_INPUT_CHANNEL_OPTIONS = [
+        { ch: -1, label: 'Default / Mono Mix' },
+        { ch: 0, label: 'Input 1 / Ch 1' },
+        { ch: 1, label: 'Input 2 / Ch 2' },
+    ];
+    const _CAL_WIZARD_TIMED_PLAYALONG_SEC = 30;
+    const _CAL_WIZARD_PLAY_ALONG_WAIT_MS = 60000;
+    const _CAL_WIZARD_PLAY_ALONG_WAIT_POLL_MS = 250;
+    const _CAL_WIZARD_PLAYHEAD_ADVANCE_MIN_SEC = 0.02;
+    const _CAL_WIZARD_PLAYHEAD_ADVANCE_MIN_GAP_MS = 150;
+    const _CAL_WIZARD_PAUSE_RETRY_DELAYS_MS = [0, 150, 500, 1200, 2500, 4000];
+    let _calWizardPauseRetryTimers = [];
+
+    function _calWizardDefaultAllStringsState() {
+        return {
+            running: false,
+            index: 0,
+            ids: [],
+            complete: false,
+            failedId: null,
+            detailsOpen: false,
+            message: null,
+        };
+    }
+
+    function _calWizardClearPauseRetries() {
+        _calWizardPauseRetryTimers.forEach((id) => clearTimeout(id));
+        _calWizardPauseRetryTimers = [];
+    }
+
+    function _calWizardNewState() {
+        return {
+            step: 0,
+            startedAt: Date.now(),
+            tunerMinimized: false,
+            noise: null,
+            signal: null,
+            notes: {},
+            allStrings: _calWizardDefaultAllStringsState(),
+            timing: null,
+            recommended: { inputGain: null, latencyOffset: null, reasons: {} },
+            applyChecked: { inputGain: true, latencyOffset: true },
+            applied: null,
+            complete: null,
+            playAlong: null,
+            timingCaptureNote: null,
+            autoCapture: null,
+            channelProbeRunning: false,
+            channelProbeResult: null,
+            channelProbeError: null,
+            channelProbeAbort: null,
+        };
+    }
+
+    function _calWizardStopAutoCapture() {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        if (wiz.autoCapture) {
+            const ac = wiz.autoCapture;
+            if (ac.timerId) clearTimeout(ac.timerId);
+            if (ac.intervalId) clearInterval(ac.intervalId);
+            wiz.autoCapture = null;
+        }
+        if (wiz.channelProbeAbort) {
+            wiz.channelProbeAbort = null;
+            wiz.channelProbeRunning = false;
+        }
+    }
+
+    function _calWizardNoiseStatus(avgPct) {
+        if (!Number.isFinite(avgPct)) return 'unknown';
+        if (avgPct < 5) return 'good';
+        if (avgPct < 15) return 'elevated';
+        return 'too_noisy';
+    }
+
+    function _calWizardSignalStatus(avgPct, peakPct, noiseAvg) {
+        if (!Number.isFinite(avgPct)) return 'unknown';
+        const floor = Number.isFinite(noiseAvg) ? noiseAvg + 6 : 8;
+        if (avgPct < floor) return 'too_low';
+        if ((peakPct || avgPct) > 85) return 'too_hot';
+        return 'good';
+    }
+
+    function _calWizardRecommendInputGain(signalStatus, currentGain, signalAvg) {
+        const g = Number.isFinite(currentGain) ? currentGain : 1;
+        if (signalStatus === 'too_low' && g < 5) {
+            const target = Math.min(5, Math.max(1.1, g * 1.2));
+            if (target > g + 0.04) {
+                return {
+                    value: +target.toFixed(2),
+                    reason: `Signal averaged ${Math.round(signalAvg || 0)}% — a modest gain boost may help note detection.`,
+                };
+            }
+        }
+        if (signalStatus === 'too_hot' && g > 1) {
+            const target = Math.max(1, g * 0.85);
+            if (target < g - 0.04) {
+                return {
+                    value: +target.toFixed(2),
+                    reason: 'Signal is hot — lowering input gain reduces clipping risk.',
+                };
+            }
+        }
+        return null;
+    }
+
+    function _calWizardRecommendLatency(medianMs, currentLatencyS) {
+        if (!Number.isFinite(medianMs) || Math.abs(medianMs) < 8) return null;
+        const cur = Number.isFinite(currentLatencyS) ? currentLatencyS : 0.08;
+        const delta = (medianMs / 1000) * 0.5;
+        const target = Math.max(0, Math.min(0.25, cur + delta));
+        if (Math.abs(target - cur) < 0.005) return null;
+        const dir = medianMs > 0 ? 'late' : 'early';
+        return {
+            value: +target.toFixed(3),
+            reason: `Hit timing median is ${_ndFormatMs(medianMs)} (${dir}) — adjusting audio latency offset may align notes with the chart.`,
+        };
+    }
+
+    function _calWizardBuildSafeRecommendations(wiz, snap) {
+        const rec = { inputGain: null, latencyOffset: null, reasons: {} };
+        if (wiz && wiz.signal) {
+            const g = _calWizardRecommendInputGain(
+                wiz.signal.status, inputGain, wiz.signal.avgPct);
+            if (g) {
+                rec.inputGain = g.value;
+                rec.reasons.inputGain = g.reason;
+            }
+        }
+        const med = wiz && wiz.timing && Number.isFinite(wiz.timing.medianMs)
+            ? wiz.timing.medianMs
+            : (snap && snap.timingMedianMs);
+        const lat = _calWizardRecommendLatency(med, latencyOffset);
+        if (lat) {
+            rec.latencyOffset = lat.value;
+            rec.reasons.latencyOffset = lat.reason;
+        }
+        wiz.recommended = rec;
+        return rec;
+    }
+
+    function _calWizardSetAutoStatus(html) {
+        const el = _calWizardEl && _calWizardEl.querySelector('.nd-cal-auto-status');
+        if (el) el.innerHTML = html;
+    }
+
+    function _calWizardSetChannelProbeStatus(html) {
+        const el = _calWizardEl && _calWizardEl.querySelector('.nd-cal-channel-probe-status');
+        if (el) el.innerHTML = html;
+    }
+
+    function _calWizardSetTunerOpenStatus(message, tone) {
+        const el = _calWizardEl && _calWizardEl.querySelector('.nd-cal-tuner-open-status');
+        if (!el) return;
+        if (!message) {
+            el.innerHTML = '';
+            return;
+        }
+        const cls = tone === 'warn' ? 'text-amber-200/90' : 'text-gray-400';
+        el.innerHTML = `<span class="${cls}">${message}</span>`;
+    }
+
+    function _calWizardIsTunerUiVisible() {
+        const el = document.getElementById('tuner-plugin-ui');
+        if (!el || el.classList.contains('hidden')) return false;
+        const cs = window.getComputedStyle(el);
+        return cs.display !== 'none' && cs.visibility !== 'hidden';
+    }
+
+    async function _calWizardWaitForTunerUiVisible(maxMs) {
+        const deadline = Date.now() + maxMs;
+        while (Date.now() < deadline) {
+            if (_calWizardIsTunerUiVisible()) return true;
+            await _calWizardSleep(100);
+        }
+        return _calWizardIsTunerUiVisible();
+    }
+
+    async function _calWizardOpenTunerFromWizard() {
+        if (!window.tuner || typeof window.tuner.enable !== 'function') {
+            _calWizardSetTunerOpenStatus(
+                'Tuner plugin is not loaded. Enable the Tuner plugin, then try again.', 'warn');
+            return;
+        }
+        _calWizardSetTunerOpenStatus('Opening tuner…', 'neutral');
+        try {
+            await window.tuner.enable();
+        } catch (e) {
+            console.warn('[note_detect] tuner enable:', e);
+            _calWizardSetTunerOpenStatus(
+                'Tuner did not open. Check microphone permission or open the Tuner from the bottom toolbar.', 'warn');
+            return;
+        }
+        const visible = await _calWizardWaitForTunerUiVisible(4000);
+        if (visible) {
+            _calWizardSetTunerOpenStatus('', 'neutral');
+            _calWizardSetTunerMinimized(true);
+            return;
+        }
+        _calWizardSetTunerOpenStatus(
+            'Tuner did not open. Check microphone permission or open the Tuner from the bottom toolbar.', 'warn');
+    }
+
+    function _calWizardFinishLevelSample(wiz, kind, samples) {
+        if (!samples.length) {
+            _calWizardSetAutoStatus('<span class="text-amber-200/90">No samples — turn Detect on and retry.</span>');
+            return;
+        }
+        let sum = 0;
+        let maxPeak = 0;
+        for (const s of samples) {
+            sum += s.level;
+            if (s.peak > maxPeak) maxPeak = s.peak;
+        }
+        const avg = Math.round(sum / samples.length);
+        const peak = maxPeak;
+        if (kind === 'noise') {
+            wiz.noise = {
+                avgPct: avg,
+                peakPct: peak,
+                status: _calWizardNoiseStatus(avg),
+                captured: true,
+                at: Date.now(),
+            };
+            const label = _calWizardNoiseStatusDisplay(wiz.noise.status);
+            _calWizardSetAutoStatus(
+                `<span class="text-green-300/90">Captured:</span> avg ${avg}% · peak ${peak}% · <span class="font-semibold">${label}</span>`);
+        } else if (kind === 'signal') {
+            const noiseAvg = wiz.noise && wiz.noise.avgPct;
+            wiz.signal = {
+                avgPct: avg,
+                peakPct: peak,
+                status: _calWizardSignalStatus(avg, peak, noiseAvg),
+                captured: true,
+                at: Date.now(),
+            };
+            const label = _calWizardSignalStatusDisplay(wiz.signal.status);
+            let extra = '';
+            const gRec = _calWizardRecommendInputGain(wiz.signal.status, inputGain, avg);
+            if (gRec) extra = `<div class="text-gray-400 mt-1">Suggested input gain: ${gRec.value}x</div>`;
+            _calWizardSetAutoStatus(
+                `<span class="text-green-300/90">Captured:</span> avg ${avg}% · peak ${peak}% · <span class="font-semibold">${label}</span>${extra}`);
+            _calWizardBuildSafeRecommendations(wiz, getCalibrationSnapshot());
+        }
+        renderCalibrationWizard();
+    }
+
+    function _calWizardRunLevelSampler(wiz, kind, durationMs, onDone) {
+        _calWizardStopAutoCapture();
+        const samples = [];
+        const started = Date.now();
+        wiz.autoCapture = { kind, phase: 'listening', samples, started };
+        const tick = () => {
+            const snap = getCalibrationSnapshot();
+            samples.push({ level: snap.inputLevelPct, peak: snap.inputPeakPct, t: Date.now() });
+            const elapsed = Date.now() - started;
+            _calWizardSetAutoStatus(
+                `<span class="text-cyan-300/90">Listening…</span> ${Math.round(elapsed / 1000)}s / ${Math.round(durationMs / 1000)}s · `
+                + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct));
+            if (elapsed >= durationMs) {
+                _calWizardStopAutoCapture();
+                onDone(samples);
+            }
+        };
+        tick();
+        wiz.autoCapture.intervalId = setInterval(tick, 120);
+        wiz.autoCapture.timerId = setTimeout(() => {
+            _calWizardStopAutoCapture();
+            onDone(samples);
+        }, durationMs + 200);
+    }
+
+    function _calWizardBeginCountdownThen(kind, countdownSec, afterCountdown) {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        _calWizardStopAutoCapture();
+        let left = countdownSec;
+        wiz.autoCapture = { kind, phase: 'countdown', left };
+        const tick = () => {
+            if (!_calWizardState || _calWizardState !== wiz) return;
+            _calWizardSetAutoStatus(`<span class="text-cyan-300/90">Get ready…</span> <span class="text-2xl font-bold text-white">${left}</span>`);
+            if (left <= 0) {
+                _calWizardStopAutoCapture();
+                afterCountdown();
+                return;
+            }
+            left--;
+            wiz.autoCapture.timerId = setTimeout(tick, 1000);
+        };
+        tick();
+    }
+
+    function _calWizardStartNoiseCapture() {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            return;
+        }
+        _calWizardBeginCountdownThen('noise', 3, () => {
+            _calWizardSetAutoStatus('<span class="text-cyan-300/90">Listening…</span> Mute all strings.');
+            _calWizardRunLevelSampler(wiz, 'noise', 1600, (samples) => {
+                _calWizardFinishLevelSample(wiz, 'noise', samples);
+            });
+        });
+    }
+
+    function _calWizardStartSignalCapture() {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            return;
+        }
+        const noiseFloor = (wiz.noise && wiz.noise.avgPct) || 3;
+        const trigger = noiseFloor + 8;
+        _calWizardBeginCountdownThen('signal', 3, () => {
+            _calWizardStopAutoCapture();
+            const samples = [];
+            const started = Date.now();
+            const maxWait = 12000;
+            wiz.autoCapture = { kind: 'signal', phase: 'wait_signal', samples, started };
+            const tick = () => {
+                const s = getCalibrationSnapshot();
+                const lvl = s.inputLevelPct;
+                const elapsed = Date.now() - started;
+                if (lvl >= trigger && wiz.autoCapture.phase === 'wait_signal') {
+                    wiz.autoCapture.phase = 'listening';
+                    wiz.autoCapture.signalStarted = Date.now();
+                    _calWizardSetAutoStatus('<span class="text-cyan-300/90">Signal detected — listening…</span> Play open low E.');
+                }
+                if (wiz.autoCapture.phase === 'listening') {
+                    samples.push({ level: lvl, peak: s.inputPeakPct, t: Date.now() });
+                    const listenFor = Date.now() - (wiz.autoCapture.signalStarted || started);
+                    _calWizardSetAutoStatus(
+                        `<span class="text-cyan-300/90">Listening…</span> ${Math.round(listenFor / 1000)}s · `
+                        + calibrationFormatLevel(lvl, s.inputPeakPct));
+                    if (listenFor >= 1600) {
+                        _calWizardStopAutoCapture();
+                        _calWizardFinishLevelSample(wiz, 'signal', samples);
+                        return;
+                    }
+                } else {
+                    _calWizardSetAutoStatus(
+                        `<span class="text-cyan-300/90">Waiting for signal…</span> Play open low E (need ≥${trigger}%). `
+                        + calibrationFormatLevel(lvl, s.inputPeakPct));
+                    if (elapsed >= maxWait) {
+                        _calWizardStopAutoCapture();
+                        _calWizardSetAutoStatus('<span class="text-amber-200/90">Timeout — no signal detected. Retry when ready.</span>');
+                    }
+                }
+            };
+            tick();
+            wiz.autoCapture.intervalId = setInterval(tick, 120);
+        });
+    }
+
+    function _calWizardResolveNoteCheckContext() {
+        try { _syncChartStateFromHw(); } catch (_) { /* read-only refresh */ }
+        const hw = resolveHw();
+        let info = null;
+        try { info = (hw && hw.getSongInfo) ? hw.getSongInfo() : null; } catch (_) {}
+        const hasTuning = !!(info && Array.isArray(info.tuning) && info.tuning.length > 0);
+        const arrangement = currentArrangement || 'guitar';
+        const stringCount = (Number.isFinite(currentStringCount) && currentStringCount > 0)
+            ? currentStringCount : 6;
+        const offsets = Array.isArray(tuningOffsets) ? tuningOffsets : [0, 0, 0, 0, 0, 0];
+        return { hasTuning, arrangement, stringCount, offsets };
+    }
+
+    function _calWizardOpenStringMidi(stringIndex, ctx) {
+        const { hasTuning, arrangement, stringCount, offsets } = ctx;
+        let expectedMidi = null;
+        if (hasTuning) {
+            try {
+                const computed = _ndMidiFromStringFret(
+                    stringIndex, 0, arrangement, stringCount, offsets, 0);
+                if (Number.isFinite(computed)) expectedMidi = computed;
+            } catch (_) { /* fall through to fallback */ }
+        }
+        if (!Number.isFinite(expectedMidi)) {
+            try {
+                const base = _ndStandardMidiFor(arrangement, stringCount);
+                if (base && base[stringIndex] !== undefined) expectedMidi = base[stringIndex];
+            } catch (_) { /* ignore */ }
+        }
+        return expectedMidi;
+    }
+
+    function _calWizardOpenStringDisplayNum(stringIndex, stringCount) {
+        return stringCount - stringIndex;
+    }
+
+    function _calWizardOpenStringLabel(stringIndex, stringCount, expectedNote, hasTuning) {
+        const n = _calWizardOpenStringDisplayNum(stringIndex, stringCount);
+        const note = expectedNote || '—';
+        if (stringIndex === 0) {
+            return hasTuning
+                ? `String ${n} — low string (${note})`
+                : `String ${n} — low string`;
+        }
+        if (stringIndex === stringCount - 1) {
+            return hasTuning
+                ? `String ${n} — high string (${note})`
+                : `String ${n} — high string`;
+        }
+        return hasTuning ? `String ${n} (${note})` : `String ${n}`;
+    }
+
+    function _calWizardResolveNoteChecks(opts) {
+        const mode = (opts && opts.mode === 'all') ? 'all' : 'quick';
+        const ctx = _calWizardResolveNoteCheckContext();
+        const { hasTuning, stringCount } = ctx;
+        if (mode === 'all') {
+            const specs = [];
+            for (let s = 0; s < stringCount; s++) {
+                const expectedMidi = _calWizardOpenStringMidi(s, ctx);
+                if (!Number.isFinite(expectedMidi)) continue;
+                const expectedNote = _ndMidiToName(expectedMidi);
+                specs.push({
+                    id: 'openS' + s,
+                    label: _calWizardOpenStringLabel(s, stringCount, expectedNote, hasTuning),
+                    expectedMidi,
+                    expectedNote,
+                    string: s,
+                    displayString: _calWizardOpenStringDisplayNum(s, stringCount),
+                });
+            }
+            return specs;
+        }
+        const specs = [];
+        for (const def of _CAL_WIZARD_NOTE_CHECK_DEFS) {
+            if (def.string >= stringCount) continue;
+            let expectedMidi = _calWizardOpenStringMidi(def.string, ctx);
+            if (!Number.isFinite(expectedMidi)) expectedMidi = def.fallbackMidi;
+            const expectedNote = _ndMidiToName(expectedMidi);
+            const label = def.string === 0
+                ? (hasTuning ? `Open low string (${expectedNote})` : def.fallbackLabel)
+                : (hasTuning ? `Open 2nd string (${expectedNote})` : def.fallbackLabel);
+            specs.push({
+                id: def.id,
+                label,
+                expectedMidi,
+                expectedNote,
+                string: def.string,
+            });
+        }
+        if (!specs.length) {
+            return _CAL_WIZARD_NOTE_CHECK_DEFS.map((def) => ({
+                id: def.id,
+                label: def.fallbackLabel,
+                expectedMidi: def.fallbackMidi,
+                expectedNote: _ndMidiToName(def.fallbackMidi),
+                string: def.string,
+            }));
+        }
+        return specs;
+    }
+
+    function _calWizardFindNoteCheckSpec(noteId) {
+        if (!noteId) return null;
+        const quick = _calWizardResolveNoteChecks({ mode: 'quick' });
+        const hit = quick.find((n) => n.id === noteId);
+        if (hit) return hit;
+        const all = _calWizardResolveNoteChecks({ mode: 'all' });
+        return all.find((n) => n.id === noteId) || null;
+    }
+
+    // Wizard-only raw pitch readout — bypasses chart-aware detectedDisplayMidi.
+    function _calWizardRawPitchFields() {
+        const confOk = detectedConfidence > detectionConfidenceMin;
+        const rawMidi = (detectedMidi >= 0 && confOk) ? detectedMidi : null;
+        const rawNote = Number.isFinite(rawMidi) ? _ndMidiToName(rawMidi) : '—';
+        let displayNote = null;
+        if (detectedString >= 0 && confOk) {
+            const dm = Number.isFinite(detectedDisplayMidi) ? detectedDisplayMidi : detectedMidi;
+            if (Number.isFinite(dm)) displayNote = _ndMidiToName(dm);
+        }
+        return {
+            rawMidi,
+            rawNote,
+            displayNote,
+            confidencePct: confOk ? Math.round(detectedConfidence * 100) : null,
+            channel: _ndHealthInputChannelLabel(),
+        };
+    }
+
+    function _calWizardMidiNearTarget(detectedMidi, targetMidi, centsTol) {
+        if (!Number.isFinite(detectedMidi) || !Number.isFinite(targetMidi)) return false;
+        return Math.abs(_ndNearestOctaveCents(detectedMidi, targetMidi)) <= centsTol;
+    }
+
+    function _calWizardStopAllStringsRun(reason, opts) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.allStrings) return;
+        const seq = wiz.allStrings;
+        const wasRunning = seq.running;
+        seq.running = false;
+        if (opts && opts.clearMessage) seq.message = null;
+        if (reason === 'restart') {
+            seq.complete = false;
+            seq.failedId = null;
+        }
+        if (wasRunning && wiz.autoCapture && wiz.autoCapture.kind === 'note') {
+            const nid = wiz.autoCapture.noteId;
+            if (nid && seq.ids && seq.ids.includes(nid)) {
+                _calWizardStopAutoCapture();
+            }
+        }
+    }
+
+    function _calWizardStartAllStringsRun() {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            return;
+        }
+        _calWizardStopAllStringsRun('restart', { clearMessage: true });
+        const specs = _calWizardResolveNoteChecks({ mode: 'all' });
+        if (!specs.length) return;
+        for (const key of Object.keys(wiz.notes)) {
+            if (key.startsWith('openS')) delete wiz.notes[key];
+        }
+        const ids = specs.map((s) => s.id);
+        const first = specs[0];
+        wiz.allStrings = {
+            running: true,
+            index: 0,
+            ids,
+            complete: false,
+            failedId: null,
+            detailsOpen: true,
+            message: first ? `Play ${first.label}` : null,
+        };
+        renderCalibrationWizard();
+        _calWizardStartNoteCapture(ids[0]);
+    }
+
+    function _calWizardAdvanceAllStringsRun(noteId, ok) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.allStrings || !wiz.allStrings.running) return false;
+        const seq = wiz.allStrings;
+        const expectedId = seq.ids[seq.index];
+        if (noteId !== expectedId) return true;
+        seq.detailsOpen = true;
+        if (!ok) {
+            seq.running = false;
+            seq.failedId = noteId;
+            const spec = _calWizardFindNoteCheckSpec(noteId);
+            const label = spec ? spec.label : noteId;
+            seq.message = `${label} did not pass — retry the run or check manually.`;
+            renderCalibrationWizard();
+            return true;
+        }
+        seq.index += 1;
+        if (seq.index >= seq.ids.length) {
+            seq.running = false;
+            seq.complete = true;
+            seq.message = 'All open strings passed.';
+            _calWizardSetAutoStatus('<span class="text-green-300/90">All open strings passed.</span>');
+            renderCalibrationWizard();
+            return true;
+        }
+        const nextId = seq.ids[seq.index];
+        const nextSpec = _calWizardFindNoteCheckSpec(nextId);
+        seq.message = nextSpec ? `Play ${nextSpec.label}` : `Play string ${seq.index + 1}`;
+        renderCalibrationWizard();
+        _calWizardStartNoteCapture(nextId);
+        return true;
+    }
+
+    function _calWizardStartNoteCapture(noteId) {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calWizardSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            if (wiz.allStrings && wiz.allStrings.running) {
+                _calWizardStopAllStringsRun('detect-off');
+            }
+            return;
+        }
+        _calWizardBeginCountdownThen('note_' + noteId, 2, () => {
+            const spec = _calWizardFindNoteCheckSpec(noteId);
+            if (!spec) return;
+            _calWizardStopAutoCapture();
+            const stable = [];
+            const started = Date.now();
+            const maxWait = 14000;
+            wiz.autoCapture = { kind: 'note', noteId, stable, started };
+            const tick = () => {
+                const s = getCalibrationSnapshot();
+                const heardMidi = _calWizardRawPitchFields().rawMidi;
+                if (_calWizardMidiNearTarget(heardMidi, spec.expectedMidi, 100)) {
+                    stable.push({ midi: heardMidi, conf: detectedConfidence, t: Date.now() });
+                } else {
+                    stable.length = 0;
+                }
+                const elapsed = Date.now() - started;
+                if (stable.length >= 4) {
+                    const last = stable[stable.length - 1];
+                    wiz.notes[noteId] = {
+                        ok: true,
+                        label: spec.label,
+                        expectedNote: spec.expectedNote,
+                        expectedMidi: spec.expectedMidi,
+                        heardNote: _ndMidiToName(last.midi),
+                        confidencePct: Math.round(last.conf * 100),
+                        at: Date.now(),
+                    };
+                    _calWizardStopAutoCapture();
+                    _calWizardSetAutoStatus(
+                        `<span class="text-green-300/90">${spec.label} OK</span> — `
+                        + `expected ${spec.expectedNote}, heard ${wiz.notes[noteId].heardNote} `
+                        + `(${wiz.notes[noteId].confidencePct}% conf)`);
+                    if (!_calWizardAdvanceAllStringsRun(noteId, true)) {
+                        renderCalibrationWizard();
+                    }
+                    return;
+                }
+                _calWizardSetAutoStatus(
+                    `<span class="text-cyan-300/90">Listening for ${spec.label}…</span> `
+                    + (s.heardConfidencePct != null
+                        ? `Expected: ${spec.expectedNote} · Heard: ${s.rawHeardNote ?? s.heardNote} · ${s.heardConfidencePct}%`
+                        : `Expected: ${spec.expectedNote} · Channel: ${s.channel || '—'} · Live: `
+                        + calibrationFormatLevel(s.inputLevelPct, s.inputPeakPct)));
+                if (elapsed >= maxWait) {
+                    _calWizardStopAutoCapture();
+                    wiz.notes[noteId] = {
+                        ok: false,
+                        label: spec.label,
+                        expectedNote: spec.expectedNote,
+                        expectedMidi: spec.expectedMidi,
+                        at: Date.now(),
+                    };
+                    _calWizardSetAutoStatus(
+                        `<span class="text-amber-200/90">${spec.label}: no stable note detected. `
+                        + `Expected ${spec.expectedNote}. Retry.</span>`);
+                    if (!_calWizardAdvanceAllStringsRun(noteId, false)) {
+                        renderCalibrationWizard();
+                    }
+                }
+            };
+            tick();
+            wiz.autoCapture.intervalId = setInterval(tick, 150);
+        });
+    }
+
+    function _calWizardCaptureTimingSnapshot() {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        let d = null;
+        try { d = getCalibrationSnapshot().diagnostic; } catch (_) {}
+        const dist = d && d.timing_error_ms_hits ? d.timing_error_ms_hits : {};
+        const med = dist.median;
+        const count = dist.count || 0;
+        wiz.timing = {
+            medianMs: Number.isFinite(med) ? med : null,
+            sampleCount: count,
+            captured: true,
+            at: Date.now(),
+        };
+        _calWizardBuildSafeRecommendations(wiz, getCalibrationSnapshot());
+        renderCalibrationWizard();
+    }
+
+    // Hides the wizard card and passes clicks through — reused for tuner step and
+    // timing play-along (not tuner-specific despite the name).
+    function _calWizardSetTunerMinimized(minimized) {
+        const wiz = _calWizardState;
+        if (!_calWizardEl || !wiz) return;
+        wiz.tunerMinimized = !!minimized;
+        const card = _calWizardEl.querySelector('.nd-cal-wizard-card');
+        const ret = _calWizardEl.querySelector('.nd-cal-return-wizard');
+        if (minimized) {
+            _calWizardEl.style.background = 'transparent';
+            _calWizardEl.style.pointerEvents = 'none';
+            if (card) card.style.visibility = 'hidden';
+            if (ret) ret.style.display = 'block';
+        } else {
+            _calWizardEl.style.background = 'rgba(0,0,0,0.65)';
+            _calWizardEl.style.pointerEvents = 'auto';
+            if (card) card.style.visibility = 'visible';
+            if (ret) ret.style.display = 'none';
+            _calWizardUpdateReturnButtonTimer(null);
+        }
+    }
+
+    function _calWizardMinimizeForPlayback() {
+        _calWizardSetTunerMinimized(true);
+    }
+
+    function _calWizardUpdateReturnButtonTimer(secLeft) {
+        if (!_calWizardEl) return;
+        const primary = _calWizardEl.querySelector('.nd-cal-return-primary');
+        const secondary = _calWizardEl.querySelector('.nd-cal-return-secondary');
+        if (!primary || !secondary) return;
+        if (secLeft === 'waiting') {
+            primary.textContent = 'Press Play to start timing';
+            secondary.textContent = `The ${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s timer starts when playback begins`;
+        } else if (Number.isFinite(secLeft) && secLeft >= 0) {
+            primary.textContent = `Timing test: ${secLeft}s left`;
+            secondary.textContent = 'Keep playing — setup will return automatically';
+        } else {
+            primary.textContent = 'Return to Calibration Wizard';
+            secondary.textContent = 'Tap here to continue setup';
+        }
+    }
+
+    function _calWizardTeardownPlayAlongWait(pa) {
+        if (!pa) return;
+        if (pa.waitTimeoutId) {
+            clearTimeout(pa.waitTimeoutId);
+            pa.waitTimeoutId = null;
+        }
+        if (pa.waitPollId) {
+            clearInterval(pa.waitPollId);
+            pa.waitPollId = null;
+        }
+        if (pa.onPlayHandler && window.slopsmith && typeof window.slopsmith.off === 'function') {
+            try { window.slopsmith.off('song:play', pa.onPlayHandler); } catch (_) {}
+            pa.onPlayHandler = null;
+        }
+    }
+
+    function _calWizardIsPlaybackActive() {
+        try {
+            if (window.slopsmith && window.slopsmith.isPlaying) return true;
+        } catch (_) { /* host may be unavailable */ }
+        return false;
+    }
+
+    function _calWizardPlayheadAdvancing(pa) {
+        const hw = resolveHw();
+        if (!hw || typeof hw.getTime !== 'function' || !pa) return false;
+        const t = hw.getTime();
+        if (!Number.isFinite(pa._phLast)) {
+            pa._phLast = t;
+            pa._phLastAt = Date.now();
+            return false;
+        }
+        const gapMs = Date.now() - pa._phLastAt;
+        if (gapMs < _CAL_WIZARD_PLAYHEAD_ADVANCE_MIN_GAP_MS) return false;
+        const advancing = t > pa._phLast + _CAL_WIZARD_PLAYHEAD_ADVANCE_MIN_SEC;
+        pa._phLast = t;
+        pa._phLastAt = Date.now();
+        return advancing;
+    }
+
+    function _calWizardBeginTimedPlayAlongCountdown() {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong || wiz.playAlong.phase !== 'waiting') return;
+        const pa = wiz.playAlong;
+        _calWizardTeardownPlayAlongWait(pa);
+        pa.phase = 'running';
+        pa.endsAt = Date.now() + pa.durationMs;
+        const tickCountdown = () => {
+            if (!_calWizardState || !_calWizardState.playAlong) return;
+            const active = _calWizardState.playAlong;
+            if (active.phase !== 'running' || !Number.isFinite(active.endsAt)) return;
+            const left = Math.ceil((active.endsAt - Date.now()) / 1000);
+            if (left <= 0) {
+                _calWizardFinishTimedPlayAlong(false);
+                return;
+            }
+            _calWizardUpdateReturnButtonTimer(left);
+        };
+        tickCountdown();
+        pa.intervalId = setInterval(tickCountdown, 1000);
+        pa.timerId = setTimeout(() => _calWizardFinishTimedPlayAlong(false), pa.durationMs + 50);
+    }
+
+    function _calWizardPollPlayAlongWait() {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong || wiz.playAlong.phase !== 'waiting') return;
+        const pa = wiz.playAlong;
+        if (pa.playbackSeen || _calWizardIsPlaybackActive() || _calWizardPlayheadAdvancing(pa)) {
+            _calWizardBeginTimedPlayAlongCountdown();
+        }
+    }
+
+    function _calWizardCancelTimedPlayAlongWaiting(message) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong) return;
+        _calWizardStopTimedPlayAlong('cancel-wait');
+        _calWizardSetTunerMinimized(false);
+        wiz.timingCaptureNote = message;
+        renderCalibrationWizard();
+        _calWizardRefreshLive();
+    }
+
+    function _calWizardStopTimedPlayAlong(reason) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong) return false;
+        const pa = wiz.playAlong;
+        _calWizardTeardownPlayAlongWait(pa);
+        if (pa.timerId) {
+            clearTimeout(pa.timerId);
+            pa.timerId = null;
+        }
+        if (pa.intervalId) {
+            clearInterval(pa.intervalId);
+            pa.intervalId = null;
+        }
+        wiz.playAlong = null;
+        _calWizardUpdateReturnButtonTimer(null);
+        return true;
+    }
+
+    function _calWizardDispatchPlaybackPause(reason) {
+        const caps = window.slopsmith && window.slopsmith.capabilities;
+        if (!caps || typeof caps.dispatch !== 'function') {
+            return Promise.resolve({ attempted: false, handled: false });
+        }
+        try {
+            const result = caps.dispatch({
+                capability: 'playback',
+                command: 'pause',
+                requester: 'slopsmith-plugin-notedetect',
+                args: { requesterId: 'cal-wizard-timed-playalong', reason: reason || 'timed-playalong-complete' },
+            });
+            const parse = (r) => ({
+                attempted: true,
+                handled: !!(r && (r.outcome === 'handled' || r.status === 'paused')),
+                result: r,
+            });
+            if (result && typeof result.then === 'function') {
+                return result.then(parse).catch((e) => {
+                    console.warn('[note_detect] cal-wizard timed playalong pause:', e);
+                    return { attempted: true, handled: false, error: e };
+                });
+            }
+            return Promise.resolve(parse(result));
+        } catch (e) {
+            console.warn('[note_detect] cal-wizard timed playalong pause:', e);
+            return Promise.resolve({ attempted: false, handled: false, error: e });
+        }
+    }
+
+    function _calWizardAppendTimingCaptureNote(fragment) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.timingCaptureNote || !fragment) return;
+        if (!wiz.timingCaptureNote.includes(fragment)) {
+            wiz.timingCaptureNote += ` ${fragment}`;
+            renderCalibrationWizard();
+        }
+    }
+
+    function _calWizardMaybePauseAfterTimedPlayAlong(pa) {
+        if (!pa || pa.wasPlayingAtArm !== false) return;
+        if (!_calWizardIsPlaybackActive()) return;
+        _calWizardClearPauseRetries();
+        const delays = _CAL_WIZARD_PAUSE_RETRY_DELAYS_MS;
+        delays.forEach((delayMs, idx) => {
+            const isLast = idx === delays.length - 1;
+            const timerId = setTimeout(() => {
+                _calWizardPauseRetryTimers = _calWizardPauseRetryTimers.filter((id) => id !== timerId);
+                if (!_calWizardState) return;
+                if (!_calWizardIsPlaybackActive()) {
+                    _calWizardAppendTimingCaptureNote('Playback paused.');
+                    return;
+                }
+                const reason = idx === 0
+                    ? 'cal-wizard-timed-playalong-complete'
+                    : 'cal-wizard-timed-playalong-retry';
+                _calWizardDispatchPlaybackPause(reason).then(() => {
+                    if (!_calWizardState) return;
+                    if (!_calWizardIsPlaybackActive()) {
+                        _calWizardAppendTimingCaptureNote('Playback paused.');
+                    } else if (isLast) {
+                        _calWizardAppendTimingCaptureNote(
+                            'Playback may still be running — pause when ready.');
+                    }
+                });
+            }, delayMs);
+            _calWizardPauseRetryTimers.push(timerId);
+        });
+    }
+
+    function _calWizardFinishTimedPlayAlong(partial) {
+        const wiz = _calWizardState;
+        if (!wiz || !wiz.playAlong) return;
+        if (wiz.playAlong.phase === 'waiting') {
+            _calWizardCancelTimedPlayAlongWaiting('Timed play-along cancelled — returned before playback started.');
+            return;
+        }
+        const stashedPlayAlong = { wasPlayingAtArm: wiz.playAlong.wasPlayingAtArm };
+        _calWizardStopTimedPlayAlong('finish');
+        _calWizardSetTunerMinimized(false);
+        wiz.timingCaptureNote = partial
+            ? 'Partial window captured — returned early.'
+            : `Timed play-along captured (${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s window).`;
+        _calWizardCaptureTimingSnapshot();
+        if (!partial) _calWizardMaybePauseAfterTimedPlayAlong(stashedPlayAlong);
+    }
+
+    function _calWizardStartTimedPlayAlong(durationSec) {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            wiz.timingCaptureNote = 'Turn Detect on first.';
+            renderCalibrationWizard();
+            return;
+        }
+        _calWizardStopTimedPlayAlong('restart');
+        try { _resetCalibrationSamples(); } catch (e) {
+            console.warn('[note_detect] resetCalibrationSamples:', e);
+        }
+        wiz.timing = null;
+        wiz.timingCaptureNote = null;
+        const sec = Number.isFinite(durationSec) && durationSec > 0
+            ? durationSec : _CAL_WIZARD_TIMED_PLAYALONG_SEC;
+        const durationMs = sec * 1000;
+        const wasPlayingAtArm = _calWizardIsPlaybackActive();
+        wiz.playAlong = {
+            phase: 'waiting',
+            durationSec: sec,
+            durationMs,
+            waitStartedAt: Date.now(),
+            waitTimeoutId: null,
+            waitPollId: null,
+            onPlayHandler: null,
+            playbackSeen: false,
+            wasPlayingAtArm,
+            endsAt: null,
+            timerId: null,
+            intervalId: null,
+        };
+        _calWizardMinimizeForPlayback();
+        _calWizardUpdateReturnButtonTimer('waiting');
+        const pa = wiz.playAlong;
+        if (_calWizardIsPlaybackActive()) {
+            _calWizardBeginTimedPlayAlongCountdown();
+            return;
+        }
+        pa.onPlayHandler = () => {
+            const w = _calWizardState;
+            if (!w || !w.playAlong || w.playAlong.phase !== 'waiting') return;
+            w.playAlong.playbackSeen = true;
+            _calWizardPollPlayAlongWait();
+        };
+        if (window.slopsmith && typeof window.slopsmith.on === 'function') {
+            try { window.slopsmith.on('song:play', pa.onPlayHandler); } catch (_) {}
+        }
+        pa.waitPollId = setInterval(_calWizardPollPlayAlongWait, _CAL_WIZARD_PLAY_ALONG_WAIT_POLL_MS);
+        pa.waitTimeoutId = setTimeout(() => {
+            const w = _calWizardState;
+            if (!w || !w.playAlong || w.playAlong.phase !== 'waiting') return;
+            _calWizardCancelTimedPlayAlongWaiting('Timed play-along cancelled — playback did not start.');
+        }, _CAL_WIZARD_PLAY_ALONG_WAIT_MS);
+    }
+
+    function _calWizardFmtGain(v) {
+        return Number.isFinite(v) ? `${(+v).toFixed(2)}x` : '—';
+    }
+
+    function _calWizardFmtLatencyMs(v) {
+        return Number.isFinite(v) ? `${Math.round(v * 1000)} ms` : '—';
+    }
+
+    function _calWizardCompletionHtml(wiz) {
+        const applied = wiz.applied;
+        const appliedParts = [];
+        if (applied && applied.inputGain != null) {
+            appliedParts.push(`Input gain ${_calWizardFmtGain(applied.inputGain)}`);
+        }
+        if (applied && applied.latencyOffset != null) {
+            appliedParts.push(`Detection delay ${_calWizardFmtLatencyMs(applied.latencyOffset)}`);
+        }
+        if (wiz.complete === 'applied') {
+            const detailLine = appliedParts.length
+                ? appliedParts.join(' · ')
+                : 'Checked settings were applied.';
+            return `
+                <div class="text-center py-3 mb-4 rounded-xl bg-dark-800/90 border border-green-900/40">
+                    <p class="text-xl font-bold text-white mb-2">Calibration applied</p>
+                    <p class="text-sm text-gray-200 mb-1">You're done. These settings are now active.</p>
+                    <p class="text-xs text-gray-400">${detailLine}</p>
+                </div>
+                <button type="button" class="nd-cal-done w-full py-3 bg-accent hover:bg-accent-light rounded-xl text-base font-bold text-white mb-3 shadow-lg">Done — Close Wizard</button>
+                <button type="button" class="nd-cal-run-lab w-full py-2.5 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-sm text-gray-300">Run Technique Assessment</button>`;
+        }
+        return `
+            <div class="text-center py-3 mb-4 rounded-xl bg-dark-800/90 border border-gray-600">
+                <p class="text-xl font-bold text-white mb-2">Calibration finished</p>
+                <p class="text-sm text-gray-200">No recommended settings were applied.</p>
+            </div>
+            <button type="button" class="nd-cal-done w-full py-3 bg-accent hover:bg-accent-light rounded-xl text-base font-bold text-white mb-3 shadow-lg">Done — Close Wizard</button>
+            <button type="button" class="nd-cal-run-lab w-full py-2.5 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-sm text-gray-300">Run Technique Assessment</button>`;
+    }
+
+    function _calWizardReleaseTuner() {
+        try {
+            if (window.tuner && typeof window.tuner.disable === 'function') {
+                window.tuner.disable();
+            }
+        } catch (e) {
+            console.warn('[note_detect] cal wizard tuner release:', e);
+        }
+        if (_calWizardState) _calWizardSetTunerMinimized(false);
+        if (enabled) {
+            try { restartAudio(); } catch (e) {
+                console.warn('[note_detect] cal wizard restartAudio after tuner release:', e);
+            }
+        }
+    }
+
+    function _calWizardApplySafeSettings(wiz) {
+        const applied = {};
+        const rec = wiz.recommended || {};
+        if (wiz.applyChecked.inputGain && Number.isFinite(rec.inputGain)) {
+            inputGain = Math.max(0.1, Math.min(5, rec.inputGain));
+            if (gainNode) gainNode.gain.value = inputGain;
+            applied.inputGain = inputGain;
+        }
+        if (wiz.applyChecked.latencyOffset && Number.isFinite(rec.latencyOffset)) {
+            latencyOffset = Math.max(0, Math.min(0.25, rec.latencyOffset));
+            applied.latencyOffset = latencyOffset;
+        }
+        saveSettings();
+        wiz.applied = applied;
+        return applied;
+    }
+
+    function _calWizardDeviceLabel() {
+        if (!selectedDeviceId) return 'Default system input';
+        return `Device ${selectedDeviceId.slice(0, 12)}…`;
+    }
+
+    function _calWizardEngineChannelLabel(ch) {
+        const opt = _CAL_WIZARD_INPUT_CHANNEL_OPTIONS.find((o) => o.ch === ch);
+        return opt ? opt.label : `Channel ${ch}`;
+    }
+
+    function _calWizardEngineChannelDisplayLabel(ch) {
+        if (ch === 0) return 'Left (Ch 1)';
+        if (ch === 1) return 'Right (Ch 2)';
+        return 'Default / Mono Mix';
+    }
+
+    function _calWizardPluginChannelFromEngine(ch) {
+        if (ch === 0) return 'left';
+        if (ch === 1) return 'right';
+        return 'mono';
+    }
+
+    function _calWizardSleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function _calWizardWizardAudioApi() {
+        if (usingDesktopBridge && bridgeDesktop && bridgeDesktop.audio) return bridgeDesktop.audio;
+        const desktop = (typeof window !== 'undefined') ? window.slopsmithDesktop : null;
+        return (desktop && desktop.audio) ? desktop.audio : null;
+    }
+
+    async function _calWizardSampleEngineLevels(durationMs, intervalMs) {
+        const audio = _calWizardWizardAudioApi();
+        if (!audio || typeof audio.getLevels !== 'function') {
+            return { maxLevel: 0, avgLevel: 0, maxPeak: 0 };
+        }
+        let maxLevel = 0;
+        let maxPeak = 0;
+        let levelSum = 0;
+        let levelCount = 0;
+        const t0 = Date.now();
+        while (Date.now() - t0 < durationMs) {
+            try {
+                const lv = await audio.getLevels();
+                if (lv) {
+                    const level = Number.isFinite(lv.inputLevel) ? lv.inputLevel : 0;
+                    const peak = Number.isFinite(lv.inputPeak) ? lv.inputPeak : 0;
+                    maxLevel = Math.max(maxLevel, level);
+                    maxPeak = Math.max(maxPeak, peak);
+                    levelSum += level;
+                    levelCount++;
+                }
+            } catch (_) { /* read-only */ }
+            await _calWizardSleep(intervalMs);
+        }
+        const avgLevel = levelCount > 0 ? levelSum / levelCount : 0;
+        return { maxLevel, avgLevel, maxPeak };
+    }
+
+    function _calWizardChannelProbeTrialShortLabel(t) {
+        if (!t) return '?';
+        if (t.ch === -1) return 'Mono';
+        if (t.ch === 0) return 'Ch 1';
+        if (t.ch === 1) return 'Ch 2';
+        return t.label || '?';
+    }
+
+    function _calWizardChannelProbeProgressLabel(ch) {
+        if (ch === -1) return 'Mono Mix';
+        if (ch === 0) return 'Ch 1';
+        if (ch === 1) return 'Ch 2';
+        return 'Channel';
+    }
+
+    function _calWizardChannelProbeTrialsSummary(trials) {
+        if (!trials || !trials.length) return '';
+        return trials.map((t) => `${_calWizardChannelProbeTrialShortLabel(t)} ${Math.round((t.maxLevel || 0) * 100)}%`).join(', ');
+    }
+
+    function _calWizardLevelsClose(a, b, ratio) {
+        const hi = Math.max(a, b);
+        if (hi <= 0) return true;
+        return Math.abs(a - b) / hi <= ratio;
+    }
+
+    function _calWizardTrialByCh(trials, ch) {
+        return trials.find((t) => t.ch === ch) || null;
+    }
+
+    function _calWizardPickChannelProbeWinner(trials) {
+        if (!trials || !trials.length) return null;
+        let best = trials[0];
+        for (let i = 1; i < trials.length; i++) {
+            const t = trials[i];
+            if (t.maxLevel > best.maxLevel
+                || (t.maxLevel === best.maxLevel && t.avgLevel > best.avgLevel)) {
+                best = t;
+            }
+        }
+        const mono = trials.find((t) => t.ch === -1);
+        if (!mono || best.ch !== -1) return best;
+        let bestSingle = null;
+        for (const t of trials) {
+            if (t.ch !== 0 && t.ch !== 1) continue;
+            if (!bestSingle || t.maxLevel > bestSingle.maxLevel
+                || (t.maxLevel === bestSingle.maxLevel && t.avgLevel > bestSingle.avgLevel)) {
+                bestSingle = t;
+            }
+        }
+        if (!bestSingle) return best;
+        const hi = Math.max(mono.maxLevel, bestSingle.maxLevel);
+        if (hi > 0 && Math.abs(mono.maxLevel - bestSingle.maxLevel) / hi <= _CAL_WIZARD_CHANNEL_PROBE_MONO_TIE_RATIO) {
+            return bestSingle;
+        }
+        return best;
+    }
+
+    function _calWizardAnalyzeChannelProbeTrials(trials) {
+        const ratio = _CAL_WIZARD_CHANNEL_PROBE_MONO_TIE_RATIO;
+        const ch1 = _calWizardTrialByCh(trials, 0);
+        const ch2 = _calWizardTrialByCh(trials, 1);
+        const best = _calWizardPickChannelProbeWinner(trials);
+        const ch1ch2Close = !!(ch1 && ch2
+            && _calWizardLevelsClose(ch1.maxLevel, ch2.maxLevel, ratio));
+        const ch1usable = !!(ch1 && ch1.maxLevel >= _CAL_WIZARD_CHANNEL_PROBE_MIN_PEAK);
+        const ch2usable = !!(ch2 && ch2.maxLevel >= _CAL_WIZARD_CHANNEL_PROBE_MIN_PEAK);
+        const ambiguousCh12 = ch1ch2Close && ch1usable && ch2usable;
+        let suggested = ch2;
+        let alternate = ch1;
+        if (ch1 && ch2) {
+            if (ch2.maxLevel > ch1.maxLevel) {
+                suggested = ch2;
+                alternate = ch1;
+            } else if (ch1.maxLevel > ch2.maxLevel) {
+                suggested = ch1;
+                alternate = ch2;
+            } else if (ch2.avgLevel > ch1.avgLevel) {
+                suggested = ch2;
+                alternate = ch1;
+            } else if (ch1.avgLevel > ch2.avgLevel) {
+                suggested = ch1;
+                alternate = ch2;
+            } else {
+                // Exact tie — default suggestion to Ch 2 (Spark LIVE guitar path).
+                suggested = ch2;
+                alternate = ch1;
+            }
+        }
+        return {
+            best,
+            ch1,
+            ch2,
+            ch1ch2Close,
+            ambiguousCh12,
+            suggested,
+            alternate,
+        };
+    }
+
+    async function _calWizardApplyEngineInputChannel(ch) {
+        const audio = _calWizardWizardAudioApi();
+        if (!audio || typeof audio.setInputChannel !== 'function') return false;
+        await audio.setInputChannel(ch);
+        if (typeof audio.loadDeviceSettings === 'function'
+            && typeof audio.saveDeviceSettings === 'function') {
+            try {
+                const cur = await audio.loadDeviceSettings();
+                const base = (cur && typeof cur === 'object') ? cur : {};
+                await audio.saveDeviceSettings({
+                    ...base,
+                    inputChannel: String(ch),
+                    savedAt: Date.now(),
+                });
+            } catch (e) {
+                console.warn('[note_detect] cal wizard saveDeviceSettings:', e);
+            }
+        }
+        selectedChannel = _calWizardPluginChannelFromEngine(ch);
+        saveSettings();
+        return true;
+    }
+
+    function _calWizardFormatChannelProbeResult(result) {
+        const summary = (result && result.trials) ? _calWizardChannelProbeTrialsSummary(result.trials) : '';
+        if (!result || result.ok === false) {
+            return `<span class="text-amber-200/90">No strong input detected.</span> Check guitar volume, cable, Spark USB routing, input gain, or try another device.${summary ? `<div class="text-gray-500 mt-1">${summary}</div>` : ''}`;
+        }
+        if (result.ok === 'ambiguous') {
+            const sug = Number.isFinite(result.suggestedCh)
+                ? _calWizardEngineChannelDisplayLabel(result.suggestedCh)
+                : '—';
+            const alt = Number.isFinite(result.alternateCh)
+                ? _calWizardEngineChannelDisplayLabel(result.alternateCh)
+                : '—';
+            return `<span class="text-amber-200/90">Ch 1 and Ch 2 are very close.</span> Suggested: ${sug}, but ${alt} is also usable. Choose the channel that matches your setup.${summary ? `<div class="text-gray-500 mt-1">${summary}</div>` : ''}`;
+        }
+        const levelPct = Math.round((result.bestLevel || 0) * 100);
+        const peakPct = Math.round((result.bestPeak || 0) * 100);
+        const disp = Number.isFinite(result.bestCh)
+            ? _calWizardEngineChannelDisplayLabel(result.bestCh)
+            : (result.bestLabel || '—');
+        const peakNote = peakPct > levelPct ? ` (peak ${peakPct}%)` : '';
+        return `<span class="text-green-300/90">Best channel: ${disp}, level ${levelPct}%${peakNote}</span>${summary ? `<div class="text-gray-500 mt-1">${summary}</div>` : ''}`;
+    }
+
+    async function _calWizardApplyChannelProbeUserPick(ch) {
+        const wiz = _calWizardState;
+        if (!wiz || !Number.isFinite(ch)) return;
+        const applied = await _calWizardApplyEngineInputChannel(ch);
+        if (!applied) return;
+        const trial = wiz.channelProbeResult && wiz.channelProbeResult.trials
+            ? _calWizardTrialByCh(wiz.channelProbeResult.trials, ch)
+            : null;
+        wiz.channelProbeResult = {
+            ok: true,
+            userPicked: true,
+            bestCh: ch,
+            bestLabel: trial ? trial.label : _calWizardEngineChannelLabel(ch),
+            bestLevel: trial ? trial.maxLevel : 0,
+            bestPeak: trial ? trial.maxPeak : 0,
+            trials: wiz.channelProbeResult.trials,
+        };
+        renderCalibrationWizard();
+        _calWizardRefreshLive();
+    }
+
+    async function _calWizardAutoDetectInputChannel() {
+        const wiz = _calWizardState;
+        if (!wiz) return;
+        if (wiz.channelProbeRunning) {
+            _calWizardSetChannelProbeStatus(
+                '<span class="text-amber-200/90">Detection already in progress...</span>');
+            return;
+        }
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            wiz.channelProbeError = 'Turn Detect on first.';
+            renderCalibrationWizard();
+            return;
+        }
+        const audio = _calWizardWizardAudioApi();
+        if (!usingDesktopBridge || !audio
+            || typeof audio.setInputChannel !== 'function'
+            || typeof audio.getLevels !== 'function') {
+            wiz.channelProbeError = 'Auto-detect needs the desktop audio engine.';
+            renderCalibrationWizard();
+            return;
+        }
+        wiz.channelProbeRunning = true;
+        wiz.channelProbeError = null;
+        wiz.channelProbeResult = null;
+        const token = {};
+        wiz.channelProbeAbort = token;
+        renderCalibrationWizard();
+        const trials = [];
+        const probeSteps = _CAL_WIZARD_INPUT_CHANNEL_OPTIONS;
+        try {
+            for (let i = 0; i < probeSteps.length; i++) {
+                const opt = probeSteps[i];
+                if (wiz.channelProbeAbort !== token) return;
+                const progLabel = _calWizardChannelProbeProgressLabel(opt.ch);
+                _calWizardSetChannelProbeStatus(
+                    `<span class="text-cyan-300/90">Strum hard…</span> Testing <strong>${progLabel} (${i + 1} of ${probeSteps.length})</strong>…`);
+                await audio.setInputChannel(opt.ch);
+                if (typeof audio.resetPeaks === 'function') await audio.resetPeaks();
+                await _calWizardSleep(_CAL_WIZARD_CHANNEL_PROBE_SETTLE_MS);
+                const { maxLevel, avgLevel, maxPeak } = await _calWizardSampleEngineLevels(
+                    _CAL_WIZARD_CHANNEL_PROBE_MS,
+                    _CAL_WIZARD_CHANNEL_PROBE_INTERVAL_MS,
+                );
+                if (wiz.channelProbeAbort !== token) return;
+                trials.push({ ch: opt.ch, label: opt.label, maxLevel, avgLevel, maxPeak });
+            }
+            const analysis = _calWizardAnalyzeChannelProbeTrials(trials);
+            const { best, ambiguousCh12, suggested, alternate } = analysis;
+            const ok = best && best.maxLevel >= _CAL_WIZARD_CHANNEL_PROBE_MIN_PEAK;
+            if (!ok) {
+                wiz.channelProbeResult = {
+                    ok: false,
+                    trials,
+                    bestLevel: best ? best.maxLevel : 0,
+                    bestPeak: best ? best.maxPeak : 0,
+                };
+            } else if (ambiguousCh12) {
+                wiz.channelProbeResult = {
+                    ok: 'ambiguous',
+                    ambiguousCh12: true,
+                    suggestedCh: suggested ? suggested.ch : null,
+                    alternateCh: alternate ? alternate.ch : null,
+                    trials,
+                };
+            } else {
+                await _calWizardApplyEngineInputChannel(best.ch);
+                wiz.channelProbeResult = {
+                    ok: true,
+                    clearWinner: true,
+                    bestCh: best.ch,
+                    bestLabel: best.label,
+                    bestLevel: best.maxLevel,
+                    bestPeak: best.maxPeak,
+                    trials,
+                };
+            }
+        } catch (e) {
+            wiz.channelProbeError = (e && e.message) ? e.message : String(e);
+        } finally {
+            if (wiz.channelProbeAbort === token) wiz.channelProbeAbort = null;
+            wiz.channelProbeRunning = false;
+            renderCalibrationWizard();
+            _calWizardRefreshLive();
+        }
+    }
+
+    function getCalibrationSnapshot() {
+        let d = null;
+        try { d = _buildDiagnosticPayload(); } catch (_) { /* read-only */ }
+        const hw = resolveHw();
+        let avMs = null;
+        try { avMs = hw && hw.getAvOffset ? hw.getAvOffset() : null; } catch (_) {}
+        const teHits = (d && d.timing_error_ms_hits) ? d.timing_error_ms_hits : {};
+        const total = hits + misses;
+        const pitch = _calWizardRawPitchFields();
+        const heardNote = pitch.rawNote;
+        const heardConfPct = pitch.confidencePct;
+        let hearingLine = '—';
+        try { hearingLine = _ndHealthDetectedLine(); } catch (_) {}
+        const sr = audioCtx && audioCtx.sampleRate
+            ? Math.round(audioCtx.sampleRate)
+            : (bridgeSampleRate ? Math.round(bridgeSampleRate) : null);
+        return {
+            enabled: !!enabled,
+            inputLevelPct: Math.round((inputLevel || 0) * 100),
+            inputPeakPct: Math.round((inputPeak || 0) * 100),
+            hearingLine,
+            heardNote,
+            heardConfidencePct: heardConfPct,
+            rawHeardNote: pitch.rawNote,
+            displayHeardNote: pitch.displayNote,
+            rawMidi: pitch.rawMidi,
+            channel: pitch.channel,
+            source: _ndHealthDetectorPathLabel(),
+            sampleRateHz: sr,
+            avOffsetMs: avMs,
+            latencyOffsetMs: Math.round(latencyOffset * 1000),
+            timingMedianMs: teHits.median,
+            diagnostic: d,
+            stats: {
+                hits,
+                misses,
+                total,
+                accuracy: total > 0 ? Math.round((hits / total) * 100) : null,
+            },
+            method: detectionMethod,
+        };
+    }
+
+    function calibrationWizardClose() {
+        _calWizardStopAllStringsRun('close');
+        _calWizardClearPauseRetries();
+        _calWizardStopAutoCapture();
+        _calWizardStopTimedPlayAlong('close');
+        _calWizardReleaseTuner();
+        if (_calWizardTick) {
+            clearInterval(_calWizardTick);
+            _calWizardTick = null;
+        }
+        if (_calWizardEl) {
+            _calWizardEl.remove();
+            _calWizardEl = null;
+        }
+        _calWizardState = null;
+    }
+
+    function _calWizardDetectBanner(snap) {
+        if (snap && snap.enabled) return '';
+        return '<p class="nd-cal-detect-warn text-amber-200/90 text-xs mb-2">Turn Detect on first for live input and timing checks.</p>';
+    }
+
+    function _calWizardRefreshLive() {
+        if (!_calWizardEl || !_calWizardState) return;
+        const snap = getCalibrationSnapshot();
+        const wiz = _calWizardState;
+        const live = _calWizardEl.querySelector('.nd-cal-live-level');
+        if (live) live.textContent = 'Live: ' + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
+        const heard = _calWizardEl.querySelector('.nd-cal-heard');
+        if (heard) {
+            if (wiz.step === 5) {
+                heard.textContent = snap.heardConfidencePct != null
+                    ? `Now hearing: ${snap.rawHeardNote ?? snap.heardNote} · ${snap.heardConfidencePct}% confidence`
+                    : `Now hearing: nothing yet — play a note · Channel: ${snap.channel || '—'} · Live: `
+                    + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
+            } else {
+                heard.textContent = snap.heardConfidencePct != null
+                    ? `Now hearing: ${snap.heardNote} · ${snap.heardConfidencePct}% confidence`
+                    : `Now hearing: ${snap.hearingLine === '—' ? 'nothing yet — play a note' : snap.hearingLine}`;
+            }
+        }
+        const debugEl = _calWizardEl.querySelector('.nd-cal-pitch-debug');
+        if (debugEl) {
+            if (wiz.step === 5) {
+                let expectNote = '—';
+                if (wiz.autoCapture && wiz.autoCapture.kind === 'note' && wiz.autoCapture.noteId) {
+                    const active = _calWizardFindNoteCheckSpec(wiz.autoCapture.noteId);
+                    if (active) expectNote = active.expectedNote;
+                }
+                if (expectNote === '—') {
+                    const noteSpecs = _calWizardResolveNoteChecks({ mode: 'quick' });
+                    const primary = noteSpecs[0];
+                    if (primary) expectNote = primary.expectedNote;
+                }
+                if (snap.heardConfidencePct != null) {
+                    let line = `Expected: ${expectNote} · Heard: ${snap.rawHeardNote ?? '—'}`;
+                    if (snap.displayHeardNote && snap.displayHeardNote !== snap.rawHeardNote) {
+                        line += ` · Display: ${snap.displayHeardNote}`;
+                        const now = Date.now();
+                        if (!wiz._lastPitchDbg || now - wiz._lastPitchDbg > 2000) {
+                            console.debug('[cal-wizard] pitch', {
+                                expected: expectNote,
+                                raw: snap.rawHeardNote,
+                                display: snap.displayHeardNote,
+                                conf: snap.heardConfidencePct,
+                                channel: snap.channel,
+                            });
+                            wiz._lastPitchDbg = now;
+                        }
+                    }
+                    line += ` · Conf: ${snap.heardConfidencePct}% · Channel: ${snap.channel || '—'}`;
+                    debugEl.textContent = line;
+                    debugEl.classList.remove('hidden');
+                } else {
+                    debugEl.textContent = `Expected: ${expectNote} · Channel: ${snap.channel || '—'} · Live: `
+                        + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct);
+                    debugEl.classList.remove('hidden');
+                }
+            } else {
+                debugEl.textContent = '';
+                debugEl.classList.add('hidden');
+            }
+        }
+        const medEl = _calWizardEl.querySelector('.nd-cal-timing-median');
+        if (medEl) {
+            const t = wiz.timing;
+            const m = t && Number.isFinite(t.medianMs) ? t.medianMs : snap.timingMedianMs;
+            const n = t && t.sampleCount ? t.sampleCount : 0;
+            medEl.textContent = Number.isFinite(m)
+                ? `Your average timing vs chart: ${_ndFormatMs(m)} · ${n} hit samples`
+                : `Your average timing vs chart: not enough hits yet (${n} samples)`;
+        }
+    }
+
+    function _calWizardReviewChanges(wiz) {
+        const rec = wiz.recommended || {};
+        const changes = [];
+        const consider = (key, label, curVal, recVal, fmt, reason) => {
+            if (!Number.isFinite(recVal)) return;
+            if (Number.isFinite(curVal) && Math.abs(recVal - curVal) < 0.004) return;
+            changes.push({ key, label, curVal, recVal, fmt, reason: reason || '' });
+        };
+        consider('inputGain', 'Input gain', inputGain, rec.inputGain,
+            _calWizardFmtGain, rec.reasons && rec.reasons.inputGain);
+        consider('latencyOffset', 'Detection delay', latencyOffset, rec.latencyOffset,
+            _calWizardFmtLatencyMs, rec.reasons && rec.reasons.latencyOffset);
+        return changes;
+    }
+
+    function _calWizardReviewSummaryHtml(wiz, opts = {}) {
+        const showCheckboxes = opts.showCheckboxes !== false;
+        const onlyChecked = !!opts.onlyChecked;
+        const changes = _calWizardReviewChanges(wiz);
+        const visible = onlyChecked
+            ? changes.filter((c) => wiz.applyChecked[c.key] !== false)
+            : changes;
+        if (!visible.length) {
+            if (onlyChecked && changes.length) {
+                return '<p class="text-sm text-gray-300 mb-3">No settings are selected to apply. Go back to Review to check items, or finish without applying.</p>';
+            }
+            return '<p class="text-sm text-gray-300 mb-3">No safe setting changes recommended — you can finish without applying.</p>';
+        }
+        const cards = visible.map((c) => {
+            const checked = wiz.applyChecked[c.key] !== false ? 'checked' : '';
+            const chk = showCheckboxes
+                ? `<input type="checkbox" class="nd-cal-apply-chk accent-green-400 mt-0.5 shrink-0" data-key="${c.key}" ${checked}>`
+                : '';
+            return `<div class="flex items-start gap-3 p-3 rounded-lg bg-dark-800/90 border border-gray-600">
+                ${chk}
+                <div class="min-w-0 flex-1">
+                    <div class="text-sm font-medium text-gray-100">${c.label}</div>
+                    <div class="text-sm text-gray-300 mt-1">${c.fmt(c.curVal)} → <span class="text-green-300 font-mono font-medium">${c.fmt(c.recVal)}</span></div>
+                </div>
+            </div>`;
+        }).join('');
+        return `<div class="space-y-2 mb-3">${cards}</div>`;
+    }
+
+    function _calWizardReviewDetailsHtml(wiz) {
+        const changes = _calWizardReviewChanges(wiz);
+        if (!changes.length) return '';
+        const rows = changes.map((c) => {
+            const checked = wiz.applyChecked[c.key] !== false ? 'checked' : '';
+            return `<tr class="border-b border-gray-700/50">
+                <td class="py-1.5 pr-2 text-gray-300">${c.label}</td>
+                <td class="py-1.5 text-gray-400 font-mono">${c.fmt(c.curVal)}</td>
+                <td class="py-1.5 text-green-300/90 font-mono">${c.fmt(c.recVal)}</td>
+                <td class="py-1.5 text-xs text-gray-400">${c.reason}</td>
+                <td class="py-1.5"><input type="checkbox" class="nd-cal-apply-chk accent-green-400" data-key="${c.key}" ${checked}></td></tr>`;
+        }).join('');
+        return `<details class="mb-3">
+            <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200 py-1 select-none">Show technical details</summary>
+            <table class="w-full text-xs mt-2"><thead><tr class="text-gray-500 text-left">
+                <th class="py-1 pr-1">Setting</th><th class="pr-1">Current</th><th class="pr-1">Recommended</th><th class="pr-1">Reason</th><th>Apply</th>
+            </tr></thead><tbody>${rows}</tbody></table>
+        </details>`;
+    }
+
+    function renderCalibrationWizard() {
+        if (!_calWizardEl || !_calWizardState) return;
+        const body = _calWizardEl.querySelector('.nd-cal-body');
+        const title = _calWizardEl.querySelector('.nd-cal-title');
+        const backBtn = _calWizardEl.querySelector('.nd-cal-back');
+        const nextBtn = _calWizardEl.querySelector('.nd-cal-next');
+        if (!body || !title) return;
+        const step = _calWizardState.step;
+        const snap = getCalibrationSnapshot();
+        const wiz = _calWizardState;
+        const meta = _CAL_WIZARD_STEPS[step] || { title: 'Step' };
+        title.textContent = `Calibration Wizard — ${meta.title}`;
+        if (backBtn) backBtn.style.visibility = step > 0 && step < 8 ? 'visible' : 'hidden';
+        if (nextBtn) {
+            if (step >= 8) {
+                nextBtn.style.display = 'none';
+            } else {
+                nextBtn.style.display = '';
+                nextBtn.textContent = step === 7 ? 'Continue to Apply' : 'Next';
+            }
+        }
+        if (step === 7) _calWizardBuildSafeRecommendations(wiz, snap);
+
+        let html = '';
+        if (step === 0) {
+            html = `
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Calibration Wizard</strong> sets up your audio input, levels, and timing.</p>
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Technique Assessment</strong> (separate tool) checks how well specific playing techniques verify — bends, harmonics, palm mutes, and more.</p>
+                <p class="text-gray-400 text-[10px] mb-2">This wizard may recommend <strong>input gain</strong> and <strong>detection delay (latency offset)</strong> only. It does not change scoring strictness, pitch windows, or detection thresholds.</p>
+                <p class="text-gray-400 text-[10px]">Tip: turn <strong>Detect</strong> on before starting step 1.</p>`;
+        } else if (step === 1) {
+            const engineOk = snap.enabled && (usingDesktopBridge || audioCtx);
+            const probeBusy = wiz.channelProbeRunning;
+            const probeAmbiguous = wiz.channelProbeResult && wiz.channelProbeResult.ok === 'ambiguous';
+            const probePickHtml = probeAmbiguous
+                ? `<div class="flex flex-col gap-1 mt-2">
+                    <button type="button" class="nd-cal-pick-channel w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200" data-ch="0">Ch 1 — Dry / Clean</button>
+                    <button type="button" class="nd-cal-pick-channel w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200" data-ch="1">Ch 2 — Wet / FX</button>
+                   </div>`
+                : '';
+            const probeResultBoxClass = 'nd-cal-channel-probe-result text-[11px] mt-2 p-2 rounded-lg border border-gray-600 bg-dark-800/90';
+            const probeResultHtml = wiz.channelProbeResult
+                ? `<div class="${probeResultBoxClass}">${_calWizardFormatChannelProbeResult(wiz.channelProbeResult)}${probePickHtml}</div>`
+                : (wiz.channelProbeError
+                    ? `<div class="${probeResultBoxClass} text-amber-200/90">${_ndEscapeHtml(wiz.channelProbeError)}</div>`
+                    : '');
+            html = `
+                ${_calWizardDetectBanner(snap)}
+                <p class="text-gray-300 text-xs mb-2">Confirm which input channel Slopsmith is listening to. Strum while auto-detect runs.</p>
+                <div class="text-[11px] text-gray-300 font-mono space-y-1 mb-2">
+                    <div>Device: ${_calWizardDeviceLabel()}</div>
+                    <div>Channel: ${snap.channel || '—'}</div>
+                    <div>Detector: ${snap.source || '—'}</div>
+                    <div>Engine: ${engineOk ? 'Running' : 'Not ready — enable Detect'}</div>
+                </div>
+                <div class="nd-cal-live-level text-cyan-300/90 text-xs font-mono mb-2">Live: —</div>
+                <button type="button" class="nd-cal-auto-channel w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${probeBusy ? ' opacity-60 cursor-not-allowed' : ''}"${probeBusy ? ' disabled' : ''}>${probeBusy ? 'Detecting...' : 'Auto-detect Channel'}</button>
+                <div class="nd-cal-channel-probe-status text-[11px] text-gray-400 mb-2 min-h-[1.5rem]">${probeBusy
+                    ? '<span class="text-cyan-300/90">Testing Mono Mix (1 of 3)…</span>'
+                    : 'Tests Mono Mix, Ch 1 (dry), and Ch 2 (wet) on the desktop audio engine.'}</div>
+                ${probeResultHtml}
+                <p class="text-[10px] text-gray-500 mb-1"><strong class="text-gray-400">Desktop:</strong> this step sets the native audio engine channel (saved automatically when a winner is found).</p>
+                <p class="text-[10px] text-gray-500">The <strong>Input Channel</strong> dropdown below only applies to browser microphone fallback — not desktop audio.</p>
+                <p class="text-[10px] text-amber-200/80">If stuck: check USB cable, interface gain, turn Detect on, and strum loudly during the test.</p>`;
+        } else if (step === 2) {
+            html = `
+                <p class="text-gray-300 text-xs mb-2">Tune your guitar using the bottom <strong class="text-gray-200">Tuner</strong> panel.</p>
+                <p class="text-[10px] text-gray-500 mb-2">Open Tuner hides this wizard so you can use the tuner. Tap <strong>Return to Calibration Wizard</strong> when done.</p>
+                <p class="text-[10px] text-amber-200/80">If notes miss often later: retune here before continuing.</p>
+                <button type="button" class="nd-cal-open-tuner w-full mb-2 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200">Open Tuner</button>
+                <div class="nd-cal-tuner-open-status text-[11px] mb-2 min-h-[1.5rem]"></div>
+                <button type="button" class="nd-cal-tuned w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white">I'm Tuned — Continue</button>`;
+        } else if (step === 3) {
+            const nDone = wiz.noise && wiz.noise.captured;
+            html = `
+                ${_calWizardDetectBanner(snap)}
+                <p class="text-gray-300 text-xs mb-2">Mute all strings and rest your hands on the strings. The wizard listens automatically after a short countdown.</p>
+                <div class="nd-cal-live-level text-cyan-300/90 text-xs font-mono mb-2">Live: —</div>
+                <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 min-h-[2rem]">${nDone
+                    ? `Captured: avg ${wiz.noise.avgPct}% · peak ${wiz.noise.peakPct}% · ${_calWizardNoiseStatusDisplay(wiz.noise.status)}`
+                    : 'Ready to measure room noise.'}</div>
+                <button type="button" class="nd-cal-start-noise w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${nDone ? 'Retry Noise Capture' : 'Start Noise Capture'}</button>
+                <p class="text-[10px] text-gray-500">If <strong>Too noisy</strong>: lower input gain, move away from amps/fans, or try the dry (Ch 1) input.</p>`;
+        } else if (step === 4) {
+            const sDone = wiz.signal && wiz.signal.captured;
+            html = `
+                ${_calWizardDetectBanner(snap)}
+                <p class="text-gray-300 text-xs mb-2">Play your <strong class="text-gray-200">open low E</strong> at normal playing volume when prompted. Listening starts after the countdown.</p>
+                <div class="nd-cal-live-level text-cyan-300/90 text-xs font-mono mb-2">Live: —</div>
+                <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 min-h-[2rem]">${sDone
+                    ? `Captured: avg ${wiz.signal.avgPct}% · peak ${wiz.signal.peakPct}% · ${_calWizardSignalStatusDisplay(wiz.signal.status)}`
+                    : 'Ready to measure your playing level.'}</div>
+                <button type="button" class="nd-cal-start-signal w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">${sDone ? 'Retry Signal Capture' : 'Start Signal Capture'}</button>
+                <p class="text-[10px] text-gray-500">If <strong>Too low</strong>: raise interface gain or play closer to the mic/DI. If <strong>Too hot</strong>: lower gain to avoid clipping.</p>`;
+        } else if (step === 5) {
+            const noteSpecs = _calWizardResolveNoteChecks({ mode: 'quick' });
+            const allNoteSpecs = _calWizardResolveNoteChecks({ mode: 'all' });
+            const allStr = wiz.allStrings || _calWizardDefaultAllStringsState();
+            const allRunning = !!allStr.running;
+            const detailsOpen = !!(allStr.detailsOpen || allStr.running || allStr.complete || allStr.failedId);
+            const noteRowHtml = (spec, compact) => {
+                const r = wiz.notes[spec.id];
+                const st = r && r.ok ? 'text-green-300/90' : r ? 'text-amber-200/90' : 'text-gray-500';
+                const txt = r && r.ok
+                    ? `OK — heard ${r.heardNote} (${r.confidencePct}%)`
+                    : r
+                        ? `Failed — expected ${r.expectedNote || spec.expectedNote}`
+                        : `Expected ${spec.expectedNote}`;
+                const labelCls = compact ? 'text-[10px]' : 'text-xs';
+                return `<div class="flex justify-between py-1 border-b border-gray-700/50 gap-2">
+                    <span class="text-gray-300 ${labelCls}">${spec.label}</span>
+                    <span class="${st} text-[10px] text-right shrink-0">${txt}</span></div>`;
+            };
+            const noteRows = noteSpecs.map((spec) => noteRowHtml(spec, false)).join('');
+            const noteButtons = noteSpecs.map((spec) =>
+                `<button type="button" class="nd-cal-check-note w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-1" data-note="${spec.id}">Check ${spec.label}</button>`
+            ).join('');
+            const allRows = allNoteSpecs.map((spec) => noteRowHtml(spec, true)).join('');
+            const allBtnDisabled = allRunning ? ' disabled' : '';
+            const allBtnDisabledCls = allRunning ? ' opacity-50 cursor-not-allowed' : '';
+            const allButtons = allNoteSpecs.map((spec) => {
+                const n = spec.displayString != null ? spec.displayString : (spec.string + 1);
+                return `<button type="button" class="nd-cal-check-note-all w-full py-1.5 bg-dark-600 hover:bg-dark-500 rounded text-[10px] text-gray-200 mb-1${allBtnDisabledCls}" data-note="${spec.id}"${allBtnDisabled}>Check String ${n}</button>`;
+            }).join('');
+            let seqStatusHtml = '';
+            if (allStr.message) {
+                const seqCls = allStr.complete
+                    ? 'text-green-300/90'
+                    : allStr.failedId
+                        ? 'text-amber-200/90'
+                        : 'text-cyan-300/90';
+                seqStatusHtml = `<p class="text-[10px] ${seqCls} mb-2">${allStr.message}</p>`;
+            }
+            const runBtnLabel = allRunning ? 'Checking…' : 'Run All-Strings Check';
+            const runBtnDisabled = allRunning ? ' disabled' : '';
+            const runBtnCls = allRunning ? ' opacity-60 cursor-not-allowed' : '';
+            html = `
+                ${_calWizardDetectBanner(snap)}
+                <p class="text-gray-300 text-xs mb-2">Quick check that Slopsmith hears open strings. This is simpler than Technique Assessment — just confirms basic detection works.</p>
+                <p class="text-[10px] text-gray-500 mb-2">Targets match the current song tuning. Use the same tone and pitch-shift path you will play the song with.</p>
+                <p class="text-[10px] text-gray-500 mb-2">Load a song first for song tuning in the tuner.</p>
+                <div class="nd-cal-heard text-cyan-300/90 text-[10px] font-mono mb-2">Now hearing: —</div>
+                <div class="nd-cal-pitch-debug text-[9px] text-gray-500 font-mono mb-1 hidden"></div>
+                <div class="nd-cal-auto-status text-[11px] text-gray-400 mb-2 min-h-[1.5rem]">—</div>
+                <div class="mb-2">${noteRows}</div>
+                ${noteButtons}
+                <details class="nd-cal-all-strings mt-3 mb-2"${detailsOpen ? ' open' : ''}>
+                    <summary class="text-sm text-gray-400 cursor-pointer hover:text-gray-200 py-1 select-none">Check all open strings (advanced)</summary>
+                    <p class="text-[10px] text-gray-500 mt-2 mb-2">Optional — verify every open string against song tuning. Not required to continue.</p>
+                    <button type="button" class="nd-cal-run-all-strings w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${runBtnCls}"${runBtnDisabled}>${runBtnLabel}</button>
+                    ${seqStatusHtml}
+                    <div class="mb-2">${allRows}</div>
+                    ${allButtons}
+                </details>
+                <p class="text-[10px] text-gray-500">If a check fails: retune, confirm the right input channel, raise gain slightly, and try the other channel (dry vs wet).</p>`;
+        } else if (step === 6) {
+            const t = wiz.timing;
+            const liveMed = snap.timingMedianMs;
+            const liveN = (snap.diagnostic && snap.diagnostic.timing_error_ms_hits)
+                ? snap.diagnostic.timing_error_ms_hits.count : 0;
+            const playAlongBusy = !!(wiz.playAlong);
+            html = `
+                ${_calWizardDetectBanner(snap)}
+                <p class="text-gray-300 text-xs mb-2"><strong class="text-gray-200">Play part of a song</strong> with Detect on so hits are scored. Use a timed test for a clean ${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s sample window, or minimize manually.</p>
+                <p class="text-[10px] text-gray-500 mb-2">Use the speed you normally practice. This measures input vs chart alignment, not tempo.</p>
+                <div class="nd-cal-timing-median text-gray-300 text-xs mb-2">Your average timing vs chart: —</div>
+                <p class="text-[10px] text-gray-500 mb-2">Live session: ${Number.isFinite(liveMed) ? _ndFormatMs(liveMed) + ' average' : 'not enough hits yet'} · ${liveN} hit samples</p>
+                <p class="text-[10px] text-gray-500 mb-2"><strong class="text-gray-400">Chart/video offset</strong> (main Settings) moves notes on screen. <strong class="text-gray-400">Detection delay</strong> (latency offset) moves when your playing is judged — this step helps tune detection delay.</p>
+                <p class="text-[10px] text-amber-200/80">Mostly late? Detection delay may need increasing. Mostly early? Try lowering it.</p>
+                ${wiz.timingCaptureNote ? `<p class="text-[10px] text-cyan-300/90 mb-2">${wiz.timingCaptureNote}</p>` : ''}
+                <button type="button" class="nd-cal-start-playalong w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2${playAlongBusy ? ' opacity-60 cursor-not-allowed' : ''}"${playAlongBusy ? ' disabled' : ''}>Start Timed Play-Along Test (${_CAL_WIZARD_TIMED_PLAYALONG_SEC}s)</button>
+                <button type="button" class="nd-cal-minimize-play w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Minimize Wizard — Play Song</button>
+                <button type="button" class="nd-cal-reset-timing w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Reset Timing Samples</button>
+                <button type="button" class="nd-cal-capture-timing w-full py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-1">Capture Timing Snapshot</button>
+                ${t && t.captured ? `<p class="text-[10px] text-green-300/90">Stored: ${_ndFormatMs(t.medianMs)} · ${t.sampleCount} samples</p>` : ''}`;
+        } else if (step === 7) {
+            html = `
+                <p class="text-sm text-gray-200 mb-3">Review safe recommendations. Uncheck anything you do not want applied.</p>
+                ${_calWizardReviewSummaryHtml(wiz, { showCheckboxes: true })}
+                ${_calWizardReviewDetailsHtml(wiz)}
+                <p class="text-xs text-gray-500 mt-2"><strong class="text-gray-400">Never changed by this wizard:</strong> pitch tolerance, timing tolerance, chord leniency, clean timing/pitch thresholds, harmonic SNR, note verifier / scoring thresholds</p>`;
+        } else if (step === 8) {
+            if (wiz.complete) {
+                html = _calWizardCompletionHtml(wiz);
+            } else {
+                html = `
+                <p class="text-base font-medium text-gray-100 mb-3">Ready to apply recommended calibration settings.</p>
+                ${_calWizardReviewSummaryHtml(wiz, { showCheckboxes: false, onlyChecked: true })}
+                <p class="text-sm text-gray-400 mb-4">Apply updates input gain and/or detection delay only. Scoring strictness and detection thresholds are not changed.</p>
+                <button type="button" class="nd-cal-apply-safe w-full py-3 bg-accent hover:bg-accent-light rounded-xl text-sm font-bold text-white mb-3 shadow-lg">Apply Recommended Settings</button>
+                <button type="button" class="nd-cal-finish-no-apply w-full py-2.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-sm text-gray-300">Finish Without Applying</button>`;
+            }
+        }
+        body.innerHTML = html;
+
+        const openTuner = body.querySelector('.nd-cal-open-tuner');
+        if (openTuner) {
+            openTuner.onclick = () => { _calWizardOpenTunerFromWizard(); };
+        }
+        const tunedBtn = body.querySelector('.nd-cal-tuned');
+        if (tunedBtn) {
+            tunedBtn.onclick = () => {
+                _calWizardReleaseTuner();
+                calibrationWizardNext();
+            };
+        }
+
+        const startNoise = body.querySelector('.nd-cal-start-noise');
+        if (startNoise) startNoise.onclick = () => _calWizardStartNoiseCapture();
+
+        const startSignal = body.querySelector('.nd-cal-start-signal');
+        if (startSignal) startSignal.onclick = () => _calWizardStartSignalCapture();
+
+        const autoChannel = body.querySelector('.nd-cal-auto-channel');
+        if (autoChannel) {
+            autoChannel.onclick = () => {
+                if (_calWizardState && _calWizardState.channelProbeRunning) {
+                    _calWizardSetChannelProbeStatus(
+                        '<span class="text-amber-200/90">Detection already in progress...</span>');
+                    return;
+                }
+                _calWizardAutoDetectInputChannel();
+            };
+        }
+
+        body.querySelectorAll('.nd-cal-pick-channel').forEach((btn) => {
+            btn.onclick = () => {
+                const ch = parseInt(btn.getAttribute('data-ch'), 10);
+                if (Number.isFinite(ch)) _calWizardApplyChannelProbeUserPick(ch);
+            };
+        });
+
+        body.querySelectorAll('.nd-cal-check-note').forEach((btn) => {
+            btn.onclick = () => {
+                const id = btn.getAttribute('data-note');
+                if (id) _calWizardStartNoteCapture(id);
+            };
+        });
+
+        body.querySelectorAll('.nd-cal-check-note-all').forEach((btn) => {
+            btn.onclick = () => {
+                if (_calWizardState && _calWizardState.allStrings && _calWizardState.allStrings.running) return;
+                const id = btn.getAttribute('data-note');
+                if (id) _calWizardStartNoteCapture(id);
+            };
+        });
+
+        const runAllStrings = body.querySelector('.nd-cal-run-all-strings');
+        if (runAllStrings) {
+            runAllStrings.onclick = () => {
+                if (_calWizardState && _calWizardState.allStrings && _calWizardState.allStrings.running) return;
+                _calWizardStartAllStringsRun();
+            };
+        }
+
+        const resetTiming = body.querySelector('.nd-cal-reset-timing');
+        if (resetTiming) {
+            resetTiming.onclick = () => {
+                _calWizardStopTimedPlayAlong('reset');
+                try { _resetCalibrationSamples(); } catch (e) { console.warn('[note_detect] resetCalibrationSamples:', e); }
+                wiz.timing = null;
+                wiz.timingCaptureNote = null;
+                _calWizardRefreshLive();
+                renderCalibrationWizard();
+            };
+        }
+        const capTiming = body.querySelector('.nd-cal-capture-timing');
+        if (capTiming) {
+            capTiming.onclick = () => {
+                wiz.timingCaptureNote = null;
+                _calWizardCaptureTimingSnapshot();
+            };
+        }
+
+        const startPlayAlong = body.querySelector('.nd-cal-start-playalong');
+        if (startPlayAlong) {
+            startPlayAlong.onclick = () => _calWizardStartTimedPlayAlong(_CAL_WIZARD_TIMED_PLAYALONG_SEC);
+        }
+
+        const minimizePlay = body.querySelector('.nd-cal-minimize-play');
+        if (minimizePlay) {
+            minimizePlay.onclick = () => {
+                _calWizardStopTimedPlayAlong('manual-minimize');
+                _calWizardMinimizeForPlayback();
+            };
+        }
+
+        body.querySelectorAll('.nd-cal-apply-chk').forEach((chk) => {
+            chk.onchange = () => {
+                const key = chk.getAttribute('data-key');
+                if (key) wiz.applyChecked[key] = chk.checked;
+            };
+        });
+
+        const applyBtn = body.querySelector('.nd-cal-apply-safe');
+        if (applyBtn) {
+            applyBtn.onclick = () => {
+                _calWizardApplySafeSettings(wiz);
+                wiz.complete = 'applied';
+                renderCalibrationWizard();
+            };
+        }
+        const finishNo = body.querySelector('.nd-cal-finish-no-apply');
+        if (finishNo) {
+            finishNo.onclick = () => {
+                wiz.complete = 'finished';
+                wiz.applied = null;
+                renderCalibrationWizard();
+            };
+        }
+
+        const doneBtn = body.querySelector('.nd-cal-done');
+        if (doneBtn) doneBtn.onclick = () => calibrationWizardClose();
+
+        const runLabBtn = body.querySelector('.nd-cal-run-lab');
+        if (runLabBtn) {
+            runLabBtn.onclick = () => {
+                calibrationWizardClose();
+                try { openInstrumentCalibrationLab(); } catch (e) {
+                    console.warn('[note_detect] openInstrumentCalibrationLab:', e);
+                }
+            };
+        }
+
+        if (step >= 1 && step <= 6) _calWizardRefreshLive();
+    }
+
+    function calibrationWizardNext() {
+        if (!_calWizardState) return;
+        _calWizardStopAllStringsRun('next');
+        _calWizardStopAutoCapture();
+        if (_calWizardState.step === 2) {
+            _calWizardReleaseTuner();
+        } else if (_calWizardState.tunerMinimized) {
+            _calWizardSetTunerMinimized(false);
+        }
+        if (_calWizardState.step >= 8) return;
+        _calWizardState.step++;
+        renderCalibrationWizard();
+    }
+
+    function calibrationWizardBack() {
+        if (!_calWizardState || _calWizardState.step <= 0) return;
+        _calWizardStopAllStringsRun('back');
+        _calWizardStopAutoCapture();
+        if (_calWizardState.tunerMinimized) _calWizardSetTunerMinimized(false);
+        _calWizardState.step--;
+        renderCalibrationWizard();
+    }
+
+    function openCalibrationWizard() {
+        calibrationWizardClose();
+        _calWizardState = _calWizardNewState();
+        const overlay = document.createElement('div');
+        overlay.className = 'nd-cal-wizard';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:300;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.65);pointer-events:auto;';
+        overlay.innerHTML = `
+            <button type="button" class="nd-cal-return-wizard bg-accent hover:bg-accent-light text-white shadow-2xl border-2 border-white/25" style="display:none;pointer-events:auto;position:fixed;left:50%;transform:translateX(-50%);bottom:120px;z-index:301;padding:16px 32px;border-radius:16px;max-width:calc(100vw - 2rem);text-align:center;cursor:pointer;">
+                <span class="nd-cal-return-primary block text-sm font-bold leading-tight">Return to Calibration Wizard</span>
+                <span class="nd-cal-return-secondary block text-[11px] font-normal opacity-90 mt-1">Tap here to continue setup</span>
+            </button>
+            <div class="nd-cal-wizard-card bg-dark-700 border border-gray-600 rounded-2xl shadow-2xl text-sm" style="width:24rem;max-width:calc(100vw - 2rem);max-height:calc(100vh - 3rem);display:flex;flex-direction:column;">
+                <div class="flex justify-between items-center px-4 py-3 border-b border-gray-700">
+                    <span class="nd-cal-title text-gray-200 font-semibold text-xs">Calibration Wizard</span>
+                    <button type="button" class="nd-cal-close text-gray-500 hover:text-white text-lg leading-none" title="Close">&times;</button>
+                </div>
+                <div class="nd-cal-body px-4 py-3 overflow-y-auto flex-1 text-xs"></div>
+                <div class="flex gap-2 px-4 py-3 border-t border-gray-700">
+                    <button type="button" class="nd-cal-back flex-1 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300">Back</button>
+                    <button type="button" class="nd-cal-next flex-1 py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white">Next</button>
+                </div>
+            </div>`;
+        overlay.onclick = (e) => { if (e.target === overlay) calibrationWizardClose(); };
+        overlay.querySelector('.nd-cal-close').onclick = () => calibrationWizardClose();
+        overlay.querySelector('.nd-cal-back').onclick = () => calibrationWizardBack();
+        overlay.querySelector('.nd-cal-next').onclick = () => calibrationWizardNext();
+        const ret = overlay.querySelector('.nd-cal-return-wizard');
+        if (ret) {
+            ret.onclick = () => {
+                if (_calWizardState && _calWizardState.playAlong) {
+                    if (_calWizardState.playAlong.phase === 'waiting') {
+                        _calWizardCancelTimedPlayAlongWaiting(
+                            'Timed play-along cancelled — returned before playback started.');
+                        return;
+                    }
+                    _calWizardFinishTimedPlayAlong(true);
+                    return;
+                }
+                _calWizardSetTunerMinimized(false);
+                _calWizardRefreshLive();
+            };
+        }
+        document.body.appendChild(overlay);
+        _calWizardEl = overlay;
+        renderCalibrationWizard();
+        _calWizardTick = setInterval(() => {
+            if (!_calWizardEl || !_calWizardEl.isConnected) {
+                calibrationWizardClose();
+                return;
+            }
+            if (_calWizardState && !_calWizardState.tunerMinimized
+                && _calWizardState.step >= 1 && _calWizardState.step <= 6) {
+                _calWizardRefreshLive();
+            }
+        }, 200);
+    }
+
+    // ── Technique Assessment (Phase 1 — diagnostic only; was Instrument Calibration Lab) ──
+    // Read-only guided probes via scoreChord harmonicVerify. Does NOT
+    // change thresholds, scoring, latency, or apply settings.
+    let _calLabEl = null;
+    let _calLabTick = null;
+    let _calLabState = null;
+    let _calLabLastReport = null;
+
+    const _CAL_LAB_FAIL = { SNR: 1, FUND: 2, PITCH: 4 };
+    const _CAL_LAB_SCHEMA = 'note_detect.calibration_report.v1';
+    const _CAL_LAB_MIN_CAPTURES = 3;
+    const _CAL_LAB_POWER_CHORD_NOTES = [
+        { s: 0, f: 0, role: 'root' },
+        { s: 1, f: 2, role: 'fifth' },
+    ];
+    const _CAL_LAB_ADVANCED_ONLY_STEP_IDS = new Set([
+        'picked', 'hammerOn', 'pullOff', 'palmMute',
+        'naturalHarmonic', 'pinchHarmonic', 'halfBend', 'wholeBend', 'sustain',
+    ]);
+    const _CAL_LAB_BASIC_OPEN_ROWS = [
+        { s: 0, f: 0, prompt: 'Play the thickest string open', btn: 'Capture thickest string' },
+        { s: 1, f: 0, prompt: 'Play the next string open', btn: 'Capture next string' },
+    ];
+    const _CAL_LAB_BASIC_FRET_ROWS = [
+        { s: 0, f: 5, prompt: 'Play the thickest string at the 5th fret', btn: 'Capture thickest string, 5th fret' },
+    ];
+    const _CAL_LAB_AUTO_NOISE_MS = 1800;
+    const _CAL_LAB_AUTO_SIGNAL_MS = 2000;
+    const _CAL_LAB_AUTO_PROBE_LISTEN_MS = 7000;
+    const _CAL_LAB_AUTO_PROBE_INTERVAL_MS = 600;
+    const _CAL_LAB_AUTO_PWR_LISTEN_MS = 8000;
+    const _CAL_LAB_AUTO_PWR_INTERVAL_MS = 700;
+
+    function _calLabDefaultAutoRun() {
+        return {
+            active: false,
+            phase: 'idle',
+            stepId: null,
+            subIndex: 0,
+            status: null,
+            timerId: null,
+            intervalId: null,
+            inFlight: false,
+            capturesThisRun: 0,
+            startedAt: 0,
+            listenEndsAt: 0,
+            sessionId: 0,
+        };
+    }
+
+    function _calLabEnsureAutoRun(st) {
+        if (!st.autoRun) st.autoRun = _calLabDefaultAutoRun();
+        return st.autoRun;
+    }
+
+    function _calLabStopAutoCapture(reason) {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = st.autoRun;
+        if (!ar) return;
+        if (ar.timerId != null) {
+            clearTimeout(ar.timerId);
+            ar.timerId = null;
+        }
+        if (ar.intervalId != null) {
+            clearInterval(ar.intervalId);
+            ar.intervalId = null;
+        }
+        ar.inFlight = false;
+        if (ar.phase === 'countdown' || ar.phase === 'listening') {
+            ar.phase = 'idle';
+        }
+        ar.active = false;
+        if (reason) ar.status = reason;
+    }
+
+    function _calLabSetAutoStatus(html) {
+        if (!_calLabEl) return;
+        const el = _calLabEl.querySelector('.nd-cal-lab-auto-status');
+        if (el) el.innerHTML = html;
+    }
+
+    function _calLabIsAutoBusy(st) {
+        const ar = st && st.autoRun;
+        return !!(ar && ar.active && (ar.phase === 'countdown' || ar.phase === 'listening'));
+    }
+
+    function _calLabBeginCountdownThen(seconds, label, callback) {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = _calLabEnsureAutoRun(st);
+        if (ar.timerId != null) clearTimeout(ar.timerId);
+        ar.active = true;
+        ar.phase = 'countdown';
+        let left = seconds;
+        const tick = () => {
+            if (!_calLabState || _calLabState !== st || !ar.active) return;
+            const n = left > 0 ? String(left) : 'Go!';
+            _calLabSetAutoStatus(
+                `<p class="text-gray-200 text-sm mb-1">${label}</p>`
+                + `<p class="text-2xl font-bold text-white text-center py-2">${n}</p>`);
+            if (left <= 0) {
+                ar.timerId = null;
+                ar.phase = 'listening';
+                callback();
+                return;
+            }
+            left -= 1;
+            ar.timerId = setTimeout(tick, 1000);
+        };
+        tick();
+    }
+
+    function _calLabAvgLevelSamples(samples) {
+        if (!samples || !samples.length) return { avg: null, peak: null };
+        let sum = 0;
+        let maxPeak = 0;
+        for (const s of samples) {
+            sum += s.level;
+            if (s.peak > maxPeak) maxPeak = s.peak;
+        }
+        return { avg: Math.round(sum / samples.length), peak: maxPeak };
+    }
+
+    function _calLabRunLevelSampler(durationMs, onDone) {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = _calLabEnsureAutoRun(st);
+        const sessionId = ar.sessionId;
+        const samples = [];
+        const started = Date.now();
+        ar.startedAt = started;
+        ar.listenEndsAt = started + durationMs;
+        if (ar.intervalId != null) clearInterval(ar.intervalId);
+        if (ar.timerId != null) clearTimeout(ar.timerId);
+        let finished = false;
+        const finish = () => {
+            if (finished) return;
+            finished = true;
+            if (ar.intervalId != null) {
+                clearInterval(ar.intervalId);
+                ar.intervalId = null;
+            }
+            if (ar.timerId != null) {
+                clearTimeout(ar.timerId);
+                ar.timerId = null;
+            }
+            ar.inFlight = false;
+            onDone(samples, sessionId);
+        };
+        const tick = () => {
+            if (!_calLabState || _calLabState !== st || ar.sessionId !== sessionId || !ar.active) return;
+            const snap = getCalibrationSnapshot();
+            samples.push({ level: snap.inputLevelPct, peak: snap.inputPeakPct, t: Date.now() });
+            const elapsed = Date.now() - started;
+            _calLabSetAutoStatus(
+                `<span class="text-cyan-300/90">Listening…</span> ${Math.round(elapsed / 1000)}s · `
+                + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct));
+            if (elapsed >= durationMs) finish();
+        };
+        tick();
+        ar.intervalId = setInterval(tick, 120);
+        ar.timerId = setTimeout(finish, durationMs + 250);
+    }
+
+    function _calLabProbeCountForStep(st, opts) {
+        const { store, noteDef, technique, multiNotes } = opts;
+        if (multiNotes) {
+            return ((st.techniqueCaptures && st.techniqueCaptures[technique]) || []).length;
+        }
+        const caps = (st[store] && st[store][noteDef.s]) || [];
+        return caps.length;
+    }
+
+    function _calLabStoreProbeCapture(st, opts, cap) {
+        if (!cap || !cap.ok) return false;
+        const { store, noteDef, technique, multiNotes } = opts;
+        if (multiNotes) {
+            if (!st.techniqueCaptures) st.techniqueCaptures = {};
+            if (!st.techniqueCaptures[technique]) st.techniqueCaptures[technique] = [];
+            st.techniqueCaptures[technique].push(cap);
+            return true;
+        }
+        if (!st[store]) st[store] = {};
+        if (!st[store][noteDef.s]) st[store][noteDef.s] = [];
+        st[store][noteDef.s].push(cap);
+        return true;
+    }
+
+    function _calLabRunProbeListenWindow(opts) {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = _calLabEnsureAutoRun(st);
+        const sessionId = ar.sessionId;
+        const listenMs = opts.listenMs || _CAL_LAB_AUTO_PROBE_LISTEN_MS;
+        const intervalMs = opts.intervalMs || _CAL_LAB_AUTO_PROBE_INTERVAL_MS;
+        const minCaptures = opts.minCaptures || _CAL_LAB_MIN_CAPTURES;
+        ar.phase = 'listening';
+        ar.active = true;
+        ar.startedAt = Date.now();
+        ar.listenEndsAt = ar.startedAt + listenMs;
+        ar.capturesThisRun = 0;
+
+        let ended = false;
+        const endWindow = (reason) => {
+            if (ended) return;
+            ended = true;
+            if (ar.intervalId != null) {
+                clearInterval(ar.intervalId);
+                ar.intervalId = null;
+            }
+            if (ar.timerId != null) {
+                clearTimeout(ar.timerId);
+                ar.timerId = null;
+            }
+            ar.inFlight = false;
+            ar.active = false;
+            ar.phase = reason === 'stop' ? 'idle' : 'done';
+            if (opts.onComplete) opts.onComplete(reason);
+        };
+
+        const tryCapture = async () => {
+            if (!_calLabState || _calLabState !== st || ar.sessionId !== sessionId || !ar.active) return;
+            if (ar.inFlight || Date.now() >= ar.listenEndsAt) return;
+            ar.inFlight = true;
+            let cap;
+            try {
+                if (opts.multiNotes) {
+                    cap = await _calLabCaptureMulti(opts.multiNotes, opts.technique);
+                } else {
+                    cap = await _calLabCaptureProbe(opts.noteDef, opts.technique || opts.store);
+                }
+            } catch (_) {
+                cap = null;
+            }
+            ar.inFlight = false;
+            if (!_calLabState || _calLabState !== st || ar.sessionId !== sessionId) return;
+            if (_calLabStoreProbeCapture(st, opts, cap)) {
+                ar.capturesThisRun = _calLabProbeCountForStep(st, opts);
+            }
+            const count = _calLabProbeCountForStep(st, opts);
+            const shortLabel = opts.shortLabel || opts.label || 'check';
+            _calLabSetAutoStatus(
+                `<span class="text-cyan-300/90">${shortLabel}</span> — ${count} of ${minCaptures} captures`);
+            if (opts.onProgress) opts.onProgress(count);
+            if (count >= minCaptures) endWindow('enough');
+        };
+
+        const tick = () => {
+            if (!_calLabState || _calLabState !== st || ar.sessionId !== sessionId || !ar.active) return;
+            if (Date.now() >= ar.listenEndsAt) {
+                endWindow('timeout');
+                return;
+            }
+            tryCapture();
+        };
+
+        const count = _calLabProbeCountForStep(st, opts);
+        _calLabSetAutoStatus(
+            `<span class="text-cyan-300/90">${opts.shortLabel || opts.label}</span> — ${count} of ${minCaptures} captures`);
+        tick();
+        ar.intervalId = setInterval(tick, intervalMs);
+        ar.timerId = setTimeout(() => endWindow('timeout'), listenMs + 300);
+    }
+
+    function _calLabBasicAutoControlsHtml(stepKey, startLabel, busy, showRetry) {
+        const hideStart = busy ? 'hidden' : '';
+        const hideStop = busy ? '' : 'hidden';
+        const hideRetry = showRetry && !busy ? '' : 'hidden';
+        return `<div class="nd-cal-lab-auto-controls flex flex-col gap-2 mb-2">
+            <button type="button" class="nd-cal-lab-auto-start ${hideStart} w-full py-2.5 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white" data-auto-step="${stepKey}">${startLabel}</button>
+            <button type="button" class="nd-cal-lab-auto-retry ${hideRetry} w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200" data-auto-step="${stepKey}">Retry</button>
+            <button type="button" class="nd-cal-lab-auto-stop ${hideStop} w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-amber-200/90" data-auto-step="${stepKey}">Stop</button>
+        </div>`;
+    }
+
+    function _calLabUpdateBasicAutoButtons() {
+        if (!_calLabEl || !_calLabState) return;
+        const busy = _calLabIsAutoBusy(_calLabState);
+        const start = _calLabEl.querySelector('.nd-cal-lab-auto-start');
+        const retry = _calLabEl.querySelector('.nd-cal-lab-auto-retry');
+        const stop = _calLabEl.querySelector('.nd-cal-lab-auto-stop');
+        if (start) start.classList.toggle('hidden', busy);
+        if (stop) stop.classList.toggle('hidden', !busy);
+        if (retry) {
+            const done = _calLabState.autoRun && _calLabState.autoRun.phase === 'done';
+            retry.classList.toggle('hidden', busy || !done);
+        }
+        const nextBtn = _calLabEl.querySelector('.nd-cal-lab-next');
+        if (nextBtn) nextBtn.disabled = busy;
+    }
+
+    function _calLabClearBasicOpenCaptures(st) {
+        st.openCaptures = {};
+    }
+
+    function _calLabClearBasicFretCaptures(st) {
+        st.fretCaptures = {};
+    }
+
+    function _calLabClearBasicPowerCaptures(st) {
+        if (!st.techniqueCaptures) st.techniqueCaptures = {};
+        st.techniqueCaptures.powerChord = [];
+    }
+
+    function _calLabStartNoiseAuto() {
+        const st = _calLabState;
+        if (!st) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'noise';
+        ar.sessionId = Date.now();
+        ar.active = true;
+        _calLabBeginCountdownThen(3, 'Get ready: mute all strings', () => {
+            _calLabSetAutoStatus('<span class="text-cyan-300/90">Listening for room noise…</span>');
+            _calLabRunLevelSampler(_CAL_LAB_AUTO_NOISE_MS, (samples, sessionId) => {
+                if (!_calLabState || _calLabState.autoRun.sessionId !== sessionId) return;
+                const { avg, peak } = _calLabAvgLevelSamples(samples);
+                if (!Number.isFinite(avg)) {
+                    st.autoRun.phase = 'error';
+                    st.autoRun.active = false;
+                    _calLabSetAutoStatus('<span class="text-amber-200/90">No samples — turn Detect on and retry.</span>');
+                    _calLabUpdateBasicAutoButtons();
+                    return;
+                }
+                st.noiseLevelPct = avg;
+                st.noisePeakPct = peak;
+                st.autoRun.phase = 'done';
+                st.autoRun.active = false;
+                const resultEl = _calLabEl && _calLabEl.querySelector('.nd-cal-lab-auto-result');
+                if (resultEl) {
+                    resultEl.textContent = calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct);
+                }
+                _calLabSetAutoStatus(
+                    `<span class="text-green-300/90">Noise check complete:</span> `
+                    + calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct));
+                _calLabUpdateBasicAutoButtons();
+            });
+        });
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabStartSignalAuto() {
+        const st = _calLabState;
+        if (!st) return;
+        const snap = getCalibrationSnapshot();
+        if (!snap.enabled) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'signal';
+        ar.sessionId = Date.now();
+        ar.active = true;
+        _calLabBeginCountdownThen(3, 'Get ready: play the thickest string loudly', () => {
+            _calLabSetAutoStatus('<span class="text-cyan-300/90">Listening for playing level…</span>');
+            _calLabRunLevelSampler(_CAL_LAB_AUTO_SIGNAL_MS, (samples, sessionId) => {
+                if (!_calLabState || _calLabState.autoRun.sessionId !== sessionId) return;
+                const { avg, peak } = _calLabAvgLevelSamples(samples);
+                if (!Number.isFinite(avg)) {
+                    st.autoRun.phase = 'error';
+                    st.autoRun.active = false;
+                    _calLabSetAutoStatus('<span class="text-amber-200/90">No samples — turn Detect on and retry.</span>');
+                    _calLabUpdateBasicAutoButtons();
+                    return;
+                }
+                st.signalLevelPct = avg;
+                st.signalPeakPct = peak;
+                st.autoRun.phase = 'done';
+                st.autoRun.active = false;
+                const resultEl = _calLabEl && _calLabEl.querySelector('.nd-cal-lab-auto-result');
+                if (resultEl) {
+                    resultEl.textContent = calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct);
+                }
+                _calLabSetAutoStatus(
+                    `<span class="text-green-300/90">Signal check complete:</span> `
+                    + calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct));
+                _calLabUpdateBasicAutoButtons();
+            });
+        });
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabRunOpenSubPrompt() {
+        const st = _calLabState;
+        if (!st) return;
+        const ar = _calLabEnsureAutoRun(st);
+        const rows = _CAL_LAB_BASIC_OPEN_ROWS;
+        if (ar.subIndex >= rows.length) {
+            ar.phase = 'done';
+            ar.active = false;
+            _calLabSetAutoStatus('<span class="text-green-300/90">Open-string check complete.</span>');
+            _calLabUpdateBasicAutoButtons();
+            renderCalibrationLab();
+            return;
+        }
+        const row = rows[ar.subIndex];
+        const shortLabel = ar.subIndex === 0 ? 'Checking thickest string open' : 'Checking next string open';
+        _calLabBeginCountdownThen(3, `Get ready: ${row.prompt}`, () => {
+            _calLabRunProbeListenWindow({
+                store: 'openCaptures',
+                noteDef: { s: row.s, f: row.f },
+                technique: 'openCaptures',
+                label: row.prompt,
+                shortLabel,
+                listenMs: _CAL_LAB_AUTO_PROBE_LISTEN_MS,
+                intervalMs: _CAL_LAB_AUTO_PROBE_INTERVAL_MS,
+                minCaptures: _CAL_LAB_MIN_CAPTURES,
+                onComplete: () => {
+                    if (!_calLabState) return;
+                    ar.subIndex += 1;
+                    if (ar.subIndex < rows.length) {
+                        _calLabRunOpenSubPrompt();
+                    } else {
+                        ar.phase = 'done';
+                        ar.active = false;
+                        _calLabSetAutoStatus('<span class="text-green-300/90">Open-string check complete.</span>');
+                        _calLabUpdateBasicAutoButtons();
+                        renderCalibrationLab();
+                    }
+                },
+            });
+        });
+    }
+
+    function _calLabStartOpenAuto(clearFirst) {
+        const st = _calLabState;
+        if (!st) return;
+        if (!_calLabCanProbe()) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on (desktop) first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        if (clearFirst) _calLabClearBasicOpenCaptures(st);
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'open';
+        ar.sessionId = Date.now();
+        ar.subIndex = 0;
+        ar.active = true;
+        _calLabRunOpenSubPrompt();
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabStartFretAuto(clearFirst) {
+        const st = _calLabState;
+        if (!st) return;
+        if (!_calLabCanProbe()) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on (desktop) first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        if (clearFirst) _calLabClearBasicFretCaptures(st);
+        const row = _CAL_LAB_BASIC_FRET_ROWS[0];
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'fret5';
+        ar.sessionId = Date.now();
+        ar.subIndex = 0;
+        ar.active = true;
+        _calLabBeginCountdownThen(3, `Get ready: ${row.prompt}`, () => {
+            _calLabRunProbeListenWindow({
+                store: 'fretCaptures',
+                noteDef: { s: row.s, f: row.f },
+                technique: 'fretCaptures',
+                label: row.prompt,
+                shortLabel: 'Checking thickest string, 5th fret',
+                listenMs: _CAL_LAB_AUTO_PROBE_LISTEN_MS,
+                intervalMs: _CAL_LAB_AUTO_PROBE_INTERVAL_MS,
+                minCaptures: _CAL_LAB_MIN_CAPTURES,
+                onComplete: () => {
+                    if (!_calLabState) return;
+                    ar.phase = 'done';
+                    ar.active = false;
+                    _calLabSetAutoStatus('<span class="text-green-300/90">Fretted-note check complete.</span>');
+                    _calLabUpdateBasicAutoButtons();
+                    renderCalibrationLab();
+                },
+            });
+        });
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabStartPowerChordAuto(clearFirst) {
+        const st = _calLabState;
+        if (!st) return;
+        if (!_calLabCanProbe()) {
+            _calLabSetAutoStatus('<span class="text-amber-200/90">Turn Detect on (desktop) first.</span>');
+            return;
+        }
+        _calLabStopAutoCapture('restart');
+        if (clearFirst) _calLabClearBasicPowerCaptures(st);
+        const ar = _calLabEnsureAutoRun(st);
+        ar.stepId = 'powerChord';
+        ar.sessionId = Date.now();
+        ar.active = true;
+        _calLabBeginCountdownThen(3, 'Get ready: play a power chord (thickest open + next string 2nd fret)', () => {
+            _calLabRunProbeListenWindow({
+                multiNotes: [{ s: 0, f: 0 }, { s: 1, f: 2 }],
+                technique: 'powerChord',
+                label: 'Play a power chord: thickest string open + next string 2nd fret',
+                shortLabel: 'Power chord check',
+                listenMs: _CAL_LAB_AUTO_PWR_LISTEN_MS,
+                intervalMs: _CAL_LAB_AUTO_PWR_INTERVAL_MS,
+                minCaptures: _CAL_LAB_MIN_CAPTURES,
+                onProgress: () => {
+                    const diagEl = _calLabEl && _calLabEl.querySelector('.nd-cal-lab-pwr-diag-live');
+                    if (diagEl) diagEl.textContent = _calLabPowerChordSimpleDiagnosis(st);
+                },
+                onComplete: () => {
+                    if (!_calLabState) return;
+                    ar.phase = 'done';
+                    ar.active = false;
+                    _calLabSetAutoStatus(
+                        `<span class="text-green-300/90">Power chord check complete.</span> `
+                        + _calLabPowerChordSimpleDiagnosis(st));
+                    _calLabUpdateBasicAutoButtons();
+                    renderCalibrationLab();
+                },
+            });
+        });
+        _calLabUpdateBasicAutoButtons();
+    }
+
+    function _calLabRetryBasicAuto(stepKey) {
+        if (stepKey === 'noise') _calLabStartNoiseAuto();
+        else if (stepKey === 'signal') _calLabStartSignalAuto();
+        else if (stepKey === 'open') _calLabStartOpenAuto(true);
+        else if (stepKey === 'fret5') _calLabStartFretAuto(true);
+        else if (stepKey === 'powerChord') _calLabStartPowerChordAuto(true);
+    }
+
+    function _calLabEffectivePitchTol(chartPitch, flags) {
+        let cents = chartPitch;
+        if (flags && (flags.b || flags.sl)) cents = Math.max(cents, 100);
+        if (flags && flags.hm) cents = 0;
+        return cents;
+    }
+
+    function _calLabTickFromResult(r, flags) {
+        const harmonicSnr = _ND_VERIFY_HARMONIC_SNR;
+        const snr = Number.isFinite(r && r.bandEnergy) ? r.bandEnergy : 0;
+        const pitchTol = _calLabEffectivePitchTol(pitchTolerance, flags || {});
+        const passedSnr = snr >= harmonicSnr;
+        const passedFund = !!(r && r.fundamentalPresent);
+        const absCents = (r && Number.isFinite(r.centsError)) ? Math.abs(r.centsError) : null;
+        const passedPitch = pitchTol <= 0
+            || (absCents != null && absCents <= pitchTol);
+        const gatePassCount = (passedSnr ? 1 : 0) + (passedFund ? 1 : 0) + (passedPitch ? 1 : 0);
+        let failedMask = 0;
+        if (!passedSnr) failedMask |= _CAL_LAB_FAIL.SNR;
+        if (!passedFund) failedMask |= _CAL_LAB_FAIL.FUND;
+        if (!passedPitch) failedMask |= _CAL_LAB_FAIL.PITCH;
+        const snrRatio = harmonicSnr > 0 ? snr / harmonicSnr : snr;
+        return {
+            snr,
+            snrRatio,
+            harmonicSnrUsed: harmonicSnr,
+            fundamentalRatio: Number.isFinite(r && r.fundamentalRatio) ? r.fundamentalRatio : null,
+            centsError: Number.isFinite(r && r.centsError) ? r.centsError : null,
+            absCentsError: absCents,
+            passedSnr,
+            passedFundamental: passedFund,
+            passedPitch,
+            gatePassCount,
+            failedGateMask: failedMask,
+            hit: !!(r && r.hit),
+        };
+    }
+
+    function _calLabMedian(arr) {
+        if (!arr.length) return null;
+        const s = [...arr].sort((a, b) => a - b);
+        const m = Math.floor(s.length / 2);
+        return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+    }
+
+    function _calLabAvg(arr) {
+        return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+    }
+
+    function _calLabPowerChordDisplayString(stringIndex) {
+        return currentStringCount - stringIndex;
+    }
+
+    function _calLabPowerChordNoteMeta(stringIndex, fret) {
+        const def = _CAL_LAB_POWER_CHORD_NOTES.find((n) => n.s === stringIndex && n.f === fret);
+        const disp = _calLabPowerChordDisplayString(stringIndex);
+        let label;
+        if (def && def.role === 'root') label = 'thickest string (root)';
+        else if (def && def.role === 'fifth') label = 'next string (fifth)';
+        else label = `String ${disp}`;
+        let expectedNote = '—';
+        try {
+            const midi = _ndMidiFromStringFret(
+                stringIndex, fret, currentArrangement, currentStringCount, tuningOffsets, capo);
+            if (Number.isFinite(midi)) expectedNote = _ndMidiToName(midi);
+        } catch (_) { /* read-only */ }
+        return {
+            label,
+            role: def ? def.role : null,
+            expectedNote,
+            string: stringIndex,
+            fret,
+        };
+    }
+
+    function _calLabPowerChordNotePass(noteTick) {
+        return !!(noteTick && (noteTick.hit || noteTick.gatePassCount === 3));
+    }
+
+    function _calLabPowerChordHeardNote(noteTick) {
+        if (!noteTick || !Number.isFinite(noteTick.centsError)) return '—';
+        try {
+            const expectedMidi = _ndMidiFromStringFret(
+                noteTick.string, noteTick.fret, currentArrangement, currentStringCount, tuningOffsets, capo);
+            if (!Number.isFinite(expectedMidi)) return '—';
+            return _ndMidiToName(expectedMidi + noteTick.centsError / 100);
+        } catch (_) {
+            return '—';
+        }
+    }
+
+    function _calLabPowerChordNoteRowHtml(noteTick) {
+        if (!noteTick) return '';
+        const meta = _calLabPowerChordNoteMeta(noteTick.string, noteTick.fret);
+        const clarity = Number.isFinite(noteTick.snrRatio) ? noteTick.snrRatio.toFixed(2) : '—';
+        const heard = _calLabPowerChordHeardNote(noteTick);
+        const chips = _calLabGateChipsHtml(noteTick);
+        const passCls = _calLabPowerChordNotePass(noteTick)
+            ? 'text-green-300/90' : 'text-amber-200/90';
+        return `<div class="py-1 border-b border-gray-700/40">
+            <div class="flex justify-between gap-2 text-[10px]">
+                <span class="text-gray-300">${meta.label}</span>
+                <span class="${passCls} shrink-0">${_calLabPowerChordNotePass(noteTick) ? 'pass' : 'fail'}</span>
+            </div>
+            <div class="text-[9px] text-gray-500">Expected ${meta.expectedNote} · heard ${heard} · clarity ${clarity}</div>
+            ${chips ? `<div class="mt-0.5">${chips}</div>` : ''}
+        </div>`;
+    }
+
+    function _calLabPowerChordCaptureBlockHtml(cap, index) {
+        if (!cap || !cap.ok || !Array.isArray(cap.notes)) {
+            return `<div class="text-[10px] text-amber-200/90 py-1">Capture ${index + 1}: probe failed</div>`;
+        }
+        const rows = cap.notes.map((n) => _calLabPowerChordNoteRowHtml(n)).join('');
+        const batch = cap.batchHit
+            ? '<span class="text-green-300/90">batch hit</span>'
+            : '<span class="text-amber-200/90">batch miss</span>';
+        return `<div class="mb-2 p-2 bg-dark-800/50 rounded border border-gray-700/40">
+            <div class="text-[10px] text-gray-400 mb-1">Capture ${index + 1} · ${batch}</div>
+            ${rows}
+        </div>`;
+    }
+
+    function _calLabSummarizePowerChordRole(caps, role) {
+        const def = _CAL_LAB_POWER_CHORD_NOTES.find((n) => n.role === role);
+        if (!def) {
+            return { role, n: 0, passRate: null, dominantFailure: null, failCounts: { SNR: 0, FUND: 0, PITCH: 0 } };
+        }
+        let passes = 0;
+        let total = 0;
+        const failCounts = { SNR: 0, FUND: 0, PITCH: 0 };
+        for (const cap of caps) {
+            if (!cap || !cap.ok || !Array.isArray(cap.notes)) continue;
+            const note = cap.notes.find((n) => n.string === def.s && n.fret === def.f);
+            if (!note) continue;
+            total++;
+            if (_calLabPowerChordNotePass(note)) passes++;
+            if (note.failedGateMask & _CAL_LAB_FAIL.SNR) failCounts.SNR++;
+            if (note.failedGateMask & _CAL_LAB_FAIL.FUND) failCounts.FUND++;
+            if (note.failedGateMask & _CAL_LAB_FAIL.PITCH) failCounts.PITCH++;
+        }
+        let dominantFailure = null;
+        let maxF = 0;
+        for (const [k, v] of Object.entries(failCounts)) {
+            if (v > maxF) { maxF = v; dominantFailure = k; }
+        }
+        return {
+            role,
+            string: def.s,
+            fret: def.f,
+            label: _calLabPowerChordNoteMeta(def.s, def.f).label,
+            expectedNote: _calLabPowerChordNoteMeta(def.s, def.f).expectedNote,
+            n: total,
+            passRate: total > 0 ? passes / total : null,
+            dominantFailure,
+            failCounts,
+        };
+    }
+
+    function _calLabSummarizePowerChordCaptures(caps) {
+        const list = caps || [];
+        const root = _calLabSummarizePowerChordRole(list, 'root');
+        const fifth = _calLabSummarizePowerChordRole(list, 'fifth');
+        const aggregate = _calLabSummarizeCaptures(list);
+        return {
+            ...aggregate,
+            root,
+            fifth,
+            likelyCause: _calLabPowerChordLikelyCause({ root, fifth }),
+        };
+    }
+
+    function _calLabPowerChordLikelyCause(ps) {
+        if (!ps || !ps.root || !ps.fifth) return null;
+        const rootRate = ps.root.passRate;
+        const fifthRate = ps.fifth.passRate;
+        if (rootRate == null && fifthRate == null) return null;
+        const rootOk = rootRate != null && rootRate >= 0.5;
+        const fifthOk = fifthRate != null && fifthRate >= 0.5;
+        if (rootOk && !fifthOk) {
+            if (ps.fifth.dominantFailure === 'FUND') {
+                return 'Root verifies, fifth fails fundamental: distorted tone may be hiding the fifth\'s fundamental.';
+            }
+            if (ps.fifth.dominantFailure === 'PITCH') {
+                return 'Root verifies, fifth fails pitch: tuning or pitch-shift path may not match the song.';
+            }
+            return 'Root verifies, fifth fails: likely masking, wet distortion, or chord voicing issue.';
+        }
+        if (!rootOk && fifthOk) {
+            return 'Fifth verifies, root fails: low-string clarity or fundamental may be weak — check gain, palm muting, or low-string coupling.';
+        }
+        if (!rootOk && !fifthOk) {
+            if (ps.root.dominantFailure === 'SNR' && ps.fifth.dominantFailure === 'SNR') {
+                return 'Both strings fail clarity: signal may be too noisy/wet or wrong channel.';
+            }
+            if (ps.root.dominantFailure === 'FUND' || ps.fifth.dominantFailure === 'FUND') {
+                return 'Fundamental fails: distorted tone may be hiding the fundamental.';
+            }
+            if (ps.root.dominantFailure === 'PITCH' || ps.fifth.dominantFailure === 'PITCH') {
+                return 'Pitch fails: tuning or pitch-shift path may not match the song.';
+            }
+            return 'Both strings struggle to verify: check input channel, gain, and tone path.';
+        }
+        if (rootOk && fifthOk) {
+            return 'Root and fifth both verify in probes — gameplay chord misses may be timing, chart voicing, or a different detector path.';
+        }
+        return null;
+    }
+
+    function _calLabPowerChordSimpleDiagnosis(st) {
+        const caps = (st.techniqueCaptures && st.techniqueCaptures.powerChord) || [];
+        const sum = _calLabSummarizePowerChordCaptures(caps);
+        if (!sum.n) return 'No captures yet — press Capture while playing both strings.';
+        const rootOk = sum.root.passRate != null && sum.root.passRate >= 0.5;
+        const fifthOk = sum.fifth.passRate != null && sum.fifth.passRate >= 0.5;
+        if (rootOk && fifthOk) {
+            return 'Power chord: root and fifth both heard in probes.';
+        }
+        if (rootOk && !fifthOk) {
+            return 'Power chord: root heard, fifth not heard. Try the dry/clean channel to compare.';
+        }
+        if (!rootOk && fifthOk) {
+            return 'Power chord: fifth heard, root not heard. Check gain and low-string clarity.';
+        }
+        if (sum.root.dominantFailure === 'SNR' && sum.fifth.dominantFailure === 'SNR') {
+            return 'Both strings failed signal clarity. Your signal may be too quiet, noisy, or on the wrong channel.';
+        }
+        if (sum.root.dominantFailure === 'FUND' || sum.fifth.dominantFailure === 'FUND') {
+            return 'The main note is missing. Distortion may be hiding it.';
+        }
+        if (sum.likelyCause) return sum.likelyCause;
+        return 'Power chord root/fifth check did not pass. Try the dry/clean channel to compare.';
+    }
+
+    function _calLabFormatPowerChordSum(st) {
+        const caps = (st.techniqueCaptures && st.techniqueCaptures.powerChord) || [];
+        const sum = _calLabSummarizePowerChordCaptures(caps);
+        if (!sum.n) return 'No captures yet — press Capture while playing.';
+        const rootPct = sum.root.passRate != null ? Math.round(sum.root.passRate * 100) : '—';
+        const fifthPct = sum.fifth.passRate != null ? Math.round(sum.fifth.passRate * 100) : '—';
+        const rootWeak = _calLabDominantFailLabel(sum.root.dominantFailure);
+        const fifthWeak = _calLabDominantFailLabel(sum.fifth.dominantFailure);
+        let line = `${sum.n} captures · root pass ${rootPct}% · fifth pass ${fifthPct}%`
+            + ` · root weakest: ${rootWeak} · fifth weakest: ${fifthWeak}`;
+        if (sum.likelyCause) line += ` · ${sum.likelyCause}`;
+        return line;
+    }
+
+    function _calLabMusicianStringRowLabel(s, fret, stringName) {
+        if (s === 0 && fret === 0) return 'thickest string, open';
+        if (s === 1 && fret === 0) return 'next string, open';
+        if (s === 0 && fret === 5) return 'thickest string, 5th fret';
+        const fretTxt = fret === 0 ? 'open' : `fret ${fret}`;
+        return `${stringName || 'string'} · ${fretTxt}`;
+    }
+
+    function _calLabBuildSimpleReportBullets(rep) {
+        const bullets = [];
+        bullets.push('This report did not change gameplay settings.');
+        const hw = rep.hardware || {};
+        if (Number.isFinite(hw.noise_level_pct) && hw.noise_level_pct >= 5) {
+            bullets.push('Your signal is quiet or noisy — check room noise and input gain.');
+        }
+        if (Number.isFinite(hw.signal_level_pct) && hw.signal_level_pct < 5) {
+            bullets.push('Your playing level looks low — try playing louder or raising input gain.');
+        }
+        let fundFails = 0;
+        for (const t of (rep.per_technique || [])) {
+            if (!t.summary || !t.summary.failCounts) continue;
+            fundFails += t.summary.failCounts.FUND || 0;
+        }
+        for (const ps of (rep.per_string || [])) {
+            if (ps.open && ps.open.summary && ps.open.summary.failCounts) {
+                fundFails += ps.open.summary.failCounts.FUND || 0;
+            }
+            if (ps.fret5 && ps.fret5.summary && ps.fret5.summary.failCounts) {
+                fundFails += ps.fret5.summary.failCounts.FUND || 0;
+            }
+        }
+        if (fundFails >= 2) {
+            bullets.push('The main note is missing on several tests. Distortion may be hiding it.');
+        }
+        const pwr = rep.power_chord_diagnostics;
+        if (pwr && pwr.root && pwr.fifth) {
+            const rootOk = pwr.root.passRate != null && pwr.root.passRate >= 0.5;
+            const fifthOk = pwr.fifth.passRate != null && pwr.fifth.passRate >= 0.5;
+            if (!rootOk || !fifthOk) {
+                bullets.push('Power chord root/fifth check did not fully pass.');
+            }
+            if (pwr.likely_cause) {
+                bullets.push(pwr.likely_cause);
+            }
+            if (!rootOk || !fifthOk) {
+                bullets.push('Try the dry/clean channel to compare against a wet tone.');
+            }
+        }
+        if (bullets.length === 1) {
+            bullets.push('No major issues detected from your captures — review details if something still feels off.');
+        }
+        return bullets;
+    }
+
+    function _calLabBuildPowerChordReportSummary(caps) {
+        const sum = _calLabSummarizePowerChordCaptures(caps || []);
+        const snap = getCalibrationSnapshot();
+        let detectorPath = null;
+        try {
+            if (_diagDetector && _diagDetector.path) detectorPath = _diagDetector.path;
+            else if (_ndUsingEngineVerifier) detectorPath = 'desktop-engine-verifier';
+        } catch (_) { /* read-only */ }
+        return {
+            root: sum.root,
+            fifth: sum.fifth,
+            likely_cause: sum.likelyCause,
+            input_channel: snap.channel || selectedChannel,
+            detector_path: detectorPath,
+            aggregate: {
+                n: sum.n,
+                hitRate: sum.hitRate,
+                medianSnrRatio: sum.medianSnrRatio,
+                dominantFailure: sum.dominantFailure,
+            },
+        };
+    }
+
+    function _calLabCanProbe() {
+        return !!(enabled && usingDesktopBridge && _ndBridgeScoreAvailable());
+    }
+
+    async function _calLabRunScoreProbe(notes) {
+        if (!_calLabCanProbe()) return null;
+        const ctx = {
+            arrangement: currentArrangement,
+            stringCount: currentStringCount,
+            offsets: tuningOffsets.slice(0, currentStringCount),
+            capo,
+            pitchCheckCents: pitchTolerance,
+            minHitRatio: chordHitRatio,
+            bypassMl: true,
+            harmonicVerify: true,
+            harmonicSnr: _ND_VERIFY_HARMONIC_SNR,
+            notes: notes.map((n) => ({
+                s: n.s,
+                f: n.f,
+                ho: !!n.ho,
+                po: !!n.po,
+                b: !!n.b,
+                sl: !!n.sl,
+                hm: !!n.hm,
+            })),
+        };
+        try {
+            return await _ndBridgeScoreChord(ctx);
+        } catch (e) {
+            console.warn('[note_detect] cal lab scoreChord:', e);
+            return null;
+        }
+    }
+
+    async function _calLabCaptureProbe(noteDef, technique) {
+        const batch = await _calLabRunScoreProbe([noteDef]);
+        if (!batch || !Array.isArray(batch.results) || !batch.results.length) {
+            return { ok: false, error: 'probe_failed' };
+        }
+        const r = batch.results[0];
+        const flags = {
+            ho: !!noteDef.ho, po: !!noteDef.po,
+            b: !!noteDef.b, sl: !!noteDef.sl, hm: !!noteDef.hm,
+        };
+        const tick = _calLabTickFromResult(r, flags);
+        return {
+            ok: true,
+            at: Date.now(),
+            technique: technique || null,
+            string: noteDef.s,
+            fret: noteDef.f,
+            flags,
+            ...tick,
+        };
+    }
+
+    async function _calLabCaptureMulti(notes, technique) {
+        const batch = await _calLabRunScoreProbe(notes);
+        if (!batch || !Array.isArray(batch.results)) return { ok: false, error: 'probe_failed' };
+        const perNote = batch.results.map((r, i) => {
+            const nd = notes[i] || { s: r.s, f: r.f };
+            const flags = {
+                ho: !!nd.ho, po: !!nd.po,
+                b: !!nd.b, sl: !!nd.sl, hm: !!nd.hm,
+            };
+            return { string: nd.s, fret: nd.f, ..._calLabTickFromResult(r, flags) };
+        });
+        return {
+            ok: true,
+            at: Date.now(),
+            technique: technique || null,
+            notes: perNote,
+            batchHit: !!batch.isHit,
+        };
+    }
+
+    // Per-note ticks from a capture — supports single-note probes and multi-note
+    // power-chord captures (metrics live under notes[]).
+    function _calLabCaptureTicks(capture) {
+        if (capture && Array.isArray(capture.notes) && capture.notes.length) {
+            return capture.notes.map((n) => ({
+                snrRatio: n.snrRatio,
+                gatePassCount: n.gatePassCount,
+                failedGateMask: n.failedGateMask,
+                hit: n.hit,
+            }));
+        }
+        return [{
+            snrRatio: capture && capture.snrRatio,
+            gatePassCount: capture && capture.gatePassCount,
+            failedGateMask: capture && capture.failedGateMask,
+            hit: capture && capture.hit,
+        }];
+    }
+
+    function _calLabCaptureHit(capture) {
+        if (capture && Array.isArray(capture.notes) && capture.notes.length) {
+            if (capture.batchHit) return true;
+            return capture.notes.every((n) => n.hit || n.gatePassCount === 3);
+        }
+        return !!(capture && (capture.hit || capture.gatePassCount === 3));
+    }
+
+    function _calLabSummarizeTicks(ticks, captureCount, hitRate) {
+        const ratios = ticks.map((t) => t.snrRatio).filter(Number.isFinite);
+        const gates = ticks.map((t) => t.gatePassCount).filter(Number.isFinite);
+        const masks = ticks.map((t) => t.failedGateMask | 0);
+        const failCounts = { SNR: 0, FUND: 0, PITCH: 0 };
+        for (const m of masks) {
+            if (m & _CAL_LAB_FAIL.SNR) failCounts.SNR++;
+            if (m & _CAL_LAB_FAIL.FUND) failCounts.FUND++;
+            if (m & _CAL_LAB_FAIL.PITCH) failCounts.PITCH++;
+        }
+        let dominantFailure = null;
+        let maxF = 0;
+        for (const [k, v] of Object.entries(failCounts)) {
+            if (v > maxF) { maxF = v; dominantFailure = k; }
+        }
+        return {
+            n: captureCount,
+            avgSnrRatio: _calLabAvg(ratios),
+            medianSnrRatio: _calLabMedian(ratios),
+            bestSnrRatio: ratios.length ? Math.max(...ratios) : null,
+            minSnrRatio: ratios.length ? Math.min(...ratios) : null,
+            avgGatePassCount: _calLabAvg(gates),
+            hitRate,
+            dominantFailure,
+            failCounts,
+        };
+    }
+
+    function _calLabSummarizeCaptures(captures) {
+        const caps = captures || [];
+        const ticks = caps.flatMap((c) => _calLabCaptureTicks(c));
+        const hitRate = caps.length
+            ? caps.filter((c) => _calLabCaptureHit(c)).length / caps.length
+            : null;
+        return _calLabSummarizeTicks(ticks, caps.length, hitRate);
+    }
+
+    function _calLabSummarizeSustainSeries(series) {
+        const samples = series || [];
+        const ticks = samples.map((s) => ({
+            snrRatio: s.snrRatio,
+            gatePassCount: s.gatePassCount,
+            failedGateMask: s.failedGateMask,
+        }));
+        const hitRate = samples.length
+            ? samples.filter((s) => s.gatePassCount === 3).length / samples.length
+            : null;
+        return _calLabSummarizeTicks(ticks, samples.length, hitRate);
+    }
+
+    function _calLabBuildRecommendations(report) {
+        const rec = [];
+        const thr = report.settings && report.settings.harmonic_snr_used;
+        for (const t of (report.per_technique || [])) {
+            if (!t.summary || !t.summary.n) continue;
+            const med = t.summary.medianSnrRatio;
+            const dom = t.summary.dominantFailure;
+            if (Number.isFinite(med) && thr && med < 0.9 && dom === 'SNR') {
+                rec.push(`${t.label}: SNR frequently weak (median ratio ${med.toFixed(2)} vs threshold ${thr}).`);
+            } else if (Number.isFinite(med) && thr && med < 1.0 && dom === 'SNR') {
+                rec.push(`${t.label}: SNR often below threshold (median ratio ${med.toFixed(2)}).`);
+            }
+            if (dom === 'FUND' && (t.summary.failCounts.FUND || 0) >= 2) {
+                rec.push(`${t.label}: fundamental gate failures common on best-frame probes.`);
+            }
+            if (dom === 'PITCH' && (t.summary.failCounts.PITCH || 0) >= 2) {
+                rec.push(`${t.label}: pitch gate failures observed (may include bend travel).`);
+            }
+        }
+        for (const s of (report.per_string || [])) {
+            if (!s.open || !s.open.summary || !s.open.summary.n) continue;
+            const med = s.open.summary.medianSnrRatio;
+            if (Number.isFinite(med) && med < 0.85) {
+                rec.push(`String ${s.string} open: weak SNR (median ratio ${med.toFixed(2)}).`);
+            }
+        }
+        if (report.hardware && Number.isFinite(report.hardware.noise_level_pct)
+            && report.hardware.noise_level_pct >= 5) {
+            rec.push('Noise floor looks elevated — check room noise or input gain.');
+        }
+        if (report.hardware && Number.isFinite(report.hardware.signal_level_pct)
+            && report.hardware.signal_level_pct < 5) {
+            rec.push('Signal level looks low — increase interface gain or play louder.');
+        }
+        const halfCaps = ((report.per_technique || []).find((t) => t.id === 'halfBend') || {}).captures || [];
+        const wholeCaps = ((report.per_technique || []).find((t) => t.id === 'wholeBend') || {}).captures || [];
+        if (halfCaps.length || wholeCaps.length) {
+            rec.push('Half bends and whole bends currently use the same native bend probe; compare results as labeled technique captures, not distinct detector modes.');
+        }
+        const pwrDiag = report.power_chord_diagnostics;
+        if (pwrDiag && pwrDiag.root && pwrDiag.root.n >= 2 && pwrDiag.likely_cause) {
+            rec.push(`Power chords: ${pwrDiag.likely_cause}`);
+        }
+        if (!rec.length) rec.push('No strong patterns detected — collect more captures or review per-step summaries.');
+        return rec;
+    }
+
+    function _calLabBuildReport() {
+        const snap = getCalibrationSnapshot();
+        const st = _calLabState || {};
+        const perString = [];
+        for (let si = 0; si < currentStringCount; si++) {
+            const openCaps = (st.openCaptures && st.openCaptures[si]) || [];
+            const fretCaps = (st.fretCaptures && st.fretCaptures[si]) || [];
+            perString.push({
+                string: si,
+                open: { captures: openCaps, summary: _calLabSummarizeCaptures(openCaps) },
+                fret5: { captures: fretCaps, summary: _calLabSummarizeCaptures(fretCaps) },
+            });
+        }
+        const techniqueKeys = [
+            ['picked', 'Picked notes'],
+            ['hammerOn', 'Hammer-ons'],
+            ['pullOff', 'Pull-offs'],
+            ['powerChord', 'Power chords'],
+            ['palmMute', 'Palm mutes'],
+            ['naturalHarmonic', 'Natural harmonics'],
+            ['pinchHarmonic', 'Pinch harmonics'],
+            ['halfBend', 'Half bends'],
+            ['wholeBend', 'Whole bends'],
+            ['sustain', 'Sustain / decay'],
+        ];
+        const perTechnique = techniqueKeys.map(([key, label]) => {
+            const caps = (st.techniqueCaptures && st.techniqueCaptures[key]) || [];
+            let summary;
+            if (key === 'sustain' && (st.sustainSeries || []).length) {
+                summary = _calLabSummarizeSustainSeries(st.sustainSeries);
+            } else if (key === 'powerChord') {
+                summary = _calLabSummarizePowerChordCaptures(caps);
+            } else {
+                summary = _calLabSummarizeCaptures(caps);
+            }
+            const entry = { id: key, label, captures: caps, summary };
+            if (key === 'powerChord') {
+                entry.per_string_summary = _calLabBuildPowerChordReportSummary(caps);
+            }
+            return entry;
+        });
+        const powerChordCaps = (st.techniqueCaptures && st.techniqueCaptures.powerChord) || [];
+        const report = {
+            schema: _CAL_LAB_SCHEMA,
+            timestamp: new Date().toISOString(),
+            plugin_version: _ND_VERSION,
+            assessment_mode: st.mode || null,
+            calibration_notes: [
+                'Half bends and whole bends use the same native bend probe (G string fret 7, bend flag); labels distinguish technique captures only.',
+            ],
+            settings: {
+                harmonic_snr_used: _ND_VERIFY_HARMONIC_SNR,
+                pitch_tolerance_cents: pitchTolerance,
+                pitch_check_cents_verify: _ND_VERIFY_PITCH_CENTS,
+                timing_tolerance_s: timingTolerance,
+                latency_offset_s: latencyOffset,
+                input_gain: inputGain,
+                method: detectionMethod,
+            },
+            hardware: {
+                noise_level_pct: st.noiseLevelPct,
+                noise_peak_pct: st.noisePeakPct,
+                signal_level_pct: st.signalLevelPct,
+                signal_peak_pct: st.signalPeakPct,
+                sample_rate_hz: snap.sampleRateHz,
+                channel: snap.channel,
+                source: snap.source,
+                av_offset_ms: snap.avOffsetMs,
+            },
+            per_string: perString,
+            per_technique: perTechnique,
+            sustain_series: (st.sustainSeries || []),
+            power_chord_diagnostics: _calLabBuildPowerChordReportSummary(powerChordCaps),
+        };
+        report.recommendations = _calLabBuildRecommendations(report);
+        report.simple_summary = _calLabBuildSimpleReportBullets(report);
+        _calLabLastReport = report;
+        return report;
+    }
+
+    function _calLabDownloadReport() {
+        try {
+            const payload = _calLabBuildReport();
+            const json = JSON.stringify(payload, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const ts = payload.timestamp.replace(/[:.]/g, '-').slice(0, 19);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `note_detect_calibration_${ts}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 500);
+            return true;
+        } catch (e) {
+            console.warn('[note_detect] calibration report download:', e);
+            return false;
+        }
+    }
+
+    function calibrationLabClose() {
+        _calLabStopAutoCapture('close');
+        if (_calLabTick) {
+            clearInterval(_calLabTick);
+            _calLabTick = null;
+        }
+        if (_calLabEl) {
+            _calLabEl.remove();
+            _calLabEl = null;
+        }
+        _calLabState = null;
+    }
+
+    function _calLabAllStepMeta() {
+        return [
+            { id: 'intro', title: 'Get Started' },
+            { id: 'noise', title: 'Noise Floor' },
+            { id: 'signal', title: 'Signal Level' },
+            { id: 'open', title: 'Open Strings' },
+            { id: 'fret5', title: 'Fretted Note' },
+            { id: 'picked', title: 'Picked Notes' },
+            { id: 'hammerOn', title: 'Hammer-ons' },
+            { id: 'pullOff', title: 'Pull-offs' },
+            { id: 'powerChord', title: 'Power Chords' },
+            { id: 'palmMute', title: 'Palm Mutes' },
+            { id: 'naturalHarmonic', title: 'Natural Harmonics' },
+            { id: 'pinchHarmonic', title: 'Pinch Harmonics' },
+            { id: 'halfBend', title: 'Half Bends' },
+            { id: 'wholeBend', title: 'Whole Bends' },
+            { id: 'sustain', title: 'Sustain / Decay' },
+            { id: 'report', title: 'Report' },
+        ];
+    }
+
+    function _calLabActiveSteps(mode) {
+        if (!mode) return [{ id: 'intro', title: 'Get Started' }];
+        return _calLabAllStepMeta().filter((s) => {
+            if (s.id === 'intro') return false;
+            if (mode === 'basic') return !_CAL_LAB_ADVANCED_ONLY_STEP_IDS.has(s.id);
+            return true;
+        });
+    }
+
+    function _calLabStringCaptureRowHtml(st, store, s, f, label, opts) {
+        const caps = (st[store] && st[store][s]) || [];
+        const sum = _calLabSummarizeCaptures(caps);
+        const lastCap = caps.length ? caps[caps.length - 1] : null;
+        const chips = _calLabGateChipsHtml(lastCap);
+        const techDetail = opts && opts.showTech
+            ? `<span class="text-[9px] text-gray-600"> (s${s} f${f})</span>` : '';
+        const countNote = (opts && opts.showCount)
+            ? ` · ${caps.length}/${_CAL_LAB_MIN_CAPTURES} checks` : '';
+        const status = caps.length
+            ? (lastCap && (lastCap.hit || lastCap.gatePassCount === 3)
+                ? '<span class="text-green-300/90 text-[10px]">heard</span>'
+                : '<span class="text-amber-200/90 text-[10px]">not verified</span>')
+            : '';
+        return `<div class="flex flex-col gap-0.5 py-2 border-b border-gray-700/50">
+            <p class="text-gray-300 text-xs mb-1">${label}${techDetail}</p>
+            <div class="flex items-center justify-between gap-2">
+                <span class="text-gray-400 text-[10px]">${countNote.trim() || 'Ready'} ${status}</span>
+                <button type="button" class="nd-cal-lab-cap-str px-2 py-1 rounded text-[10px] bg-dark-600 hover:bg-dark-500 text-gray-200" data-store="${store}" data-s="${s}" data-f="${f}">${opts && opts.btnLabel ? opts.btnLabel : 'Capture'}</button>
+            </div>${chips ? `<div class="mt-0.5">${chips}</div>` : ''}</div>`;
+    }
+
+    function _calLabStringLabels() {
+        const labels = ['E', 'A', 'D', 'G', 'B', 'e', 'B7', 'F#'];
+        const out = [];
+        for (let i = 0; i < currentStringCount; i++) {
+            out.push({ s: i, label: labels[i] || ('S' + i) });
+        }
+        return out;
+    }
+
+    function _calLabRefreshLive() {
+        if (!_calLabEl || !_calLabState) return;
+        const snap = getCalibrationSnapshot();
+        const live = _calLabEl.querySelector('.nd-cal-lab-live');
+        if (live) {
+            live.textContent = 'Live: ' + calibrationFormatLevel(snap.inputLevelPct, snap.inputPeakPct)
+                + (_calLabCanProbe() ? ' · ready to capture' : ' · turn Detect on (desktop) to capture');
+        }
+    }
+
+    function renderCalibrationLab() {
+        if (!_calLabEl || !_calLabState) return;
+        const body = _calLabEl.querySelector('.nd-cal-lab-body');
+        const title = _calLabEl.querySelector('.nd-cal-lab-title');
+        const backBtn = _calLabEl.querySelector('.nd-cal-lab-back');
+        const nextBtn = _calLabEl.querySelector('.nd-cal-lab-next');
+        if (!body || !title) return;
+        const st = _calLabState;
+        const steps = _calLabActiveSteps(st.mode);
+        const step = st.step;
+        const stepDef = steps[step];
+        const stepId = stepDef ? stepDef.id : 'intro';
+        if (st._lastRenderStepId !== stepId || st._lastRenderMode !== st.mode) {
+            _calLabStopAutoCapture('step-change');
+            st._lastRenderStepId = stepId;
+            st._lastRenderMode = st.mode;
+        }
+        const modeLabel = st.mode === 'basic' ? 'Basic' : (st.mode === 'advanced' ? 'Advanced' : '');
+        title.textContent = modeLabel
+            ? `Technique Assessment — ${modeLabel} · ${stepDef ? stepDef.title : 'Step'}`
+            : `Technique Assessment — ${stepDef ? stepDef.title : 'Get Started'}`;
+        if (backBtn) backBtn.style.visibility = (st.mode && step > 0) ? 'visible' : 'hidden';
+        if (nextBtn) {
+            if (!st.mode) {
+                nextBtn.style.visibility = 'hidden';
+                nextBtn.disabled = false;
+            } else {
+                nextBtn.style.visibility = 'visible';
+                nextBtn.textContent = step >= steps.length - 1 ? 'Done' : 'Next';
+                nextBtn.disabled = _calLabIsAutoBusy(st);
+            }
+        }
+
+        let html = `<div class="nd-cal-lab-live text-cyan-300/90 text-[10px] font-mono mb-2">Live: —</div>`;
+        if (!_calLabCanProbe() && st.mode && stepId !== 'report') {
+            html += '<p class="text-amber-200/90 text-[10px] mb-2">Turn Detect on (desktop) to run listening checks.</p>';
+        }
+
+        if (stepId === 'intro') {
+            html += `<p class="text-gray-300 text-xs mb-3"><strong class="text-gray-200">Calibration Wizard</strong> sets up your input. <strong class="text-gray-200">Technique Assessment</strong> checks how well Slopsmith hears your playing.</p>
+                <p class="text-gray-300 text-xs mb-3">Each check looks at <strong class="text-gray-200">signal clarity</strong>, whether the <strong class="text-gray-200">main note</strong> is present, and <strong class="text-gray-200">tuning match</strong>. Read-only — nothing here changes gameplay settings.</p>
+                <button type="button" class="nd-cal-lab-start-basic w-full py-2.5 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white mb-2">Start Basic Assessment</button>
+                <p class="text-[10px] text-gray-500 mb-3">Checks input level, open strings, one fretted note, and one power chord. Best first step.</p>
+                <button type="button" class="nd-cal-lab-start-advanced w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Advanced Assessment</button>
+                <p class="text-[10px] text-gray-500">Detailed probes: hammer-ons, pull-offs, palm mutes, harmonics, bends, and sustain.</p>`;
+        } else if (stepId === 'noise') {
+            if (st.mode === 'basic') {
+                const busy = _calLabIsAutoBusy(st);
+                const done = st.autoRun && st.autoRun.phase === 'done' && st.autoRun.stepId === 'noise';
+                const noiseResult = Number.isFinite(st.noiseLevelPct)
+                    ? calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct) : '—';
+                html += `<p class="text-gray-300 text-sm mb-2">Mute all strings. We will listen to room noise.</p>
+                    ${_calLabBasicAutoControlsHtml('noise', 'Start noise check', busy, done)}
+                    <div class="nd-cal-lab-auto-status text-[11px] text-gray-300 mb-2 min-h-[2.5rem]"></div>
+                    <div class="nd-cal-lab-auto-result text-[11px] text-gray-400 mb-2">${noiseResult}</div>
+                    <details class="mb-2"><summary class="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 py-1">Manual capture options</summary>
+                        <button type="button" class="nd-cal-lab-cap-noise w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2 mt-1">Capture room noise (manual)</button>
+                    </details>`;
+            } else {
+                html += `<p class="text-gray-300 text-xs mb-2">Mute all strings and rest your hands on the strings.</p>
+                    <button type="button" class="nd-cal-lab-cap-noise w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Capture room noise</button>
+                    <div class="nd-cal-lab-cap-noise-txt text-[11px] text-gray-400">—</div>`;
+            }
+        } else if (stepId === 'signal') {
+            if (st.mode === 'basic') {
+                const busy = _calLabIsAutoBusy(st);
+                const done = st.autoRun && st.autoRun.phase === 'done' && st.autoRun.stepId === 'signal';
+                const sigResult = Number.isFinite(st.signalLevelPct)
+                    ? calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct) : '—';
+                html += `<p class="text-gray-300 text-sm mb-2">Play the thickest string loudly.</p>
+                    ${_calLabBasicAutoControlsHtml('signal', 'Start signal check', busy, done)}
+                    <div class="nd-cal-lab-auto-status text-[11px] text-gray-300 mb-2 min-h-[2.5rem]"></div>
+                    <div class="nd-cal-lab-auto-result text-[11px] text-gray-400 mb-2">${sigResult}</div>
+                    <details class="mb-2"><summary class="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 py-1">Manual capture options</summary>
+                        <button type="button" class="nd-cal-lab-cap-signal w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2 mt-1">Capture playing level (manual)</button>
+                    </details>`;
+            } else {
+                html += `<p class="text-gray-300 text-xs mb-2">Play the thickest string open at normal volume.</p>
+                    <button type="button" class="nd-cal-lab-cap-signal w-full py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-200 mb-2">Capture playing level</button>
+                    <div class="nd-cal-lab-cap-signal-txt text-[11px] text-gray-400">—</div>`;
+            }
+        } else if (stepId === 'open' || stepId === 'fret5') {
+            const fret = stepId === 'open' ? 0 : 5;
+            const store = stepId === 'open' ? 'openCaptures' : 'fretCaptures';
+            if (st.mode === 'basic') {
+                const rows = stepId === 'open' ? _CAL_LAB_BASIC_OPEN_ROWS : _CAL_LAB_BASIC_FRET_ROWS;
+                const busy = _calLabIsAutoBusy(st);
+                const autoKey = stepId === 'open' ? 'open' : 'fret5';
+                const done = st.autoRun && st.autoRun.phase === 'done' && st.autoRun.stepId === autoKey;
+                const startLabel = stepId === 'open' ? 'Start open-string check' : 'Start fretted-note check';
+                const instruct = stepId === 'open'
+                    ? 'We will check the thickest string open, then the next string open.'
+                    : 'Play the thickest string at the 5th fret when prompted.';
+                let summaryHtml = '';
+                for (const row of rows) {
+                    const caps = (st[store] && st[store][row.s]) || [];
+                    const lastCap = caps.length ? caps[caps.length - 1] : null;
+                    const chips = _calLabGateChipsHtml(lastCap);
+                    const heard = caps.length
+                        ? (lastCap && (lastCap.hit || lastCap.gatePassCount === 3)
+                            ? '<span class="text-green-300/90">heard</span>'
+                            : '<span class="text-amber-200/90">not verified</span>')
+                        : '<span class="text-gray-500">not checked</span>';
+                    summaryHtml += `<div class="py-1 border-b border-gray-700/40 text-[10px]">
+                        <span class="text-gray-300">${row.prompt}</span> · ${caps.length} captures · ${heard}
+                        ${chips ? `<div class="mt-0.5">${chips}</div>` : ''}</div>`;
+                }
+                html += `<p class="text-gray-300 text-sm mb-2">${instruct}</p>
+                    ${_calLabBasicAutoControlsHtml(autoKey, startLabel, busy, done)}
+                    <div class="nd-cal-lab-auto-status text-[11px] text-gray-300 mb-2 min-h-[2.5rem]"></div>
+                    <div class="nd-cal-lab-auto-summary text-[10px] text-gray-400 mb-2">${summaryHtml}</div>
+                    <details class="mb-2"><summary class="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 py-1">Manual capture options</summary>
+                        <div class="mt-1">`;
+                for (const row of rows) {
+                    html += _calLabStringCaptureRowHtml(st, store, row.s, row.f, row.prompt, {
+                        btnLabel: row.btn,
+                    });
+                }
+                html += `</div></details>`;
+            } else {
+                html += `<p class="text-gray-300 text-xs mb-2">Play each string ${fret === 0 ? 'open' : `at fret ${fret}`}. Capture while the note rings.</p>`;
+                for (const { s, label } of _calLabStringLabels()) {
+                    const musician = _calLabMusicianStringRowLabel(s, fret, label);
+                    html += _calLabStringCaptureRowHtml(st, store, s, fret, musician, {
+                        showTech: true,
+                        showCount: true,
+                        btnLabel: `Capture ${musician}`,
+                    });
+                }
+            }
+        } else if (stepId === 'picked') {
+            html += `<p class="text-gray-300 text-xs mb-2">Pick single notes (e.g. 12th fret). Capture while playing.</p>
+                <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="picked" data-s="0" data-f="12">Capture picked sample (low E @ 12)</button>
+                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'picked')}</div>`;
+        } else if (stepId === 'hammerOn') {
+            html += `<p class="text-gray-300 text-xs mb-2">Hammer onto fret 5 on A string (from fret 3). Capture during hammer.</p>
+                <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="hammerOn" data-s="1" data-f="5" data-ho="1">Capture hammer-on</button>
+                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'hammerOn')}</div>`;
+        } else if (stepId === 'pullOff') {
+            html += `<p class="text-gray-300 text-xs mb-2">Pull-off from fret 5 to 3 on A string. Capture during pull-off.</p>
+                <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="pullOff" data-s="1" data-f="3" data-po="1">Capture pull-off</button>
+                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'pullOff')}</div>`;
+        } else if (stepId === 'powerChord') {
+            const pwrCaps = (st.techniqueCaptures && st.techniqueCaptures.powerChord) || [];
+            const pwrCaptureBlocks = pwrCaps.length
+                ? pwrCaps.map((cap, i) => _calLabPowerChordCaptureBlockHtml(cap, i)).join('')
+                : '';
+            const simpleDiag = _calLabPowerChordSimpleDiagnosis(st);
+            if (st.mode === 'basic') {
+                const busy = _calLabIsAutoBusy(st);
+                const done = st.autoRun && st.autoRun.phase === 'done' && st.autoRun.stepId === 'powerChord';
+                html += `<p class="text-gray-300 text-sm mb-2">Play a power chord: thickest string open + next string 2nd fret.</p>
+                    <p class="text-[10px] text-gray-500 mb-2">Try the dry/clean channel if available to compare against a wet tone.</p>
+                    ${_calLabBasicAutoControlsHtml('powerChord', 'Start power-chord check', busy, done)}
+                    <div class="nd-cal-lab-auto-status text-[11px] text-gray-300 mb-2 min-h-[2.5rem]"></div>
+                    <p class="nd-cal-lab-pwr-diag-live text-[11px] text-gray-200 mb-2">${simpleDiag}</p>
+                    ${pwrCaptureBlocks ? `<details class="mb-2"><summary class="text-[10px] text-gray-400 cursor-pointer hover:text-gray-200 py-1">Technical capture details</summary>
+                        <div class="nd-cal-lab-tech-sum text-[10px] text-gray-500 mt-1 mb-2">${_calLabFormatPowerChordSum(st)}</div>
+                        <div class="nd-cal-lab-pwr-captures">${pwrCaptureBlocks}</div></details>` : ''}
+                    <details class="mb-2"><summary class="text-[10px] text-gray-500 cursor-pointer hover:text-gray-300 py-1">Manual capture options</summary>
+                        <button type="button" class="nd-cal-lab-cap-pwr w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2 mt-1">Capture power chord (manual)</button>
+                    </details>`;
+            } else {
+                html += `<p class="text-gray-300 text-xs mb-2">Play a power chord: thickest string open + next string at the 2nd fret. Capture while both ring.</p>
+                    <p class="text-[10px] text-gray-500 mb-2">Power chords are tested per string. If the root passes but the fifth fails, the issue is usually masking, distortion, or channel choice — not your timing.</p>
+                    <p class="text-[10px] text-gray-500 mb-2">Try the dry/clean channel if available to compare against a wet Spark tone.</p>
+                    <button type="button" class="nd-cal-lab-cap-pwr w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2">Capture power chord</button>
+                    <p class="text-[11px] text-gray-200 mb-2">${simpleDiag}</p>
+                    ${pwrCaptureBlocks ? `<details class="mb-2"><summary class="text-[10px] text-gray-400 cursor-pointer hover:text-gray-200 py-1">Technical capture details</summary>
+                        <div class="nd-cal-lab-tech-sum text-[10px] text-gray-500 mt-1 mb-2">${_calLabFormatPowerChordSum(st)}</div>
+                        <div class="nd-cal-lab-pwr-captures">${pwrCaptureBlocks}</div></details>` : ''}`;
+            }
+        } else if (stepId === 'palmMute') {
+            html += `<p class="text-gray-300 text-xs mb-2">Palm-muted chugs on low E.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">Note: charts do not flag palm mutes yet — this probe uses a picked-note context. Results show how muted playing verifies, not chart palm-mute scoring.</p>
+                <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="palmMute" data-s="0" data-f="0">Capture palm mute</button>
+                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'palmMute')}</div>`;
+        } else if (stepId === 'naturalHarmonic') {
+            html += `<p class="text-gray-300 text-xs mb-2">Natural harmonic at 12th fret low E. Capture lightly.</p>
+                <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="naturalHarmonic" data-s="0" data-f="12" data-hm="1">Capture natural harmonic</button>
+                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'naturalHarmonic')}</div>`;
+        } else if (stepId === 'pinchHarmonic') {
+            html += `<p class="text-gray-300 text-xs mb-2">Pinch harmonic on any string.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">Note: charts do not flag pinch harmonics yet — this probe uses picked-note context.</p>
+                <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="pinchHarmonic" data-s="2" data-f="7">Capture pinch harmonic</button>
+                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'pinchHarmonic')}</div>`;
+        } else if (stepId === 'halfBend') {
+            html += `<p class="text-gray-300 text-xs mb-2">Half bend at 7th fret G string. Capture mid-bend and release.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">Half and whole bends use the same detector probe — labels distinguish your technique, not separate detector modes.</p>
+                <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="halfBend" data-s="3" data-f="7" data-b="1">Capture half bend</button>
+                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'halfBend')}</div>`;
+        } else if (stepId === 'wholeBend') {
+            html += `<p class="text-gray-300 text-xs mb-2">Whole-step bend at 7th fret G string.</p>
+                <p class="text-[10px] text-amber-200/80 mb-2">Same probe as half bends — compare results as labeled captures, not distinct modes.</p>
+                <button type="button" class="nd-cal-lab-cap-tech w-full py-2 bg-dark-600 rounded text-xs mb-2" data-tech="wholeBend" data-s="3" data-f="7" data-b="1">Capture whole bend</button>
+                <div class="nd-cal-lab-tech-sum text-[11px] text-gray-400">${_calLabFormatTechSum(st, 'wholeBend')}</div>`;
+        } else if (stepId === 'sustain') {
+            html += `<p class="text-gray-300 text-xs mb-2">Hold a note (open low E). Record polls SNR over ~1.5 s.</p>
+                <button type="button" class="nd-cal-lab-cap-sustain w-full py-2 bg-accent hover:bg-accent-light rounded text-xs font-semibold text-white mb-2">Record sustain</button>
+                <div class="nd-cal-lab-sustain-txt text-[11px] text-gray-400">${(st.sustainSeries || []).length} samples</div>`;
+        } else if (stepId === 'report') {
+            const rep = _calLabBuildReport();
+            const simpleBullets = _calLabBuildSimpleReportBullets(rep);
+            const simpleHtml = simpleBullets.map((t) => `<li class="text-gray-200">${t}</li>`).join('');
+            const recHtml = (rep.recommendations || []).map((t) => `<li class="text-amber-200/90">${t}</li>`).join('');
+            html += `<p class="text-gray-300 text-xs mb-2">Your Technique Assessment results. This did not change gameplay settings.</p>
+                <ul class="text-[11px] list-disc pl-4 mb-3 space-y-1">${simpleHtml}</ul>
+                <button type="button" class="nd-cal-lab-dl w-full py-2 bg-dark-600 hover:bg-dark-500 rounded text-xs text-gray-200 mb-2">Download full report (JSON)</button>
+                <details class="mb-2"><summary class="text-[10px] text-gray-400 cursor-pointer hover:text-gray-200 py-1">Technical details</summary>
+                    <ul class="text-[10px] list-disc pl-4 mb-2 space-y-0.5 mt-2">${recHtml || '<li class="text-gray-500">No extra technical notes.</li>'}</ul>
+                    <pre class="text-[9px] text-gray-500 max-h-32 overflow-auto whitespace-pre-wrap">${_calLabReportPreview(rep)}</pre>
+                </details>`;
+        }
+
+        body.innerHTML = html;
+        _calLabWireHandlers();
+        _calLabRefreshLive();
+    }
+
+    function _calLabFormatTechSum(st, key) {
+        if (key === 'powerChord') return _calLabFormatPowerChordSum(st);
+        let sum;
+        let lastCap = null;
+        if (key === 'sustain' && (st.sustainSeries || []).length) {
+            sum = _calLabSummarizeSustainSeries(st.sustainSeries);
+            const s = st.sustainSeries[st.sustainSeries.length - 1];
+            if (s) lastCap = { gatePassCount: s.gatePassCount, failedGateMask: s.failedGateMask };
+        } else {
+            const caps = (st.techniqueCaptures && st.techniqueCaptures[key]) || [];
+            sum = _calLabSummarizeCaptures(caps);
+            lastCap = caps.length ? caps[caps.length - 1] : null;
+        }
+        if (!sum.n) return 'No captures yet — press Capture while playing.';
+        const unit = key === 'sustain' ? 'samples' : 'captures';
+        const weak = _calLabDominantFailLabel(sum.dominantFailure);
+        const chips = _calLabGateChipsHtml(lastCap);
+        return `${sum.n} ${unit} · weakest area: ${weak}${chips ? ' · ' : ''}${chips}`;
+    }
+
+    function _calLabReportPreview(rep) {
+        try {
+            const lines = [];
+            for (const t of (rep.per_technique || [])) {
+                if (!t.summary || !t.summary.n) continue;
+                if (t.id === 'powerChord' && t.summary.root && t.summary.fifth) {
+                    const rootPct = t.summary.root.passRate != null
+                        ? Math.round(t.summary.root.passRate * 100) : '—';
+                    const fifthPct = t.summary.fifth.passRate != null
+                        ? Math.round(t.summary.fifth.passRate * 100) : '—';
+                    let line = `${t.label}: ${t.summary.n} captures · root ${rootPct}% · fifth ${fifthPct}%`;
+                    if (t.summary.likelyCause) line += ` · ${t.summary.likelyCause}`;
+                    lines.push(line);
+                    continue;
+                }
+                const med = Number.isFinite(t.summary.medianSnrRatio)
+                    ? t.summary.medianSnrRatio.toFixed(2) : '—';
+                lines.push(`${t.label}: ${t.summary.n} captures · clarity ${med} · weakest: ${_calLabDominantFailLabel(t.summary.dominantFailure)}`);
+            }
+            return lines.slice(0, 12).join('\n') || '(empty)';
+        } catch (_) { return ''; }
+    }
+
+    function _calLabWireHandlers() {
+        if (!_calLabEl || !_calLabState) return;
+        const st = _calLabState;
+        const body = _calLabEl.querySelector('.nd-cal-lab-body');
+        if (!body) return;
+
+        const startBasic = body.querySelector('.nd-cal-lab-start-basic');
+        if (startBasic) {
+            startBasic.onclick = () => {
+                _calLabStopAutoCapture('mode');
+                st.mode = 'basic';
+                st.step = 0;
+                renderCalibrationLab();
+            };
+        }
+        const startAdvanced = body.querySelector('.nd-cal-lab-start-advanced');
+        if (startAdvanced) {
+            startAdvanced.onclick = () => {
+                _calLabStopAutoCapture('mode');
+                st.mode = 'advanced';
+                st.step = 0;
+                renderCalibrationLab();
+            };
+        }
+
+        body.querySelectorAll('.nd-cal-lab-auto-start').forEach((btn) => {
+            btn.onclick = () => {
+                const key = btn.getAttribute('data-auto-step');
+                if (key === 'noise') _calLabStartNoiseAuto();
+                else if (key === 'signal') _calLabStartSignalAuto();
+                else if (key === 'open') _calLabStartOpenAuto(false);
+                else if (key === 'fret5') _calLabStartFretAuto(false);
+                else if (key === 'powerChord') _calLabStartPowerChordAuto(false);
+            };
+        });
+        body.querySelectorAll('.nd-cal-lab-auto-retry').forEach((btn) => {
+            btn.onclick = () => {
+                const key = btn.getAttribute('data-auto-step');
+                _calLabRetryBasicAuto(key);
+            };
+        });
+        body.querySelectorAll('.nd-cal-lab-auto-stop').forEach((btn) => {
+            btn.onclick = () => {
+                _calLabStopAutoCapture('user');
+                _calLabSetAutoStatus('<span class="text-gray-400">Stopped.</span>');
+                _calLabUpdateBasicAutoButtons();
+            };
+        });
+
+        const capNoise = body.querySelector('.nd-cal-lab-cap-noise');
+        if (capNoise) {
+            capNoise.onclick = () => {
+                _calLabStopAutoCapture('manual');
+                const s = getCalibrationSnapshot();
+                st.noiseLevelPct = s.inputLevelPct;
+                st.noisePeakPct = s.inputPeakPct;
+                const el = body.querySelector('.nd-cal-lab-cap-noise-txt');
+                if (el) el.textContent = calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct);
+                const autoEl = body.querySelector('.nd-cal-lab-auto-result');
+                if (autoEl) {
+                    autoEl.textContent = calibrationFormatLevel(st.noiseLevelPct, st.noisePeakPct);
+                }
+                if (st.autoRun) {
+                    st.autoRun.phase = 'done';
+                    st.autoRun.stepId = 'noise';
+                }
+                renderCalibrationLab();
+            };
+        }
+        const capSignal = body.querySelector('.nd-cal-lab-cap-signal');
+        if (capSignal) {
+            capSignal.onclick = () => {
+                _calLabStopAutoCapture('manual');
+                const s = getCalibrationSnapshot();
+                st.signalLevelPct = s.inputLevelPct;
+                st.signalPeakPct = s.inputPeakPct;
+                const el = body.querySelector('.nd-cal-lab-cap-signal-txt');
+                if (el) el.textContent = calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct);
+                const autoEl = body.querySelector('.nd-cal-lab-auto-result');
+                if (autoEl) {
+                    autoEl.textContent = calibrationFormatLevel(st.signalLevelPct, st.signalPeakPct);
+                }
+                if (st.autoRun) {
+                    st.autoRun.phase = 'done';
+                    st.autoRun.stepId = 'signal';
+                }
+                renderCalibrationLab();
+            };
+        }
+
+        body.querySelectorAll('.nd-cal-lab-cap-str').forEach((btn) => {
+            btn.onclick = async () => {
+                _calLabStopAutoCapture('manual');
+                const store = btn.getAttribute('data-store');
+                const s = parseInt(btn.getAttribute('data-s'), 10);
+                const f = parseInt(btn.getAttribute('data-f'), 10);
+                if (!store || !Number.isInteger(s)) return;
+                btn.disabled = true;
+                const cap = await _calLabCaptureProbe({ s, f }, store);
+                btn.disabled = false;
+                if (!_calLabState || _calLabState !== st) return;
+                if (cap.ok) {
+                    if (!st[store]) st[store] = {};
+                    if (!st[store][s]) st[store][s] = [];
+                    st[store][s].push(cap);
+                }
+                renderCalibrationLab();
+            };
+        });
+
+        body.querySelectorAll('.nd-cal-lab-cap-tech').forEach((btn) => {
+            btn.onclick = async () => {
+                _calLabStopAutoCapture('manual');
+                const tech = btn.getAttribute('data-tech');
+                const s = parseInt(btn.getAttribute('data-s'), 10);
+                const f = parseInt(btn.getAttribute('data-f'), 10);
+                const note = { s, f };
+                if (btn.getAttribute('data-ho')) note.ho = true;
+                if (btn.getAttribute('data-po')) note.po = true;
+                if (btn.getAttribute('data-b')) note.b = true;
+                if (btn.getAttribute('data-hm')) note.hm = true;
+                btn.disabled = true;
+                const cap = await _calLabCaptureProbe(note, tech);
+                btn.disabled = false;
+                if (cap.ok) {
+                    if (!st.techniqueCaptures) st.techniqueCaptures = {};
+                    if (!st.techniqueCaptures[tech]) st.techniqueCaptures[tech] = [];
+                    st.techniqueCaptures[tech].push(cap);
+                }
+                renderCalibrationLab();
+            };
+        });
+
+        const capPwr = body.querySelector('.nd-cal-lab-cap-pwr');
+        if (capPwr) {
+            capPwr.onclick = async () => {
+                _calLabStopAutoCapture('manual');
+                capPwr.disabled = true;
+                const cap = await _calLabCaptureMulti([{ s: 0, f: 0 }, { s: 1, f: 2 }], 'powerChord');
+                capPwr.disabled = false;
+                if (!_calLabState || _calLabState !== st) return;
+                if (cap.ok) {
+                    if (!st.techniqueCaptures) st.techniqueCaptures = {};
+                    if (!st.techniqueCaptures.powerChord) st.techniqueCaptures.powerChord = [];
+                    st.techniqueCaptures.powerChord.push(cap);
+                }
+                renderCalibrationLab();
+            };
+        }
+
+        const capSus = body.querySelector('.nd-cal-lab-cap-sustain');
+        if (capSus) {
+            capSus.onclick = async () => {
+                capSus.disabled = true;
+                if (!st.sustainSeries) st.sustainSeries = [];
+                const note = { s: 0, f: 0 };
+                for (let i = 0; i < 10; i++) {
+                    const cap = await _calLabCaptureProbe(note, 'sustain');
+                    if (cap.ok) {
+                        st.sustainSeries.push({
+                            tMs: i * 150,
+                            snrRatio: cap.snrRatio,
+                            gatePassCount: cap.gatePassCount,
+                            failedGateMask: cap.failedGateMask,
+                        });
+                    }
+                    await new Promise((r) => setTimeout(r, 150));
+                }
+                capSus.disabled = false;
+                renderCalibrationLab();
+            };
+        }
+
+        const dl = body.querySelector('.nd-cal-lab-dl');
+        if (dl) dl.onclick = () => _calLabDownloadReport();
+    }
+
+    function calibrationLabNext() {
+        if (!_calLabState || !_calLabState.mode) return;
+        if (_calLabIsAutoBusy(_calLabState)) return;
+        _calLabStopAutoCapture('next');
+        const steps = _calLabActiveSteps(_calLabState.mode);
+        if (_calLabState.step >= steps.length - 1) {
+            calibrationLabClose();
+            return;
+        }
+        _calLabState.step++;
+        renderCalibrationLab();
+    }
+
+    function calibrationLabBack() {
+        if (!_calLabState || !_calLabState.mode || _calLabState.step <= 0) return;
+        if (_calLabIsAutoBusy(_calLabState)) return;
+        _calLabStopAutoCapture('back');
+        _calLabState.step--;
+        renderCalibrationLab();
+    }
+
+    function openInstrumentCalibrationLab() {
+        calibrationLabClose();
+        _calLabState = {
+            mode: null,
+            step: 0,
+            noiseLevelPct: null,
+            noisePeakPct: null,
+            signalLevelPct: null,
+            signalPeakPct: null,
+            openCaptures: {},
+            fretCaptures: {},
+            techniqueCaptures: {},
+            sustainSeries: [],
+            autoRun: _calLabDefaultAutoRun(),
+        };
+        const overlay = document.createElement('div');
+        overlay.className = 'nd-cal-lab';
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:301;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.65);pointer-events:auto;';
+        overlay.innerHTML = `
+            <div class="bg-dark-700 border border-gray-600 rounded-2xl shadow-2xl text-sm" style="width:24rem;max-width:calc(100vw - 2rem);max-height:calc(100vh - 3rem);display:flex;flex-direction:column;">
+                <div class="flex justify-between items-center px-4 py-3 border-b border-gray-700">
+                    <span class="nd-cal-lab-title text-gray-200 font-semibold text-xs">Technique Assessment</span>
+                    <button type="button" class="nd-cal-lab-close text-gray-500 hover:text-white text-lg leading-none">&times;</button>
+                </div>
+                <div class="nd-cal-lab-body px-4 py-3 overflow-y-auto flex-1 text-xs"></div>
+                <div class="flex gap-2 px-4 py-3 border-t border-gray-700">
+                    <button type="button" class="nd-cal-lab-back flex-1 py-2 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300">Back</button>
+                    <button type="button" class="nd-cal-lab-next flex-1 py-2 bg-accent hover:bg-accent-light rounded-lg text-xs font-semibold text-white">Next</button>
+                </div>
+            </div>`;
+        overlay.onclick = (e) => { if (e.target === overlay) calibrationLabClose(); };
+        overlay.querySelector('.nd-cal-lab-close').onclick = () => calibrationLabClose();
+        overlay.querySelector('.nd-cal-lab-back').onclick = () => calibrationLabBack();
+        overlay.querySelector('.nd-cal-lab-next').onclick = () => calibrationLabNext();
+        document.body.appendChild(overlay);
+        _calLabEl = overlay;
+        renderCalibrationLab();
+        _calLabTick = setInterval(() => {
+            if (!_calLabEl || !_calLabEl.isConnected) {
+                calibrationLabClose();
+                return;
+            }
+            _calLabRefreshLive();
+        }, 200);
+    }
+
+    function getCalibrationReport() {
+        try {
+            return _calLabLastReport || (_calLabState ? _calLabBuildReport() : null);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    // slopsmith#502 — scrollable gear popover steals horizontal drags from
+    // range sliders. Lock panel scroll while a slider is active; UI-only.
+    function _ndWireSettingsRangeScrollLock(panel) {
+        if (!panel || panel._ndRangeScrollLock) return;
+        panel._ndRangeScrollLock = true;
+
+        const release = () => {
+            panel.style.overflowY = 'auto';
+            panel.classList.remove('nd-settings-panel--slider-drag');
+        };
+
+        for (const el of panel.querySelectorAll('input[type=range]')) {
+            el.style.touchAction = 'none';
+            el.style.userSelect = 'none';
+
+            el.addEventListener('pointerdown', (e) => {
+                panel.style.overflowY = 'hidden';
+                panel.classList.add('nd-settings-panel--slider-drag');
+                try { el.setPointerCapture(e.pointerId); } catch (_) { /* host */ }
+            });
+
+            el.addEventListener('pointerup', release);
+            el.addEventListener('pointercancel', release);
+            el.addEventListener('lostpointercapture', release);
+        }
+    }
+
     // ── Settings panel ────────────────────────────────────────────────
     function showSettings() {
-        let panel = instanceRoot.querySelector('.nd-settings-panel');
-        if (panel) { panel.remove(); return; }
+        attachInstanceRoot();
+
+        let panel = document.querySelector('.nd-settings-panel');
+        if (panel) {
+            if (panel._ndHealthTick) {
+                clearInterval(panel._ndHealthTick);
+                panel._ndHealthTick = null;
+            }
+            if (panel.isConnected) {
+                panel.remove();
+                return;
+            }
+            panel.remove();
+        }
 
         panel = document.createElement('div');
-        // Bound panel height to available viewport space below `top-16`
-        // (with a small bottom gap) and let the panel scroll internally.
-        panel.className = 'nd-settings-panel fixed top-16 right-4 z-[150] bg-dark-700 border border-gray-600 rounded-xl p-4 w-80 max-h-[calc(100vh-4rem-1rem)] overflow-y-auto shadow-2xl text-sm';
+        // Position/size via inline styles — several Tailwind utilities used
+        // here (top-16, right-4, w-80, z-[150]) are not in the built
+        // slopsmith CSS bundle, so class-only styling left the panel
+        // unboxed and its labels flowed over the highway. Mount on
+        // document.body so fixed placement is relative to the viewport.
+        panel.className = 'nd-settings-panel bg-dark-700 border border-gray-600 rounded-xl p-4 shadow-2xl text-sm';
         panel.style.pointerEvents = 'auto';
+        panel.style.position = 'fixed';
+        panel.style.top = '4rem';
+        panel.style.right = '1rem';
+        panel.style.zIndex = '250';
+        panel.style.width = '20rem';
+        panel.style.maxWidth = 'calc(100vw - 2rem)';
+        panel.style.maxHeight = 'calc(100vh - 5rem)';
+        panel.style.overflowY = 'auto';
         panel.innerHTML = `
             <div class="flex justify-between items-center mb-3">
                 <span class="text-gray-200 font-semibold">Note Detection Settings</span>
                 <button class="nd-settings-close text-gray-500 hover:text-white">&times;</button>
+            </div>
+
+            <div class="nd-health-block bg-dark-600/40 border border-gray-700 rounded-lg p-3 mb-3 text-[11px] text-gray-300 leading-snug">
+                <div class="text-gray-200 text-xs font-semibold uppercase tracking-wider mb-2">Detection Health</div>
+                <div class="nd-health-status text-gray-400 mb-1">—</div>
+                <div class="nd-health-input text-gray-400 mb-1">—</div>
+                <div class="nd-health-hearing text-cyan-300/90 mb-1 font-mono text-[10px]">—</div>
+                <div class="nd-health-session text-gray-300 mb-1">—</div>
+                <div class="nd-health-top-miss text-gray-400 mb-1">—</div>
+                <div class="nd-health-align text-gray-400 mb-1">—</div>
+                <div class="nd-health-level text-gray-400 mb-1">—</div>
+                <div class="text-gray-200 text-[10px] font-semibold uppercase tracking-wider mt-2 mb-1">Recent notes that did not verify</div>
+                <div class="nd-health-rejects text-gray-400 text-[10px] whitespace-pre-line leading-snug mb-1">—</div>
+                <div class="nd-health-hint text-amber-200/90 mt-2 pt-2 border-t border-gray-700/80">—</div>
+                <div class="text-[10px] text-gray-500 mt-1 leading-tight">Read-only health stats. Use the diagnostic track for playthrough assessment, Calibration Wizard for setup, and Advanced Signal Check for deeper signal detail.</div>
+                <div class="text-[10px] text-gray-500 mt-2 mb-1 leading-tight">Play a short built-in track to check timing, open strings, fretted notes, and power chords on the highway.</div>
+                <button type="button" class="nd-diag-launch-basic w-full py-2 bg-dark-600 hover:bg-dark-500 border border-cyan-900/50 rounded-lg text-xs text-gray-200 transition">
+                    Run Basic Guitar Diagnostic
+                </button>
+                <div class="nd-health-diag-launch-status text-[10px] text-cyan-200/90 mt-1 mb-2 leading-snug"></div>
+                <div class="text-[10px] text-gray-500 mb-1 leading-tight">Set up audio input, levels, and timing before you play.</div>
+                <button type="button" class="nd-cal-wizard-open w-full py-2 bg-dark-600 hover:bg-dark-500 border border-gray-700 rounded-lg text-xs text-gray-200 transition">
+                    Run Calibration Wizard
+                </button>
+                <div class="text-[10px] text-gray-500 mt-2 mb-1 leading-tight">Optional deeper troubleshooting for root/fifth, SNR, tuning, and signal-clarity details after a diagnostic track.</div>
+                <button type="button" class="nd-cal-lab-open w-full py-2 bg-dark-600 hover:bg-dark-500 border border-purple-900/50 rounded-lg text-xs text-gray-200 transition">
+                    Advanced Signal Check
+                </button>
             </div>
 
             ${tuningMode ? `
@@ -4978,10 +9377,49 @@ function createNoteDetector(options = {}) {
             </div>
         `;
 
-        instanceRoot.appendChild(panel);
+        document.body.appendChild(panel);
 
         // Wire up controls
-        panel.querySelector('.nd-settings-close').onclick = () => panel.remove();
+        panel.querySelector('.nd-settings-close').onclick = () => {
+            if (panel._ndHealthTick) {
+                clearInterval(panel._ndHealthTick);
+                panel._ndHealthTick = null;
+            }
+            panel.remove();
+        };
+
+        const calWizardBtn = panel.querySelector('.nd-cal-wizard-open');
+        if (calWizardBtn) {
+            calWizardBtn.onclick = () => openCalibrationWizard();
+        }
+        const calLabBtn = panel.querySelector('.nd-cal-lab-open');
+        if (calLabBtn) {
+            calLabBtn.onclick = () => openInstrumentCalibrationLab();
+        }
+        const diagLaunchBtn = panel.querySelector('.nd-diag-launch-basic');
+        if (diagLaunchBtn) {
+            diagLaunchBtn.onclick = () => _ndLaunchDiagnosticTrack('basic-guitar-6', panel);
+        }
+
+        try {
+            renderDetectionHealth(panel);
+        } catch (e) {
+            console.warn('[note_detect] Detection Health render failed:',
+                e && e.message ? e.message : e);
+        }
+        panel._ndHealthTick = setInterval(() => {
+            if (!panel.isConnected) {
+                clearInterval(panel._ndHealthTick);
+                panel._ndHealthTick = null;
+                return;
+            }
+            try {
+                renderDetectionHealth(panel);
+            } catch (e) {
+                console.warn('[note_detect] Detection Health render failed:',
+                    e && e.message ? e.message : e);
+            }
+        }, 400);
 
         // Reference-recording controls — present only when tuningMode is
         // on (the .nd-rec-block element is conditional in the template
@@ -5212,6 +9650,7 @@ function createNoteDetector(options = {}) {
             saveSettings();
         };
 
+        _ndWireSettingsRangeScrollLock(panel);
         populateDevices();
     }
 
@@ -5234,7 +9673,7 @@ function createNoteDetector(options = {}) {
     async function populateDevices() {
         try {
             const devices = await navigator.mediaDevices.enumerateDevices();
-            const sel = instanceRoot.querySelector('.nd-device-select');
+            const sel = document.querySelector('.nd-settings-panel .nd-device-select');
             if (!sel) return;
             sel.innerHTML = '<option value="">Default</option>';
             for (const d of devices) {
@@ -5729,7 +10168,7 @@ function createNoteDetector(options = {}) {
         detectBtn.textContent = 'Detect';
         detectBtn.title = 'Toggle real-time note detection & scoring';
         detectBtn.onclick = toggle;
-        if (closeBtn) controls.insertBefore(detectBtn, closeBtn);
+        if (closeBtn && closeBtn.parentNode === controls) controls.insertBefore(detectBtn, closeBtn);
         else controls.appendChild(detectBtn);
 
         gearBtn = document.createElement('button');
@@ -5737,7 +10176,7 @@ function createNoteDetector(options = {}) {
         gearBtn.textContent = '\u2699';
         gearBtn.title = 'Note detection settings';
         gearBtn.onclick = showSettings;
-        if (closeBtn) controls.insertBefore(gearBtn, closeBtn);
+        if (closeBtn && closeBtn.parentNode === controls) controls.insertBefore(gearBtn, closeBtn);
         else controls.appendChild(gearBtn);
 
         attachInstanceRoot();
@@ -5776,6 +10215,9 @@ function createNoteDetector(options = {}) {
         noteResults.clear();
         _susActiveUntil.clear();
         _chordLastResult.clear();
+        _ndVerifierRejects.length = 0;
+        _ndRejectDedup.clear();
+        _ndVerifyFailSnap.clear();
         _diagResetCounters();
         sectionStats = [];
         currentSection = null;
@@ -6227,6 +10669,8 @@ function createNoteDetector(options = {}) {
             // backward-seek reset cleared the buffer. Treating "no
             // telemetry" as "silent" would force false misses on legitimate
             // detections in those transient states.
+            const engineDetectedRaw = !!v.detected;
+            const strikeCtx = _ndStrikeLevelContext(cn.t);
             if (v.detected && _ndLevelSamples.length > 0) {
                 // _ndLevelSamples are timestamped in the visual clock
                 // (hw.getTime() + avOffset), but `cn.t` (and everywhere
@@ -6240,17 +10684,34 @@ function createNoteDetector(options = {}) {
                 // time; otherwise the configured user latency (up to
                 // 250 ms) would push the real peak outside the
                 // ±_ND_LEVEL_WIN_HALF window and trip false misses.
-                const cnCenterVisualT = cn.t + latencyOffset;
-                let peakL = 0;
-                let inWindow = 0;
-                for (let i = _ndLevelSamples.length - 1; i >= 0; i--) {
-                    const s = _ndLevelSamples[i];
-                    if (s.songT > cnCenterVisualT + _ND_LEVEL_WIN_HALF) continue;
-                    if (s.songT < cnCenterVisualT - _ND_LEVEL_WIN_HALF) break;
-                    inWindow++;
-                    if (s.level > peakL) peakL = s.level;
-                }
-                if (inWindow > 0 && peakL < _ND_SILENCE_THRESHOLD) {
+                if (strikeCtx.silenceWouldTrigger) {
+                    const expectedMidiSg = _ndMidiFromStringFret(
+                        cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
+                    );
+                    _ndLogVerifierRejectOnce('silence:' + v.id, {
+                        reason: 'SILENCE_GATE',
+                        path: 'desktop-engine-verifier',
+                        skipOpenDomainPitchFallback: true,
+                        verifierId: v.id,
+                        playheadAudio,
+                        noteTime: cn.t,
+                        string: cn.s,
+                        fret: cn.f,
+                        expectedMidi: expectedMidiSg,
+                        engineDetectedRaw,
+                        engineDetected: false,
+                        silenceGateApplied: true,
+                        strikePeakPct: strikeCtx.strikePeakPct,
+                        strikeSamplesInWindow: strikeCtx.strikeSamplesInWindow,
+                        inputLevelAtLogPct: strikeCtx.levelAtLogPct,
+                        inputPeakPct: strikeCtx.strikePeakPct,
+                        rendererPitchPolled: false,
+                        detectedSongTime: Number.isFinite(v.detectedSongTime)
+                            ? v.detectedSongTime
+                            : null,
+                        pitchErrorCents: Number.isFinite(v.centsError) ? v.centsError : null,
+                        engineVerdict: _ndSnapshotEngineVerdict(v),
+                    });
                     v.detected = false;
                 }
             }
@@ -6297,11 +10758,73 @@ function createNoteDetector(options = {}) {
                     cn, cn.t, judgedAt, expectedMidi, detectedMidiForJudgment, 1,
                     { pitchError, pitchThresholdCents: lenientPitch ? 600 : undefined }
                 );
+                if (!judgment.hit) {
+                    const teReason = judgment.timingState === 'EARLY' || judgment.timingState === 'LATE'
+                        ? 'TIMING_FAIL'
+                        : (judgment.pitchState === 'SHARP' || judgment.pitchState === 'FLAT'
+                            ? 'PITCH_FAIL'
+                            : 'UNKNOWN');
+                    _ndLogVerifierRejectOnce(key, {
+                        reason: teReason,
+                        path: 'desktop-engine-verifier',
+                        verifierId: v.id,
+                        playheadAudio,
+                        noteTime: cn.t,
+                        string: cn.s,
+                        fret: cn.f,
+                        expectedMidi,
+                        detectedMidi: detectedMidiForJudgment,
+                        confidence: 1,
+                        engineDetectedRaw,
+                        engineDetected: true,
+                        silenceGateApplied: false,
+                        detectedSongTime: judgedAt,
+                        strikePeakPct: strikeCtx.strikePeakPct,
+                        strikeSamplesInWindow: strikeCtx.strikeSamplesInWindow,
+                        inputLevelAtLogPct: strikeCtx.levelAtLogPct,
+                        rendererPitchPolled: false,
+                        timingErrorMs: judgment.timingError,
+                        pitchErrorCents: judgment.pitchError,
+                        engineVerdict: _ndSnapshotEngineVerdict(v),
+                    });
+                }
                 recordJudgment(key, judgment);
             } else {
                 // Engine finalized the note as a miss — its timing window
                 // has fully passed. Mirror the legacy checkMisses() retire.
                 const t = (hw.getTime ? hw.getTime() : 0) + avOffsetSec - latencyOffset;
+                if (!_ndRejectDedup.has('silence:' + key)) {
+                    let timingErrorMs = null;
+                    if (Number.isFinite(v.timingErrorMs)) timingErrorMs = v.timingErrorMs;
+                    else if (Number.isFinite(v.timingError)) timingErrorMs = v.timingError;
+                    else if (Number.isFinite(v.detectedSongTime) && Number.isFinite(cn.t)) {
+                        timingErrorMs = Math.round((v.detectedSongTime - cn.t) * 1000);
+                    }
+                    _ndLogVerifierRejectOnce(key, {
+                        reason: 'NO_VERDICT',
+                        path: 'desktop-engine-verifier',
+                        skipOpenDomainPitchFallback: true,
+                        verifierId: v.id,
+                        playheadAudio,
+                        noteTime: cn.t,
+                        string: cn.s,
+                        fret: cn.f,
+                        expectedMidi,
+                        engineDetectedRaw,
+                        engineDetected: false,
+                        silenceGateApplied: false,
+                        detectedSongTime: Number.isFinite(v.detectedSongTime)
+                            ? v.detectedSongTime
+                            : null,
+                        strikePeakPct: strikeCtx.strikePeakPct,
+                        strikeSamplesInWindow: strikeCtx.strikeSamplesInWindow,
+                        inputLevelAtLogPct: strikeCtx.levelAtLogPct,
+                        rendererPitchPolled: false,
+                        timingErrorMs,
+                        pitchErrorCents: Number.isFinite(v.centsError) ? v.centsError : null,
+                        engineVerdict: _ndSnapshotEngineVerdict(v),
+                    });
+                }
                 recordJudgment(key, makeMissJudgment(cn, cn.t, t, expectedMidi));
             }
         }
@@ -6366,6 +10889,15 @@ function createNoteDetector(options = {}) {
             // result as the legacy browser/desktop chord-miss path.
             const avOffsetSecMiss = (hw.getAvOffset ? hw.getAvOffset() / 1000 : 0);
             const missJudgedAt = (hw.getTime ? hw.getTime() : 0) + avOffsetSecMiss - latencyOffset;
+            _ndLogVerifierRejectOnce(chordKey, {
+                reason: 'CHORD_RATIO_FAIL',
+                noteTime: grp.t,
+                chord: true,
+                expectedMidi,
+                hitStrings,
+                totalStrings,
+                chordScore: score,
+            });
             recordJudgment(chordKey, makeMissJudgment(
                 lead, grp.t, missJudgedAt, expectedMidi,
                 { chord: true, notes: grp.memberNotes, hitStrings, totalStrings, score, lateGraceMs }
@@ -7309,8 +11841,16 @@ function createNoteDetector(options = {}) {
 
         if (!disableOptions || !disableOptions.silent) showSummary();
 
-        const panel = instanceRoot.querySelector('.nd-settings-panel');
-        if (panel) panel.remove();
+        const panel = document.querySelector('.nd-settings-panel');
+        if (panel) {
+            if (panel._ndHealthTick) {
+                clearInterval(panel._ndHealthTick);
+                panel._ndHealthTick = null;
+            }
+            panel.remove();
+        }
+        calibrationWizardClose();
+        calibrationLabClose();
 
         updateButton();
     }
@@ -7328,6 +11868,8 @@ function createNoteDetector(options = {}) {
         // disable()→stopAudio() already cleared bridgeDesktop, so this re-resolves
         // window.slopsmithDesktop. No-op for the default singleton / source 0.
         _ndReleaseOwnedSource();
+        calibrationWizardClose();
+        calibrationLabClose();
         // Unbind slopsmith drill listeners so multiple createNoteDetector()
         // instances (splitscreen) don't accumulate handlers across mount/
         // unmount cycles. disable() leaves them alone (resumes drill state
@@ -8720,6 +13262,458 @@ function createNoteDetector(options = {}) {
         _liveSessionId = null;
     }
 
+    // ── Diagnostic track catalog — post-play report (read-only) ───────
+    // Catalog + report profiles let multiple diagnostic sloppaks share one
+    // detection/report path. Does NOT change scoring, thresholds, or settings.
+    const _DIAGNOSTIC_TRACK_CATALOG = [
+        {
+            id: 'basic-guitar-6',
+            title: 'Slopsmith Diagnostic — Basic Guitar',
+            artist: 'Slopsmith',
+            arrangement: 'Diagnostic Guitar',
+            filenameIncludes: 'slopsmith-diagnostic-basic-guitar.sloppak',
+            dlcRelativePath: 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak',
+            instrument: 'guitar',
+            stringCount: 6,
+            reportProfile: 'basic-guitar-v1',
+            description: 'Checks timing, open strings, fretted notes, and power chords.',
+        },
+    ];
+
+    function _ndSetDiagnosticLaunchStatus(panel, message) {
+        if (!panel) return;
+        const el = panel.querySelector('.nd-health-diag-launch-status');
+        if (el) el.textContent = message || '';
+    }
+
+    function _ndSetDiagnosticLaunchStatusAny(message) {
+        const el = document.querySelector('.nd-health-diag-launch-status');
+        if (el) el.textContent = message || '';
+    }
+
+    function _ndWaitForSongReadyEvent(timeoutMs) {
+        const ms = timeoutMs != null ? timeoutMs : 15000;
+        return new Promise((resolve) => {
+            if (!window.slopsmith || typeof window.slopsmith.on !== 'function') {
+                resolve(false);
+                return;
+            }
+            let settled = false;
+            const finish = (ok) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                try { window.slopsmith.off('song:ready', onReady); } catch (_) {}
+                resolve(ok);
+            };
+            const onReady = () => finish(true);
+            const timer = setTimeout(() => finish(false), ms);
+            try {
+                window.slopsmith.on('song:ready', onReady);
+            } catch (_) {
+                finish(false);
+            }
+        });
+    }
+
+    function _ndCaptureDiagnosticReturnBeforeLaunch(track) {
+        _ndClearDiagnosticReturnState();
+        const prevFn = String(_ndShared.currentFilename || '').trim();
+        if (!prevFn) return;
+        if (_getDiagnosticTrackForSession()) return;
+        const diagFn = String(track.dlcRelativePath || '').trim();
+        if (!diagFn) return;
+        const prevLower = prevFn.toLowerCase();
+        if (prevLower === diagFn.toLowerCase()) return;
+        if (track.filenameIncludes
+            && prevLower.includes(String(track.filenameIncludes).toLowerCase())) {
+            return;
+        }
+        const hw = resolveHw();
+        let info = {};
+        try {
+            info = (hw && hw.getSongInfo) ? (hw.getSongInfo() || {}) : {};
+        } catch (_) { /* read-only snapshot */ }
+        const arrIdx = info.arrangement_index;
+        _ndShared.diagnosticReturn.active = true;
+        _ndShared.diagnosticReturn.previousFilename = prevFn;
+        _ndShared.diagnosticReturn.previousArrangementIndex = Number.isFinite(arrIdx)
+            ? arrIdx
+            : null;
+        _ndShared.diagnosticReturn.previousTitle = info.title || null;
+        _ndShared.diagnosticReturn.previousArtist = info.artist || null;
+        _ndShared.diagnosticReturn.launchedTrackId = track.id;
+        _ndShared.diagnosticReturn.diagnosticFilename = diagFn;
+    }
+
+    async function _ndReturnToPreviousSongAfterDiagnostic() {
+        const r = _ndShared.diagnosticReturn;
+        if (!r || !r.active || !r.previousFilename) {
+            return false;
+        }
+        if (typeof window.playSong !== 'function') {
+            _ndSetDiagnosticLaunchStatusAny(
+                'Could not return to the previous song. Load it from your library.',
+            );
+            _ndClearDiagnosticReturnState();
+            return false;
+        }
+
+        const prevFn = r.previousFilename;
+        const arrIdx = r.previousArrangementIndex;
+        const readyPromise = _ndWaitForSongReadyEvent();
+
+        try {
+            const loadPromise = window.playSong(
+                encodeURIComponent(prevFn),
+                Number.isFinite(arrIdx) ? arrIdx : undefined,
+                { bridge: false },
+            );
+            if (loadPromise && typeof loadPromise.then === 'function') {
+                await loadPromise;
+            }
+        } catch (e) {
+            console.warn('[note_detect] return to previous song failed:', e);
+            _ndSetDiagnosticLaunchStatusAny(
+                'Could not return to the previous song. Load it from your library.',
+            );
+            _ndClearDiagnosticReturnState();
+            return false;
+        }
+
+        const ready = await readyPromise;
+        const prevTitle = r.previousTitle;
+        _ndClearDiagnosticReturnState();
+        if (ready) {
+            const label = prevTitle
+                ? `Returned to ${prevTitle}. Press Play when ready.`
+                : 'Returned to previous song. Press Play when ready.';
+            _ndSetDiagnosticLaunchStatusAny(label);
+            return true;
+        }
+
+        _ndSetDiagnosticLaunchStatusAny(
+            'Could not return to the previous song. Load it from your library.',
+        );
+        return false;
+    }
+
+    async function _ndLaunchDiagnosticTrack(trackId, panel) {
+        const track = _DIAGNOSTIC_TRACK_CATALOG.find((t) => t.id === trackId);
+        if (!track || !track.dlcRelativePath) {
+            _ndSetDiagnosticLaunchStatus(
+                panel,
+                'Diagnostic track is not configured.',
+            );
+            return;
+        }
+        if (typeof window.playSong !== 'function') {
+            _ndSetDiagnosticLaunchStatus(
+                panel,
+                'Diagnostic track could not be loaded. Restart Slopsmith or rescan your library.',
+            );
+            return;
+        }
+
+        _ndCaptureDiagnosticReturnBeforeLaunch(track);
+
+        _ndSetDiagnosticLaunchStatus(panel, 'Loading diagnostic track…');
+
+        const readyPromise = _ndWaitForSongReadyEvent();
+
+        try {
+            const loadPromise = window.playSong(
+                encodeURIComponent(track.dlcRelativePath),
+                undefined,
+                { bridge: false },
+            );
+            if (loadPromise && typeof loadPromise.then === 'function') {
+                await loadPromise;
+            }
+        } catch (e) {
+            console.warn('[note_detect] diagnostic launch failed:', e);
+            _ndSetDiagnosticLaunchStatus(
+                panel,
+                'Diagnostic track could not be loaded. Restart Slopsmith or rescan your library.',
+            );
+            return;
+        }
+
+        const ready = await readyPromise;
+        if (ready) {
+            _ndSetDiagnosticLaunchStatus(
+                panel,
+                'Loaded Basic Guitar Diagnostic. Press Play or Spacebar to begin.',
+            );
+            return;
+        }
+
+        _ndSetDiagnosticLaunchStatus(
+            panel,
+            'Diagnostic track is not available yet. Restart Slopsmith or rescan the library. If it still does not appear, the built-in diagnostic pack may not be installed.',
+        );
+    }
+
+    const _DIAGNOSTIC_REPORT_PROFILES = {
+        'basic-guitar-v1': {
+            matchTolS: 0.075,
+            powerChordCategoryId: 'powerChords',
+            expectedChordStrings: 2,
+            displayOrder: ['openLow', 'openNext', 'fretted', 'powerChords', 'repeatCheck'],
+            singleHitMissCategories: ['openLow', 'openNext', 'fretted'],
+            events: [
+                { t: 4,  category: 'openLow',      label: 'Open low string',  chord: false, s: 0, f: 0 },
+                { t: 8,  category: 'openNext',     label: 'Open next string', chord: false, s: 1, f: 0 },
+                { t: 12, category: 'fretted',      label: 'Fretted note',     chord: false, s: 0, f: 5 },
+                { t: 16, category: 'powerChords',  label: 'Power chord',      chord: true },
+                { t: 20, category: 'powerChords',  label: 'Power chord',      chord: true },
+                { t: 24, category: 'powerChords',  label: 'Power chord',      chord: true },
+                { t: 28, category: 'powerChords',  label: 'Power chord',      chord: true },
+                { t: 32, category: 'repeatCheck',  label: 'Repeat open low',  chord: false, s: 0, f: 0 },
+                { t: 36, category: 'repeatCheck',  label: 'Repeat fretted',   chord: false, s: 0, f: 5 },
+                { t: 40, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+                { t: 44, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+                { t: 48, category: 'repeatCheck',  label: 'Repeat power chord', chord: true },
+            ],
+            categories: {
+                openLow:     { label: 'Open low string' },
+                openNext:    { label: 'Open next string' },
+                fretted:     { label: 'Fretted note' },
+                powerChords: { label: 'Power chords' },
+                repeatCheck: { label: 'Repeat check' },
+            },
+        },
+    };
+
+    function _getDiagnosticTrackForSession() {
+        const fn = (_ndShared.currentFilename || '').toLowerCase();
+        const currentHw = resolveHw();
+        const info = (currentHw && currentHw.getSongInfo) ? currentHw.getSongInfo() : {};
+        for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
+            if (track.filenameIncludes
+                && fn.includes(String(track.filenameIncludes).toLowerCase())) {
+                return track;
+            }
+        }
+        for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
+            if (info.title === track.title
+                && info.artist === track.artist
+                && info.arrangement === track.arrangement) {
+                return track;
+            }
+        }
+        return null;
+    }
+
+    function _diagMatchProfileEvent(events, spec, matchTolS) {
+        for (const ev of events) {
+            if (!ev || !Number.isFinite(ev.t)) continue;
+            if (Math.abs(ev.t - spec.t) > matchTolS) continue;
+            if (!!ev.chord !== !!spec.chord) continue;
+            if (!spec.chord) {
+                if (ev.s !== spec.s || ev.f !== spec.f) continue;
+            }
+            return ev;
+        }
+        return null;
+    }
+
+    function _buildDiagnosticPlayReportFromProfile(profile, reportProfileId) {
+        const events = _diagEvents.slice();
+        const chartEvents = profile.events || [];
+        const matchTolS = profile.matchTolS != null ? profile.matchTolS : 0.075;
+        let matchedCount = 0;
+        for (const spec of chartEvents) {
+            if (_diagMatchProfileEvent(events, spec, matchTolS)) matchedCount++;
+        }
+        if (matchedCount === 0) return null;
+
+        const playTotal = hits + misses;
+        const overall = {
+            hits,
+            misses,
+            accuracy: playTotal > 0 ? Math.round((hits / playTotal) * 100) : 0,
+            bestStreak,
+        };
+
+        const categoryMeta = profile.categories || {};
+        const categories = {};
+        let hasPartialPowerChords = false;
+        const powerChordCategoryId = profile.powerChordCategoryId || 'powerChords';
+        const expectedChordStrings = profile.expectedChordStrings != null
+            ? profile.expectedChordStrings
+            : 2;
+
+        for (const catId of Object.keys(categoryMeta)) {
+            const specs = chartEvents.filter((s) => s.category === catId);
+            let attempts = 0;
+            let catHits = 0;
+            let catMisses = 0;
+            const timingErrors = [];
+            const chordAttempts = [];
+
+            for (const spec of specs) {
+                const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+                if (!ev) continue;
+                attempts++;
+                if (ev.hit) catHits++; else catMisses++;
+                if (Number.isFinite(ev.te)) timingErrors.push(ev.te);
+                if (spec.chord) {
+                    const hs = Number.isFinite(ev.hs) ? ev.hs : null;
+                    const tt = Number.isFinite(ev.tt) ? ev.tt : expectedChordStrings;
+                    chordAttempts.push({ t: ev.t, hit: !!ev.hit, hs, tt });
+                    if (hs != null && hs < tt) hasPartialPowerChords = true;
+                }
+            }
+
+            if (attempts === 0) continue;
+
+            const cat = {
+                id: catId,
+                label: categoryMeta[catId].label,
+                attempts,
+                hits: catHits,
+                misses: catMisses,
+                accuracy: Math.round((catHits / attempts) * 100),
+                timingMedianMs: timingErrors.length
+                    ? _diagPercentile(timingErrors, 50)
+                    : null,
+            };
+
+            if (catId === powerChordCategoryId && chordAttempts.length) {
+                const heard = chordAttempts.filter((c) => c.hs != null);
+                const avgHeard = heard.length
+                    ? heard.reduce((sum, c) => sum + c.hs, 0) / heard.length
+                    : null;
+                cat.chordHits = catHits;
+                cat.chordMisses = catMisses;
+                cat.avgStringsHeard = avgHeard;
+                cat.expectedStrings = expectedChordStrings;
+                cat.perAttempt = chordAttempts.map((c) => {
+                    const heardTxt = c.hs != null
+                        ? `heard ${c.hs} of ${c.tt} strings`
+                        : 'strings heard unknown';
+                    return { t: c.t, hit: c.hit, heardTxt };
+                });
+            }
+
+            categories[catId] = cat;
+        }
+
+        if (!Object.keys(categories).length) return null;
+
+        return {
+            reportProfile: reportProfileId,
+            overall,
+            categories,
+            matchedCount,
+            hasPartialPowerChords,
+            sections: sectionStats.map((s) => ({
+                name: s.name,
+                hits: s.hits,
+                misses: s.misses,
+                accuracy: (s.hits + s.misses) > 0
+                    ? Math.round((s.hits / (s.hits + s.misses)) * 100)
+                    : 0,
+            })),
+        };
+    }
+
+    function _buildDiagnosticPlayReport(track) {
+        if (!track || !track.reportProfile) return null;
+        const profile = _DIAGNOSTIC_REPORT_PROFILES[track.reportProfile];
+        if (!profile) return null;
+        if (track.reportProfile === 'basic-guitar-v1') {
+            return _buildDiagnosticPlayReportFromProfile(profile, track.reportProfile);
+        }
+        return null;
+    }
+
+    function _diagPlayReportHitMissHtml(hit) {
+        return hit
+            ? '<span class="text-green-400">Hit</span>'
+            : '<span class="text-red-400">Miss</span>';
+    }
+
+    function _renderDiagnosticPlayHtml(report, reportProfileId) {
+        if (!report || !report.categories) return '';
+        if (reportProfileId === 'basic-guitar-v1') {
+            return _renderDiagnosticBasicGuitarPlayHtml(report);
+        }
+        return '';
+    }
+
+    function _renderDiagnosticBasicGuitarPlayHtml(report) {
+        const profile = _DIAGNOSTIC_REPORT_PROFILES['basic-guitar-v1'];
+        if (!report || !report.categories || !profile) return '';
+        const cats = report.categories;
+        let rows = '';
+
+        for (const id of (profile.singleHitMissCategories || [])) {
+            const c = cats[id];
+            if (!c || !c.attempts) continue;
+            rows += `<div class="flex justify-between gap-2 mb-1">`
+                + `<span class="text-gray-300">${c.label}</span>`
+                + _diagPlayReportHitMissHtml(c.hits > 0)
+                + `</div>`;
+        }
+
+        const pwr = cats[profile.powerChordCategoryId || 'powerChords'];
+        if (pwr && pwr.attempts) {
+            let pwrDetail = '';
+            if (pwr.avgStringsHeard != null) {
+                pwrDetail += `<div class="text-[10px] text-gray-500">`
+                    + `${pwr.chordHits}/${pwr.attempts} hit`
+                    + ` · avg heard ${pwr.avgStringsHeard.toFixed(1)} of ${pwr.expectedStrings} strings`
+                    + `</div>`;
+            } else {
+                pwrDetail += `<div class="text-[10px] text-gray-500">${pwr.hits}/${pwr.attempts} hit</div>`;
+            }
+            const partialLines = (pwr.perAttempt || [])
+                .filter((a) => a.heardTxt && (!a.hit || a.heardTxt.indexOf('heard 2 of 2') === -1))
+                .map((a) => {
+                    const prefix = Number.isFinite(a.t) ? `${a.t}s: ` : '';
+                    return `${prefix}${a.heardTxt}`;
+                });
+            if (partialLines.length) {
+                pwrDetail += `<div class="text-[10px] text-gray-500 mt-0.5">`
+                    + partialLines.join('<br>')
+                    + `</div>`;
+            }
+            rows += `<div class="mb-1">`
+                + `<div class="flex justify-between gap-2">`
+                + `<span class="text-gray-300">${pwr.label}</span>`
+                + `<span class="text-gray-400">${pwr.hits}/${pwr.attempts} hit</span>`
+                + `</div>${pwrDetail}</div>`;
+        }
+
+        const rep = cats.repeatCheck;
+        if (rep && rep.attempts) {
+            rows += `<div class="flex justify-between gap-2 mb-1">`
+                + `<span class="text-gray-300">${rep.label}</span>`
+                + `<span class="text-gray-400">${rep.hits}/${rep.attempts} hit</span>`
+                + `</div>`;
+        }
+
+        if (!rows) return '';
+
+        let notes = '<p class="text-[10px] text-gray-500 mt-2">'
+            + 'This diagnostic report did not change gameplay settings.'
+            + '</p>';
+        if (report.hasPartialPowerChords) {
+            notes += '<p class="text-[10px] text-gray-500 mt-1">'
+                + 'Power chords were partly heard. Try a cleaner/drier channel or run '
+                + 'Technique Assessment for root/fifth detail.'
+                + '</p>';
+        }
+
+        return `<div class="mt-3 text-xs border-t border-gray-600 pt-3">`
+            + `<div class="text-gray-200 text-xs font-semibold mb-2">Diagnostic Results</div>`
+            + rows
+            + notes
+            + `</div>`;
+    }
+
     // Returns true if a summary overlay was created, false if it bailed
     // (fewer than 5 judgments) — callers deferring the summary use this
     // to know whether there is actually an overlay to reveal later.
@@ -8798,6 +13792,24 @@ function createNoteDetector(options = {}) {
             breakdownHtml += '</div>';
         }
 
+        let diagnosticPlayHtml = '';
+        const diagnosticTrack = _getDiagnosticTrackForSession();
+        const diagnosticReport = diagnosticTrack
+            ? _buildDiagnosticPlayReport(diagnosticTrack)
+            : null;
+        if (diagnosticReport) {
+            diagnosticPlayHtml = _renderDiagnosticPlayHtml(
+                diagnosticReport,
+                diagnosticTrack.reportProfile,
+            );
+        }
+
+        const returnSnap = _ndShared.diagnosticReturn;
+        const showReturnPrevBtn = !!(diagnosticReport
+            && returnSnap
+            && returnSnap.active
+            && returnSnap.previousFilename);
+
         const overlay = document.createElement('div');
         overlay.className = 'nd-summary-overlay';
         // Skin attribute mirrors the instance root's so the overlay (a
@@ -8826,7 +13838,12 @@ function createNoteDetector(options = {}) {
                 <div class="nd-sum-xp hidden"></div>
                 ${breakdownHtml}
                 ${sectionHtml}
+                ${diagnosticPlayHtml}
                 <div class="nd-sum-actions">
+                    ${showReturnPrevBtn ? `
+                    <button type="button" class="nd-summary-return-prev nd-btn">
+                        Return to Previous Song
+                    </button>` : ''}
                     ${tuningMode ? `
                     <button class="nd-summary-download nd-btn nd-btn-primary">
                         Download Diagnostic JSON
@@ -8839,6 +13856,16 @@ function createNoteDetector(options = {}) {
         `;
         const closeBtn = overlay.querySelector('.nd-summary-close');
         if (closeBtn) closeBtn.onclick = () => overlay.remove();
+        const returnPrevBtn = overlay.querySelector('.nd-summary-return-prev');
+        if (returnPrevBtn) {
+            returnPrevBtn.onclick = () => {
+                overlay.remove();
+                _ndReturnToPreviousSongAfterDiagnostic().catch((e) => {
+                    console.warn('[note_detect] return to previous song failed:',
+                        e && e.message ? e.message : e);
+                });
+            };
+        }
         const dlBtn = overlay.querySelector('.nd-summary-download');
         if (dlBtn) dlBtn.onclick = () => _downloadDiagnostic();
         // Capture the reveal-animation targets at BUILD time: a deferred
@@ -9154,6 +14181,14 @@ function createNoteDetector(options = {}) {
         downloadDiagnostic: _downloadDiagnostic,
         getDiagnostic: _buildDiagnosticPayload,
         resetDiagnostic: resetScoring,
+        getCalibrationSnapshot,
+        getVerifierRejects,
+        openCalibrationWizard,
+        closeCalibrationWizard: calibrationWizardClose,
+        openInstrumentCalibrationLab,
+        closeInstrumentCalibrationLab: calibrationLabClose,
+        getCalibrationReport,
+        downloadCalibrationReport: _calLabDownloadReport,
         // Public setter for the Auto-tune-from-session panel — applies
         // a partial settings object with the same clamps the storage
         // loader uses, then persists via saveSettings(). Each field is
@@ -9622,6 +14657,14 @@ function _ndInstallPlaySongHook() {
             let f = args[0];
             try { f = decodeURIComponent(f); } catch (_) { /* leave raw */ }
             _ndShared.currentFilename = f;
+            const ret = _ndShared.diagnosticReturn;
+            if (ret && ret.active && f) {
+                const pf = ret.previousFilename;
+                const isRestoreTarget = pf && f === pf;
+                if (!isRestoreTarget && !_ndFilenameLooksDiagnostic(f)) {
+                    _ndClearDiagnosticReturnState();
+                }
+            }
         }
         // For each live instance: silent-disable if currently enabled
         // (stop audio + timers without popping a summary modal), then
