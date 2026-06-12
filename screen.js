@@ -238,6 +238,18 @@ function _ndFilenameLooksDiagnostic(fn) {
     return _ND_DIAGNOSTIC_FILENAME_MARKERS.some((m) => lower.includes(m));
 }
 
+// Escape untrusted text before interpolating into an innerHTML string.
+// Used for values that can carry markup metacharacters (e.g. engine/device
+// error messages surfaced in the calibration wizard).
+function _ndEscapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function _ndClearDiagnosticReturnState() {
     const r = _ndShared.diagnosticReturn;
     if (!r) return;
@@ -1694,7 +1706,7 @@ function createNoteDetector(options = {}) {
             if (s.detectEnabled !== undefined) detectPreference = !!s.detectEnabled;
             if (s.missMarkerDuration !== undefined) missMarkerDuration = Math.max(0.5, Math.min(5, s.missMarkerDuration));
             if (s.hitGlowDuration !== undefined) hitGlowDuration = Math.max(0.1, Math.min(2, s.hitGlowDuration));
-            if (Number.isFinite(s.inputGain)) inputGain = Math.max(1, Math.min(5, s.inputGain));
+            if (Number.isFinite(s.inputGain)) inputGain = Math.max(0.1, Math.min(5, s.inputGain));
             if (s.latencyOffset !== undefined) latencyOffset = s.latencyOffset;
             // Clamp to the slider's range so a stale persisted value
             // (older build, manual edit) can't put scoring in a state the
@@ -4891,14 +4903,6 @@ function createNoteDetector(options = {}) {
         return 'web-' + (detectionMethod || 'yin');
     }
 
-    function _ndLevelPeakNearChartTime(noteTimeAudio) {
-        const ctx = _ndStrikeLevelContext(noteTimeAudio);
-        return {
-            levelPct: ctx.levelAtLogPct,
-            peakPct: ctx.strikePeakPct,
-        };
-    }
-
     // Level telemetry around a chart note's strike (visual clock ±200 ms).
     function _ndStrikeLevelContext(noteTimeAudio) {
         const levelAtLogPct = Math.round((inputLevel || 0) * 100);
@@ -5070,29 +5074,6 @@ function createNoteDetector(options = {}) {
                 pitchErrorCents: Number.isFinite(judgment.pitchError) ? judgment.pitchError : null,
             });
         } catch (_) { /* never throw */ }
-    }
-
-    function _ndFormatVerifierRejectLine(r) {
-        if (!r || typeof r !== 'object') return '—';
-        const label = _ND_REJECT_REASON_LABEL[r.reason] || String(r.reason || 'unknown').toLowerCase();
-        const parts = [label];
-        if (Number.isFinite(r.hitStrings) && Number.isFinite(r.totalStrings)) {
-            parts.push(`${r.hitStrings}/${r.totalStrings} strings`);
-        } else if (Number.isInteger(r.string) && Number.isInteger(r.fret)) {
-            parts.push(`string ${r.string} fret ${r.fret}`);
-        }
-        const strikePeak = Number.isFinite(r.strikePeakPct)
-            ? r.strikePeakPct
-            : (Number.isFinite(r.inputPeakPct) ? r.inputPeakPct : null);
-        if (Number.isFinite(strikePeak)) {
-            parts.push(`peak@strike ${strikePeak}%`);
-        }
-        if (Number.isFinite(r.timingErrorMs)) {
-            const te = Math.round(r.timingErrorMs);
-            parts.push((te >= 0 ? '+' : '') + te + ' ms');
-        }
-        if (Number.isFinite(r.noteTime)) parts.push('t=' + (+r.noteTime).toFixed(2));
-        return parts.join(' · ');
     }
 
     function getVerifierRejects() {
@@ -6390,7 +6371,7 @@ function createNoteDetector(options = {}) {
         const applied = {};
         const rec = wiz.recommended || {};
         if (wiz.applyChecked.inputGain && Number.isFinite(rec.inputGain)) {
-            inputGain = Math.max(1, Math.min(5, rec.inputGain));
+            inputGain = Math.max(0.1, Math.min(5, rec.inputGain));
             if (gainNode) gainNode.gain.value = inputGain;
             applied.inputGain = inputGain;
         }
@@ -6962,7 +6943,7 @@ function createNoteDetector(options = {}) {
             const probeResultHtml = wiz.channelProbeResult
                 ? `<div class="${probeResultBoxClass}">${_calWizardFormatChannelProbeResult(wiz.channelProbeResult)}${probePickHtml}</div>`
                 : (wiz.channelProbeError
-                    ? `<div class="${probeResultBoxClass} text-amber-200/90">${wiz.channelProbeError}</div>`
+                    ? `<div class="${probeResultBoxClass} text-amber-200/90">${_ndEscapeHtml(wiz.channelProbeError)}</div>`
                     : '');
             html = `
                 ${_calWizardDetectBanner(snap)}
@@ -7910,14 +7891,6 @@ function createNoteDetector(options = {}) {
         return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
     }
 
-    function _calLabFailLabel(mask) {
-        const p = [];
-        if (mask & _CAL_LAB_FAIL.SNR) p.push('SNR');
-        if (mask & _CAL_LAB_FAIL.FUND) p.push('fundamental');
-        if (mask & _CAL_LAB_FAIL.PITCH) p.push('pitch');
-        return p.length ? p.join('+') : 'none';
-    }
-
     function _calLabPowerChordDisplayString(stringIndex) {
         return currentStringCount - stringIndex;
     }
@@ -8536,10 +8509,6 @@ function createNoteDetector(options = {}) {
             if (mode === 'basic') return !_CAL_LAB_ADVANCED_ONLY_STEP_IDS.has(s.id);
             return true;
         });
-    }
-
-    function _calLabStepMeta() {
-        return _calLabAllStepMeta();
     }
 
     function _calLabStringCaptureRowHtml(st, store, s, f, label, opts) {
@@ -10632,9 +10601,7 @@ function createNoteDetector(options = {}) {
                 // time; otherwise the configured user latency (up to
                 // 250 ms) would push the real peak outside the
                 // ±_ND_LEVEL_WIN_HALF window and trip false misses.
-                if (strikeCtx.strikeSamplesInWindow > 0
-                    && strikeCtx.strikePeakPct != null
-                    && strikeCtx.strikePeakPct < Math.round(_ND_SILENCE_THRESHOLD * 100)) {
+                if (strikeCtx.silenceWouldTrigger) {
                     const expectedMidiSg = _ndMidiFromStringFret(
                         cn.s, cn.f, currentArrangement, currentStringCount, tuningOffsets, capo
                     );
@@ -13452,11 +13419,6 @@ function createNoteDetector(options = {}) {
         return null;
     }
 
-    function _isDiagnosticBasicGuitarSession() {
-        const track = _getDiagnosticTrackForSession();
-        return !!(track && track.id === 'basic-guitar-6');
-    }
-
     function _diagMatchProfileEvent(events, spec, matchTolS) {
         for (const ev of events) {
             if (!ev || !Number.isFinite(ev.t)) continue;
@@ -13579,12 +13541,6 @@ function createNoteDetector(options = {}) {
             return _buildDiagnosticPlayReportFromProfile(profile, track.reportProfile);
         }
         return null;
-    }
-
-    function _buildDiagnosticBasicGuitarPlayReport() {
-        const track = _getDiagnosticTrackForSession();
-        if (!track || track.reportProfile !== 'basic-guitar-v1') return null;
-        return _buildDiagnosticPlayReport(track);
     }
 
     function _diagPlayReportHitMissHtml(hit) {
