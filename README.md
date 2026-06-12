@@ -144,6 +144,10 @@ YIN is the default and handles most rigs well. The other methods are opt-in for 
 | **CREPE / SPICE** | distorted / effected signals | 20 MB model download, WebGL required for speed |
 | **Chord constraint** | chords (auto-routed for ≥2 simultaneous chart notes) | per-string energy band check, not full polyphonic transcription |
 
+### Desktop: detect in-plugin on native audio
+
+On the Slopsmith **desktop** app the native JUCE engine owns the audio device and, by default, the engine's own detector produces the pitch/note verdicts the plugin consumes — so the **Detection Method** selector above has no effect there. Enable **Detect in-plugin (native audio)** in the gear ⚙ settings to instead run note_detect's own YIN/HPS/CREPE on the engine-captured guitar signal (pulled via the engine's `getRawAudioFrame` API), which is what lets you pick HPS or CREPE on desktop. Chords are still verified by the engine's harmonic-comb chord scorer. Because the audio comes from the native engine (not the browser's `getUserMedia`), this also sidesteps Electron's broken multichannel-USB capture on some interfaces (slopsmith#818). The toggle only appears on a desktop build whose engine exposes the raw-frame API, and takes effect the next time Detect is switched on.
+
 ### Chord detection
 
 When two or more chart notes share a timestamp the plugin routes through a constraint-based scorer instead of the single-note pitch detectors. For each note in the chord it computes the expected frequency band for that string (open pitch to fret 24, with ±10% headroom for capo, tuning offsets, and bends), measures how much of the audio frame's spectral energy falls inside that band, and counts the string as ringing if the band has ≥3% of total energy. The chord scores `hits / total`; the **Chord Leniency** setting decides how high that ratio needs to be for the chord to register as a hit.
