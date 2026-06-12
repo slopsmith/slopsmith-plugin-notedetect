@@ -9466,7 +9466,7 @@ function createNoteDetector(options = {}) {
             </select>
 
             <label class="block text-gray-400 text-xs mb-1">Audio Latency Offset: <span class="nd-latency-val">${Math.round(latencyOffset * 1000)}</span>ms</label>
-            <input type="range" min="0" max="250" value="${Math.round(latencyOffset * 1000)}"
+            <input type="range" min="0" max="500" value="${Math.round(latencyOffset * 1000)}"
                    class="nd-latency-slider w-full accent-green-400 mb-2">
             <div class="text-[10px] text-gray-600 mb-3 leading-tight">
                 Compensates for USB/audio interface delay. Increase if notes register late.
@@ -14446,13 +14446,20 @@ function createNoteDetector(options = {}) {
             }
             if (Number.isFinite(partial.latencyOffset)) {
                 // Clamp to the same range as the gear-popover slider
-                // (0–0.250 s). The storage loader doesn't clamp this
+                // (0–0.500 s). The storage loader doesn't clamp this
                 // field on read, but the writer should — letting a
                 // caller (auto-tune, DevTools experiment, stale code)
                 // park latency at 5 s would render the matching
                 // window unreachable until the user manually drags
                 // the slider back into range.
-                latencyOffset = Math.max(0, Math.min(0.25, partial.latencyOffset));
+                //
+                // Ceiling is 0.5 s, not 0.25: the detection pipeline's
+                // own latency (bass needs a ~85 ms analysis window, plus
+                // frame accumulation + the 50 ms detect tick) stacks with
+                // input I/O, and on real rigs the total chart→detected lag
+                // runs ~350 ms — above the old 250 ms cap, so the correct
+                // offset was literally unreachable through any UI path.
+                latencyOffset = Math.max(0, Math.min(0.5, partial.latencyOffset));
             }
             // Re-enforce timing-threshold invariants at the END of the
             // setter. A partial that lowers `timingTolerance` alone (and
