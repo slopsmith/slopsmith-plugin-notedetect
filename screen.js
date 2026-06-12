@@ -9291,11 +9291,22 @@ function createNoteDetector(options = {}) {
         // The native-frame detection toggle only does something on a desktop
         // build whose engine exposes the raw-audio-frame pull this instance
         // would use — hide it entirely in the browser / on a downlevel addon
-        // so it can't read as a dead switch.  Use _ndBridgeRawFramesAvailable()
-        // rather than a bare getRawAudioFrame check so source-bound instances
-        // (splitscreen, multi-input) route through getSourceRawAudioFrame and
-        // the UI gate matches the runtime gate in startAudio().
-        const _ndCanNativeFrames = _ndBridgeRawFramesAvailable();
+        // so it can't read as a dead switch.
+        //
+        // This check must be session-independent (the settings panel can open
+        // while Detect is off, when bridgeDesktop is null and
+        // _ndBridgeRawFramesAvailable() always returns false). Probe
+        // window.slopsmithDesktop directly and accept either getRawAudioFrame
+        // (default / unbound source) or getSourceRawAudioFrame (source-bound /
+        // splitscreen / multi-input), so the toggle is shown for any capable
+        // desktop build regardless of audio session state.
+        const _ndCanNativeFrames = (function () {
+            const d = (typeof window !== 'undefined') ? window.slopsmithDesktop : null;
+            const a = d && d.isDesktop && d.audio;
+            if (!a) return false;
+            return typeof a.getRawAudioFrame === 'function'
+                || typeof a.getSourceRawAudioFrame === 'function';
+        })();
         panel.innerHTML = `
             <div class="flex justify-between items-center mb-3">
                 <span class="text-gray-200 font-semibold">Note Detection Settings</span>
