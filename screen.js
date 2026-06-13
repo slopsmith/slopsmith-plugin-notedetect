@@ -11860,9 +11860,12 @@ function createNoteDetector(options = {}) {
         if (!nd || nd.version !== 1 || typeof nd.snapshot !== 'function') return null;
         let snap; try { snap = nd.snapshot(); } catch (_) { return null; }
         if (!snap || !Array.isArray(snap.providers) || !Array.isArray(snap.bindings)) return null;
-        const ext = snap.providers.find(p => p && p.kind && p.kind !== 'audio' && p.kind !== 'engine');
-        if (!ext) return null;
-        return snap.bindings.some(b => b && b.providerId === ext.id) ? ext : null;
+        // Find a non-audio provider that has an open binding. Check bound first
+        // so that an earlier unbound provider doesn't shadow a later bound one
+        // — if multiple non-audio providers exist, only the bound one matters.
+        const boundIds = new Set(snap.bindings.filter(b => b && b.providerId).map(b => b.providerId));
+        const ext = snap.providers.find(p => p && p.kind && p.kind !== 'audio' && p.kind !== 'engine' && boundIds.has(p.id));
+        return ext || null;
     }
 
     // Keys/piano (notation) arrangements are scored by an external MIDI provider,
@@ -11883,7 +11886,10 @@ function createNoteDetector(options = {}) {
             // subscribe, before scoring/HUD are armed) would otherwise be lost —
             // these are the first notes. Buffer them; _enableExternal flushes
             // them in once it's armed (post-reset).
-            if (_extScan() && _extPending.length < 128) _extPending.push({ hit, midi });
+            // Guard on detectPreference: if the user has Detect off, stale verdicts
+            // must not accumulate in _extPending and then contaminate the next
+            // scoring session when Detect is re-enabled.
+            if (detectPreference && _extScan() && _extPending.length < 128) _extPending.push({ hit, midi });
             return;
         }
         const t = (resolveHw() && hw.getTime) ? hw.getTime() : 0;
