@@ -201,6 +201,7 @@ test('zero-input diagnostic HTML uses nd-sum modal sections and required copy', 
     );
     assert.match(html, /nd-sum-sections/);
     assert.match(html, /nd-sum-subhead/);
+    assert.match(html, /nd-sum-miss-cause/);
     assert.match(html, /Diagnostic Results/);
     assert.match(html, /Why notes may have missed/);
     assert.match(html, /No input was detected/i);

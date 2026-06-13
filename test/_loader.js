@@ -184,6 +184,10 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         '_shouldBailShowSummaryForLowJudgments', '_shouldSkipEndSummaryWhenDisabled',
         '_synthesizeZeroInputDiagnosticPlayReport',
         '_buildDiagnosticBasicGuitarPlayHtml', '_ndSummaryOverlayMountNode',
+        '_applyNdSummaryOverlayShellStyles', '_hideNdSummaryOverlayShell',
+        '_revealNdSummaryOverlayShell', '_applyNdSummaryContentFallbackStyles',
+        '_getDiagnosticTrackForSessionFromState', '_ndDiagnosticCatalogMatchesSongInfo',
+        '_getDiagnosticTrackCatalog',
         'createNoteDetector',
     ];
     const missing = required.filter(name => typeof sandbox[name] !== 'function');
@@ -316,6 +320,13 @@ function loadDetectionCore({ sandboxBeforeRun } = {}) {
         synthesizeZeroInputDiagnosticPlayReport: sandbox._synthesizeZeroInputDiagnosticPlayReport,
         buildDiagnosticBasicGuitarPlayHtml: sandbox._buildDiagnosticBasicGuitarPlayHtml,
         summaryOverlayMountNode: sandbox._ndSummaryOverlayMountNode,
+        applyNdSummaryOverlayShellStyles: sandbox._applyNdSummaryOverlayShellStyles,
+        hideNdSummaryOverlayShell: sandbox._hideNdSummaryOverlayShell,
+        revealNdSummaryOverlayShell: sandbox._revealNdSummaryOverlayShell,
+        applyNdSummaryContentFallbackStyles: sandbox._applyNdSummaryContentFallbackStyles,
+        getDiagnosticTrackForSessionFromState: sandbox._getDiagnosticTrackForSessionFromState,
+        diagnosticCatalogMatchesSongInfo: sandbox._ndDiagnosticCatalogMatchesSongInfo,
+        getDiagnosticTrackCatalog: sandbox._getDiagnosticTrackCatalog,
         createNoteDetector: sandbox.createNoteDetector,
         // Drill-mode tests: expose the slopsmith stub so tests can
         // drive synthetic `loop:restart` etc. and toggle the loop

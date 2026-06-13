@@ -238,6 +238,87 @@ function _ndFilenameLooksDiagnostic(fn) {
     return _ND_DIAGNOSTIC_FILENAME_MARKERS.some((m) => lower.includes(m));
 }
 
+// ── Diagnostic track catalog — post-play report (read-only) ─────────────
+// Catalog + report profiles let multiple diagnostic sloppaks share one
+// detection/report path. Does NOT change scoring, thresholds, or settings.
+// Module-level so filename/metadata recognition is testable headlessly.
+const _DIAGNOSTIC_TRACK_CATALOG = [
+    {
+        id: 'basic-guitar-6',
+        title: 'Basic Guitar Diagnostic',
+        artist: 'feed[dB]ack',
+        arrangement: 'Diagnostic Guitar',
+        titleAliases: [
+            'Basic Guitar Diagnostic',
+            'Slopsmith Diagnostic — Basic Guitar',
+        ],
+        artistAliases: [
+            'feed[dB]ack',
+            'Slopsmith',
+        ],
+        filenameIncludes: 'slopsmith-diagnostic-basic-guitar.sloppak',
+        dlcRelativePath: 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak',
+        instrument: 'guitar',
+        stringCount: 6,
+        reportProfile: 'basic-guitar-v1',
+        description: 'Checks timing, open strings, fretted notes, and power chords.',
+    },
+];
+
+function _ndDiagnosticCatalogTextList(primary, aliases) {
+    const items = [primary].concat(aliases || []);
+    const seen = new Set();
+    const out = [];
+    for (const raw of items) {
+        const norm = String(raw || '').trim().toLowerCase();
+        if (!norm || seen.has(norm)) continue;
+        seen.add(norm);
+        out.push(norm);
+    }
+    return out;
+}
+
+function _ndDiagnosticCatalogTitles(track) {
+    return _ndDiagnosticCatalogTextList(track.title, track.titleAliases);
+}
+
+function _ndDiagnosticCatalogArtists(track) {
+    return _ndDiagnosticCatalogTextList(track.artist, track.artistAliases);
+}
+
+function _ndDiagnosticCatalogMatchesSongInfo(track, info) {
+    if (!track || !info) return false;
+    const title = String(info.title || '').trim().toLowerCase();
+    const artist = String(info.artist || '').trim().toLowerCase();
+    const arrangement = String(info.arrangement || '').trim();
+    if (!title || !artist) return false;
+    if (arrangement !== track.arrangement) return false;
+    if (!_ndDiagnosticCatalogTitles(track).includes(title)) return false;
+    if (!_ndDiagnosticCatalogArtists(track).includes(artist)) return false;
+    return true;
+}
+
+function _getDiagnosticTrackForSessionFromState(currentFilename, songInfo) {
+    const fn = String(currentFilename || '').toLowerCase();
+    for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
+        if (track.filenameIncludes
+            && fn.includes(String(track.filenameIncludes).toLowerCase())) {
+            return track;
+        }
+    }
+    const info = songInfo || {};
+    for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
+        if (_ndDiagnosticCatalogMatchesSongInfo(track, info)) {
+            return track;
+        }
+    }
+    return null;
+}
+
+function _getDiagnosticTrackCatalog() {
+    return _DIAGNOSTIC_TRACK_CATALOG;
+}
+
 // Escape untrusted text before interpolating into an innerHTML string.
 // Used for values that can carry markup metacharacters (e.g. engine/device
 // error messages surfaced in the calibration wizard).
@@ -752,6 +833,349 @@ function _ndFindSummaryOverlay() {
     return document.querySelector('.nd-summary-overlay');
 }
 
+// Inline shell styles so the summary modal stays full-screen even when
+// plugin.css fails to load in the v3/feed[dB]ack host (observed: position
+// static / z-index auto with overlay appended to document.body).
+const _ND_SUMMARY_OVERLAY_Z_INDEX = '1200';
+
+function _applyNdSummaryOverlayShellStyles(overlay) {
+    if (!overlay || !overlay.style) return;
+    const s = overlay.style;
+    s.position = 'fixed';
+    s.top = '0';
+    s.right = '0';
+    s.bottom = '0';
+    s.left = '0';
+    s.zIndex = _ND_SUMMARY_OVERLAY_Z_INDEX;
+    s.display = 'flex';
+    s.alignItems = 'center';
+    s.justifyContent = 'center';
+    s.background = 'rgba(0, 0, 0, 0.62)';
+    s.backdropFilter = 'blur(5px)';
+    s.webkitBackdropFilter = 'blur(5px)';
+    s.padding = '1rem';
+    s.boxSizing = 'border-box';
+    s.pointerEvents = 'auto';
+}
+
+function _hideNdSummaryOverlayShell(overlay) {
+    if (!overlay || !overlay.style) return;
+    overlay.style.display = 'none';
+}
+
+function _revealNdSummaryOverlayShell(overlay) {
+    if (!overlay || !overlay.style) return;
+    overlay.style.display = 'flex';
+}
+
+function _ndAssignInlineStyles(el, styles) {
+    if (!el || !el.style || !styles) return;
+    for (const key of Object.keys(styles)) el.style[key] = styles[key];
+}
+
+function _ndSummaryQueryAll(root, sel) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    const list = root.querySelectorAll(sel);
+    if (!list) return [];
+    return Array.from(list);
+}
+
+// Inline card/content styles when plugin.css is absent in the v3 host.
+function _applyNdSummaryContentFallbackStyles(overlay) {
+    if (!overlay || typeof overlay.querySelector !== 'function') return;
+
+    const shell = overlay.querySelector('.nd-sum-shell');
+    _ndAssignInlineStyles(shell, {
+        position: 'relative',
+        width: 'min(92vw, 820px)',
+        maxWidth: '820px',
+    });
+
+    const panel = overlay.querySelector('.nd-sum-panel');
+    _ndAssignInlineStyles(panel, {
+        width: '100%',
+        maxWidth: '820px',
+        maxHeight: '86vh',
+        overflowY: 'auto',
+        background: 'rgba(15, 23, 42, 0.96)',
+        border: '1px solid rgba(148, 163, 184, 0.25)',
+        borderRadius: '18px',
+        boxShadow: '0 24px 70px rgba(0, 0, 0, 0.45)',
+        padding: '1.5rem',
+        color: '#e5edf5',
+        lineHeight: '1.35',
+        boxSizing: 'border-box',
+        fontFamily: 'inherit',
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-header'), {
+        textAlign: 'center',
+        fontSize: '1.3rem',
+        fontWeight: '700',
+        marginBottom: '1rem',
+        letterSpacing: '0.04em',
+        textTransform: 'none',
+        color: '#e5edf5',
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-grade-wrap'), {
+        textAlign: 'center',
+        marginBottom: '0.75rem',
+        minHeight: '4.5rem',
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-grade').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            display: 'inline-block',
+            fontSize: '3rem',
+            fontWeight: '700',
+            lineHeight: '1',
+            opacity: '1',
+            transform: 'none',
+            margin: '0.25rem 0',
+            color: '#38bdf8',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-fc').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            marginTop: '0.35rem',
+            fontSize: '0.75rem',
+            letterSpacing: '0.18em',
+            textTransform: 'uppercase',
+            color: '#4ade80',
+            opacity: '1',
+        });
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-headline'), {
+        display: 'flex',
+        justifyContent: 'center',
+        gap: '2rem',
+        margin: '0.75rem 0 1rem',
+        textAlign: 'center',
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-acc').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '1.75rem',
+            fontWeight: '700',
+            fontVariantNumeric: 'tabular-nums',
+        });
+    });
+    _ndSummaryQueryAll(overlay, '.nd-sum-score').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '1.75rem',
+            fontWeight: '700',
+            fontVariantNumeric: 'tabular-nums',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-label').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            display: 'block',
+            marginTop: '0.25rem',
+            fontSize: '0.65rem',
+            letterSpacing: '0.14em',
+            textTransform: 'uppercase',
+            color: '#94a3b8',
+        });
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-stats'), {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: '0.75rem',
+        margin: '1rem 0',
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-stat').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '0.75rem',
+            padding: '0.55rem 0.75rem',
+            background: 'rgba(255, 255, 255, 0.05)',
+            border: '1px solid rgba(148, 163, 184, 0.15)',
+            borderRadius: '10px',
+            opacity: '1',
+            transform: 'none',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-stat-label').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.75rem',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            color: '#94a3b8',
+            marginRight: '0.5rem',
+            flexShrink: '0',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-stat-val').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '1rem',
+            fontWeight: '700',
+            marginLeft: 'auto',
+            fontVariantNumeric: 'tabular-nums',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-val-good').forEach((el) => { el.style.color = '#4ade80'; });
+    _ndSummaryQueryAll(overlay, '.nd-val-bad').forEach((el) => { el.style.color = '#f87171'; });
+    _ndSummaryQueryAll(overlay, '.nd-val-accent').forEach((el) => { el.style.color = '#38bdf8'; });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-sections').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            marginTop: '1rem',
+            paddingTop: '0.75rem',
+            borderTop: '1px solid rgba(148, 163, 184, 0.2)',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-subhead').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            margin: '0 0 0.6rem',
+            fontSize: '0.75rem',
+            fontWeight: '700',
+            letterSpacing: '0.12em',
+            textTransform: 'uppercase',
+            color: '#94a3b8',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-bar-row').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '0.75rem',
+            marginBottom: '0.4rem',
+            fontSize: '0.85rem',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-bar-label').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            flex: '1 1 auto',
+            minWidth: '0',
+            color: '#e5edf5',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-bar-val').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            flexShrink: '0',
+            fontWeight: '600',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-note').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            margin: '0.35rem 0 0.75rem',
+            fontSize: '0.8rem',
+            lineHeight: '1.45',
+            color: '#94a3b8',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            marginTop: '1rem',
+            paddingTop: '0.75rem',
+            borderTop: '1px solid rgba(148, 163, 184, 0.2)',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-head').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.8rem',
+            fontWeight: '700',
+            marginBottom: '0.5rem',
+            color: '#e5edf5',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-summary').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.8rem',
+            lineHeight: '1.45',
+            marginBottom: '0.45rem',
+            color: '#94a3b8',
+        });
+    });
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-line').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.8rem',
+            lineHeight: '1.45',
+            marginBottom: '0.45rem',
+            color: '#94a3b8',
+        });
+    });
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-empty').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.8rem',
+            lineHeight: '1.45',
+            marginBottom: '0.45rem',
+            color: '#94a3b8',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-cat').forEach((el) => {
+        el.style.color = '#e5edf5';
+        el.style.fontWeight = '600';
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-next').forEach((el) => {
+        el.style.color = '#64748b';
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-actions'), {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '0.75rem',
+        justifyContent: 'center',
+        marginTop: '1.25rem',
+    });
+
+    const _btnBase = {
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '0.65rem 1.15rem',
+        borderRadius: '999px',
+        border: '1px solid rgba(148, 163, 184, 0.35)',
+        background: 'rgba(255, 255, 255, 0.08)',
+        color: '#e5edf5',
+        fontSize: '0.85rem',
+        fontWeight: '600',
+        cursor: 'pointer',
+        lineHeight: '1.2',
+        minWidth: '6rem',
+    };
+    for (const sel of ['.nd-summary-return-prev', '.nd-summary-close', '.nd-summary-download', '.nd-btn']) {
+        _ndSummaryQueryAll(overlay, sel).forEach((btn) => {
+            _ndAssignInlineStyles(btn, _btnBase);
+        });
+    }
+
+    const _btnPrimary = {
+        background: 'linear-gradient(180deg, #38bdf8, #0ea5e9)',
+        border: '1px solid rgba(56, 189, 248, 0.6)',
+        color: '#0f172a',
+    };
+    for (const sel of ['.nd-summary-return-prev', '.nd-btn-primary']) {
+        _ndSummaryQueryAll(overlay, sel).forEach((btn) => {
+            _ndAssignInlineStyles(btn, _btnPrimary);
+        });
+    }
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-frame'), { display: 'none' });
+}
+
 // Read-only diagnostic rows for the end-of-song summary panel (nd-sum-* classes
 // so layout works without Tailwind inside the modal).
 function _buildDiagnosticBasicGuitarPlayHtml(report, profile, missCauseHtml) {
@@ -1260,22 +1684,22 @@ function _renderDiagnosticMissCauseHtml(analysis) {
     if (!analysis) return '';
     const { summary, categories, hasIssues } = analysis;
     if (!hasIssues) {
-        return '<div class="mt-2 text-[10px] text-gray-500">'
+        return '<div class="nd-sum-miss-cause nd-sum-miss-cause-empty">'
             + 'Why notes may have missed: No major miss pattern found.'
             + '</div>';
     }
-    let html = '<div class="mt-2 pt-2 border-t border-gray-700/80">'
-        + '<div class="text-gray-300 text-[11px] font-semibold mb-1">Why notes may have missed</div>';
+    let html = '<div class="nd-sum-miss-cause">'
+        + '<div class="nd-sum-miss-cause-head">Why notes may have missed</div>';
     if (summary) {
-        html += `<div class="text-[10px] text-gray-400 mb-1.5">${summary}</div>`;
+        html += `<div class="nd-sum-miss-cause-summary">${summary}</div>`;
     }
     for (const catId of Object.keys(categories)) {
         const c = categories[catId];
         if (!c) continue;
-        html += '<div class="text-[10px] text-gray-400 mb-1">'
-            + `<span class="text-gray-300">${c.label}:</span> ${c.line}`;
+        html += '<div class="nd-sum-miss-cause-line">'
+            + `<span class="nd-sum-miss-cause-cat">${c.label}:</span> ${c.line}`;
         if (c.nextStep) {
-            html += `<span class="text-gray-500"> · Next: ${c.nextStep}</span>`;
+            html += `<span class="nd-sum-miss-cause-next"> · Next: ${c.nextStep}</span>`;
         }
         html += '</div>';
     }
@@ -12228,7 +12652,7 @@ function createNoteDetector(options = {}) {
         if (!isDefault) return;
         const overlay = _ndFindSummaryOverlay();
         if (overlay) {
-            overlay.style.display = '';
+            _revealNdSummaryOverlayShell(overlay);
             // Play the reveal sequence now that the overlay is actually
             // visible, using the stats captured at build time (the live
             // counters may already belong to the next song).
@@ -12240,7 +12664,9 @@ function createNoteDetector(options = {}) {
         if (endOfSongSubscribed) return;
         if (!window.slopsmith
             || typeof window.slopsmith.on !== 'function'
-            || typeof window.slopsmith.off !== 'function') return;
+            || typeof window.slopsmith.off !== 'function') {
+            return;
+        }
         const fn = _endOfSongOnEnded;
         try {
             window.slopsmith.on('song:ended', fn);
@@ -14053,24 +14479,6 @@ function createNoteDetector(options = {}) {
         _liveSessionId = null;
     }
 
-    // ── Diagnostic track catalog — post-play report (read-only) ───────
-    // Catalog + report profiles let multiple diagnostic sloppaks share one
-    // detection/report path. Does NOT change scoring, thresholds, or settings.
-    const _DIAGNOSTIC_TRACK_CATALOG = [
-        {
-            id: 'basic-guitar-6',
-            title: 'Slopsmith Diagnostic — Basic Guitar',
-            artist: 'Slopsmith',
-            arrangement: 'Diagnostic Guitar',
-            filenameIncludes: 'slopsmith-diagnostic-basic-guitar.sloppak',
-            dlcRelativePath: 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak',
-            instrument: 'guitar',
-            stringCount: 6,
-            reportProfile: 'basic-guitar-v1',
-            description: 'Checks timing, open strings, fretted notes, and power chords.',
-        },
-    ];
-
     function _ndSetDiagnosticLaunchStatus(panel, message) {
         if (!panel) return;
         const el = panel.querySelector('.nd-health-diag-launch-status');
@@ -14281,23 +14689,9 @@ function createNoteDetector(options = {}) {
     };
 
     function _getDiagnosticTrackForSession() {
-        const fn = (_ndShared.currentFilename || '').toLowerCase();
         const currentHw = resolveHw();
         const info = (currentHw && currentHw.getSongInfo) ? currentHw.getSongInfo() : {};
-        for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
-            if (track.filenameIncludes
-                && fn.includes(String(track.filenameIncludes).toLowerCase())) {
-                return track;
-            }
-        }
-        for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
-            if (info.title === track.title
-                && info.artist === track.artist
-                && info.arrangement === track.arrangement) {
-                return track;
-            }
-        }
-        return null;
+        return _getDiagnosticTrackForSessionFromState(_ndShared.currentFilename, info);
     }
 
     function _buildDiagnosticPlayReportFromProfile(profile, reportProfileId) {
@@ -14459,7 +14853,9 @@ function createNoteDetector(options = {}) {
         const diagnosticTrack = _getDiagnosticTrackForSession();
         const isDiagnosticSession = !!diagnosticTrack;
         const total = hits + misses;
-        if (_shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total)) return false;
+        if (_shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total)) {
+            return false;
+        }
 
         const diagnosticReport = diagnosticTrack
             ? _buildDiagnosticPlayReport(diagnosticTrack)
@@ -14564,7 +14960,6 @@ function createNoteDetector(options = {}) {
         // Skin attribute mirrors the instance root's so the overlay (a
         // separate top-level nd root in the CSS) themes identically.
         try { overlay.setAttribute('data-nd-skin', _ndLoadSkin()); } catch (e) {}
-        overlay.style.pointerEvents = 'auto';
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
         // .nd-sum-shell wraps the (scrollable) panel so the hand-drawn frame
         // overlay (.nd-sum-frame) can sit absolutely over the panel's edges
@@ -14623,6 +15018,7 @@ function createNoteDetector(options = {}) {
         }
         const dlBtn = overlay.querySelector('.nd-summary-download');
         if (dlBtn) dlBtn.onclick = () => _downloadDiagnostic();
+        _applyNdSummaryContentFallbackStyles(overlay);
         // Capture the reveal-animation targets at BUILD time: a deferred
         // (startHidden) summary is revealed after a new song's playSong hook
         // may have reset the live counters, so _runDeferredSummary() must
@@ -14631,7 +15027,8 @@ function createNoteDetector(options = {}) {
         // startHidden: built now (so the stats are this song's) but kept
         // out of view until _runDeferredSummary() reveals it — used when
         // a training consent modal is taking the screen on song:ended.
-        if (opts && opts.startHidden) overlay.style.display = 'none';
+        _applyNdSummaryOverlayShellStyles(overlay);
+        if (opts && opts.startHidden) _hideNdSummaryOverlayShell(overlay);
         _ndSummaryOverlayMountNode().appendChild(overlay);
         if (!(opts && opts.startHidden)) _animateSummary(overlay, overlay._ndReveal);
 
