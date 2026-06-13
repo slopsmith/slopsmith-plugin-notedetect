@@ -11935,7 +11935,7 @@ function createNoteDetector(options = {}) {
     function _extBindWatch() {
         if (_extWatchOpen || !isDefault) return;
         _extWatchOpen = () => {
-            if (_extActive || !detectPreference || !_extScan()) return;
+            if (_extActive || !detectPreference || !_ndIsExternalScoredArrangement() || !_extScan()) return;
             if (enabled) { try { stopAudio(); } catch (_) {} }
             enabled = false;
             enable().catch(() => {});
@@ -11944,7 +11944,11 @@ function createNoteDetector(options = {}) {
             if (!_extActive || _extScan()) return;
             _extActive = false;
             _extPending = [];
-            _extUnsubscribe();
+            // Do NOT unsubscribe here — the persistent hit/miss subscription must
+            // survive provider-disconnect so verdicts arriving during the next async
+            // arm window (between binding-opened and _enableExternal completing) are
+            // buffered by _extFeed rather than silently dropped.  _extUnsubscribe()
+            // is reserved for full watcher teardown (disable / destroy).
             stopHUD();
             enabled = false;
             updateButton();
@@ -12018,7 +12022,7 @@ function createNoteDetector(options = {}) {
 
         // External detection source (MIDI keys highway): score from the
         // note-detection domain instead of the mic — same graded HUD + summary.
-        if (_extScan()) return _enableExternal();
+        if (_ndIsExternalScoredArrangement() && _extScan()) return _enableExternal();
         // Keys/piano arrangement with no provider yet: never start the mic —
         // idle until an external provider's binding registers (the bind watcher
         // then promotes us into external mode).
@@ -12155,7 +12159,11 @@ function createNoteDetector(options = {}) {
         sessionGen++;
         stopAudio();
         stopHUD();
-        if (_extActive) { _extActive = false; _extUnsubscribe(); }
+        // Always clear external state on disable: _extWatchClose no longer
+        // unsubscribes (to avoid dropping first-note verdicts on reconnect),
+        // so disable() is responsible for the full subscription teardown.
+        // _extSubscribe() re-runs when the next enable() reaches _enableExternal.
+        _extActive = false; _extUnsubscribe();
         // Auto-record is the one enable-bound listener we drop on disable()
         // (not only on destroy): its handler arms/saves takes, so it must
         // not stay live while Detect is off. Re-enable rebinds it.
