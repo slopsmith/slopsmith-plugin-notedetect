@@ -11843,6 +11843,128 @@ function createNoteDetector(options = {}) {
     // startAudio ultimately failed, the first call's cleanup would
     // flip `enabled` back to false after the second had already
     // reported success.
+    /* ── External detection source — note-detection domain consumer (spec 009) ─
+     * When a non-audio provider (e.g. the MIDI keys highway) has an open
+     * detection binding, notedetect scores from its reported verdicts instead
+     * of the mic, driving the SAME HUD + graded/currency summary. Scoring math
+     * is untouched: external hit/miss verdicts feed recordJudgment() exactly
+     * like the audio path (emit:true so the core stats-recorder/progression
+     * award fires too). The source's own /api/stats POST is suppressed so this
+     * doesn't double-count. */
+    let _extActive = false;
+    let _extOnHit = null, _extOnMiss = null, _extWatchOpen = null, _extWatchClose = null;
+    let _extPending = [];   // verdicts seen before external mode fully armed (flushed on activate)
+
+    function _extScan() {
+        const nd = window.slopsmith && window.slopsmith.noteDetection;
+        if (!nd || nd.version !== 1 || typeof nd.snapshot !== 'function') return null;
+        let snap; try { snap = nd.snapshot(); } catch (_) { return null; }
+        if (!snap || !Array.isArray(snap.providers) || !Array.isArray(snap.bindings)) return null;
+        // Find a non-audio provider that has an open binding. Check bound first
+        // so that an earlier unbound provider doesn't shadow a later bound one
+        // — if multiple non-audio providers exist, only the bound one matters.
+        const boundIds = new Set(snap.bindings.filter(b => b && b.providerId).map(b => b.providerId));
+        const ext = snap.providers.find(p => p && p.kind && p.kind !== 'audio' && p.kind !== 'engine' && boundIds.has(p.id));
+        return ext || null;
+    }
+
+    // Keys/piano (notation) arrangements are scored by an external MIDI provider,
+    // never the mic — notedetect's audio detection is fretted-instrument-only.
+    function _ndIsExternalScoredArrangement() {
+        try {
+            const info = (resolveHw() && hw.getSongInfo) ? hw.getSongInfo() : null;
+            const name = info && info.arrangement;
+            return !!(name && /\b(keys|piano|keyboard|synth)\b/i.test(String(name)));
+        } catch (_) { return false; }
+    }
+
+    function _extFeed(detail, hit) {
+        const p = (detail && detail.payload) || {};
+        const midi = Number(p.midi);
+        if (!_extActive) {
+            // A verdict arriving during the async enter-external window (after we
+            // subscribe, before scoring/HUD are armed) would otherwise be lost —
+            // these are the first notes. Buffer them; _enableExternal flushes
+            // them in once it's armed (post-reset).
+            // Guard on detectPreference: if the user has Detect off, stale verdicts
+            // must not accumulate in _extPending and then contaminate the next
+            // scoring session when Detect is re-enabled.
+            if (detectPreference && _extScan() && _extPending.length < 128) _extPending.push({ hit, midi });
+            return;
+        }
+        const t = (resolveHw() && hw.getTime) ? hw.getTime() : 0;
+        const key = 'ext:' + (Number.isFinite(midi) ? midi : 'x') + ':' + Number(t).toFixed(3) + ':' + (hit ? 'h' : 'm');
+        try {
+            recordJudgment(key, { hit: !!hit, detectedMidi: hit && Number.isFinite(midi) ? midi : null, _external: true },
+                { count: true, emit: true });
+        } catch (_) {}
+    }
+
+    function _extSubscribe() {
+        if (_extOnHit) return;
+        _extOnHit  = (detail) => _extFeed(detail, true);
+        _extOnMiss = (detail) => _extFeed(detail, false);
+        try {
+            window.slopsmith.on('note-detection:hit', _extOnHit);
+            window.slopsmith.on('note-detection:miss', _extOnMiss);
+        } catch (_) {}
+    }
+    function _extUnsubscribe() {
+        try {
+            if (_extOnHit)  window.slopsmith.off('note-detection:hit', _extOnHit);
+            if (_extOnMiss) window.slopsmith.off('note-detection:miss', _extOnMiss);
+        } catch (_) {}
+        _extOnHit = _extOnMiss = null;
+    }
+
+    // enableImpl() has already set enabled=true and run the event bindings.
+    function _enableExternal() {
+        _extActive = true;
+        attachInstanceRoot();
+        updateButton();
+        startHUD();
+        _extSubscribe();
+        // Flush verdicts buffered during the arming window (the first notes).
+        if (_extPending.length) {
+            const pend = _extPending; _extPending = [];
+            for (const v of pend) _extFeed({ payload: { midi: v.midi } }, v.hit);
+        }
+        return true;
+    }
+
+    function _extBindWatch() {
+        if (_extWatchOpen || !isDefault) return;
+        _extWatchOpen = () => {
+            if (_extActive || !detectPreference || !_ndIsExternalScoredArrangement() || !_extScan()) return;
+            if (enabled) { try { stopAudio(); } catch (_) {} }
+            enabled = false;
+            enable().catch(() => {});
+        };
+        _extWatchClose = () => {
+            if (!_extActive || _extScan()) return;
+            _extActive = false;
+            _extPending = [];
+            // Do NOT unsubscribe here — the persistent hit/miss subscription must
+            // survive provider-disconnect so verdicts arriving during the next async
+            // arm window (between binding-opened and _enableExternal completing) are
+            // buffered by _extFeed rather than silently dropped.  _extUnsubscribe()
+            // is reserved for full watcher teardown (disable / destroy).
+            stopHUD();
+            enabled = false;
+            updateButton();
+        };
+        try {
+            window.slopsmith.on('note-detection:binding-opened', _extWatchOpen);
+            window.slopsmith.on('note-detection:provider-registered', _extWatchOpen);
+            window.slopsmith.on('note-detection:binding-closed', _extWatchClose);
+            window.slopsmith.on('note-detection:provider-unregistered', _extWatchClose);
+        } catch (_) {}
+        // Subscribe to verdicts now (persistent) so ones arriving during the
+        // async enter-external window are buffered, not lost — _extFeed buffers
+        // until _extActive, then _enableExternal flushes them.
+        _extSubscribe();
+    }
+
     let enableInFlight = null;
     function enable() {
         if (enableInFlight) return enableInFlight;
@@ -11897,6 +12019,18 @@ function createNoteDetector(options = {}) {
         _chartStateBindEvents();
 
         resetScoring();
+
+        // External detection source (MIDI keys highway): score from the
+        // note-detection domain instead of the mic — same graded HUD + summary.
+        if (_ndIsExternalScoredArrangement() && _extScan()) return _enableExternal();
+        // Keys/piano arrangement with no provider yet: never start the mic —
+        // idle until an external provider's binding registers (the bind watcher
+        // then promotes us into external mode).
+        if (_ndIsExternalScoredArrangement()) {
+            enabled = false;
+            updateButton();
+            return false;
+        }
 
         // Queue the audio acquisition through the shared chain so
         // enable cannot overlap with a concurrent restartAudio
@@ -12025,6 +12159,11 @@ function createNoteDetector(options = {}) {
         sessionGen++;
         stopAudio();
         stopHUD();
+        // Always clear external state on disable: _extWatchClose no longer
+        // unsubscribes (to avoid dropping first-note verdicts on reconnect),
+        // so disable() is responsible for the full subscription teardown.
+        // _extSubscribe() re-runs when the next enable() reaches _enableExternal.
+        _extActive = false; _extUnsubscribe();
         // Auto-record is the one enable-bound listener we drop on disable()
         // (not only on destroy): its handler arms/saves takes, so it must
         // not stay live while Detect is off. Re-enable rebinds it.
@@ -14779,6 +14918,10 @@ function createNoteDetector(options = {}) {
     const _hasAudio = typeof window !== 'undefined'
         && (typeof window.AudioContext === 'function'
             || typeof window.webkitAudioContext === 'function');
+    // Watch for an external detection source (MIDI keys highway) so notedetect
+    // renders its HUD/summary from domain verdicts — even with no mic.
+    _extBindWatch();
+
     if (isDefault && detectPreference && _hasAudio) {
         // Auto-enable immediately so a persisted-on session starts detecting
         // the instant the page is ready — a blanket startup delay would miss
