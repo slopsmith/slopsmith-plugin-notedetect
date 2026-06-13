@@ -238,6 +238,87 @@ function _ndFilenameLooksDiagnostic(fn) {
     return _ND_DIAGNOSTIC_FILENAME_MARKERS.some((m) => lower.includes(m));
 }
 
+// ── Diagnostic track catalog — post-play report (read-only) ─────────────
+// Catalog + report profiles let multiple diagnostic sloppaks share one
+// detection/report path. Does NOT change scoring, thresholds, or settings.
+// Module-level so filename/metadata recognition is testable headlessly.
+const _DIAGNOSTIC_TRACK_CATALOG = [
+    {
+        id: 'basic-guitar-6',
+        title: 'Basic Guitar Diagnostic',
+        artist: 'feed[dB]ack',
+        arrangement: 'Diagnostic Guitar',
+        titleAliases: [
+            'Basic Guitar Diagnostic',
+            'Slopsmith Diagnostic — Basic Guitar',
+        ],
+        artistAliases: [
+            'feed[dB]ack',
+            'Slopsmith',
+        ],
+        filenameIncludes: 'slopsmith-diagnostic-basic-guitar.sloppak',
+        dlcRelativePath: 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak',
+        instrument: 'guitar',
+        stringCount: 6,
+        reportProfile: 'basic-guitar-v1',
+        description: 'Checks timing, open strings, fretted notes, and power chords.',
+    },
+];
+
+function _ndDiagnosticCatalogTextList(primary, aliases) {
+    const items = [primary].concat(aliases || []);
+    const seen = new Set();
+    const out = [];
+    for (const raw of items) {
+        const norm = String(raw || '').trim().toLowerCase();
+        if (!norm || seen.has(norm)) continue;
+        seen.add(norm);
+        out.push(norm);
+    }
+    return out;
+}
+
+function _ndDiagnosticCatalogTitles(track) {
+    return _ndDiagnosticCatalogTextList(track.title, track.titleAliases);
+}
+
+function _ndDiagnosticCatalogArtists(track) {
+    return _ndDiagnosticCatalogTextList(track.artist, track.artistAliases);
+}
+
+function _ndDiagnosticCatalogMatchesSongInfo(track, info) {
+    if (!track || !info) return false;
+    const title = String(info.title || '').trim().toLowerCase();
+    const artist = String(info.artist || '').trim().toLowerCase();
+    const arrangement = String(info.arrangement || '').trim();
+    if (!title || !artist) return false;
+    if (arrangement !== track.arrangement) return false;
+    if (!_ndDiagnosticCatalogTitles(track).includes(title)) return false;
+    if (!_ndDiagnosticCatalogArtists(track).includes(artist)) return false;
+    return true;
+}
+
+function _getDiagnosticTrackForSessionFromState(currentFilename, songInfo) {
+    const fn = String(currentFilename || '').toLowerCase();
+    for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
+        if (track.filenameIncludes
+            && fn.includes(String(track.filenameIncludes).toLowerCase())) {
+            return track;
+        }
+    }
+    const info = songInfo || {};
+    for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
+        if (_ndDiagnosticCatalogMatchesSongInfo(track, info)) {
+            return track;
+        }
+    }
+    return null;
+}
+
+function _getDiagnosticTrackCatalog() {
+    return _DIAGNOSTIC_TRACK_CATALOG;
+}
+
 // Escape untrusted text before interpolating into an innerHTML string.
 // Used for values that can carry markup metacharacters (e.g. engine/device
 // error messages surfaced in the calibration wizard).
@@ -694,6 +775,936 @@ function _ndMakeJudgment(opts) {
         score: Number.isFinite(o.score) ? o.score : undefined,
         monophonicDetected: o.monophonicDetected,
     };
+}
+
+// ── Basic Guitar Diagnostic miss-cause analysis (read-only, post-hoc) ──
+// Explains likely WHY judgments missed using data already recorded during
+// play — no scoring/threshold changes.
+
+const _DIAG_CAUSE_PRIORITY = [
+    'silence_or_gate',
+    'timing_early', 'timing_late',
+    'pitch_sharp', 'pitch_flat',
+    'power_chord_root_heard_fifth_weak', 'power_chord_fifth_heard_root_weak',
+    'power_chord_partial_one_of_two',
+    'power_chord_not_clear',
+    'repeat_inconsistency',
+    'input_channel_or_tone_suspected',
+    'unknown',
+];
+
+function _diagMatchProfileEvent(events, spec, matchTolS) {
+    const tol = matchTolS != null ? matchTolS : 0.075;
+    for (const ev of events || []) {
+        if (!ev || !Number.isFinite(ev.t)) continue;
+        if (Math.abs(ev.t - spec.t) > tol) continue;
+        if (!!ev.chord !== !!spec.chord) continue;
+        if (!spec.chord) {
+            if (ev.s !== spec.s || ev.f !== spec.f) continue;
+        }
+        return ev;
+    }
+    return null;
+}
+
+// Normal songs skip the end-of-song summary when fewer than 5 judgments
+// landed. Diagnostic sloppaks bypass this — a no-input run should still
+// surface the read-only Diagnostic Results report.
+function _shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total) {
+    return !isDiagnosticSession && total < 5;
+}
+
+// Host may disable detection before the plugin's song:ended handler runs.
+// Normal songs keep the enabled guard; diagnostic playthroughs still surface
+// the read-only report.
+function _shouldSkipEndSummaryWhenDisabled(enabled, isDiagnosticSession) {
+    return !enabled && !isDiagnosticSession;
+}
+
+// Summary overlay must mount on document.body — same as the calibration
+// wizard / lab modals. Appending under .nd-instance-root inside #player traps
+// position:fixed inside the player containing block, so only the panel footer
+// peeks out at the bottom-left behind the transport bar.
+function _ndSummaryOverlayMountNode() {
+    return document.body;
+}
+
+function _ndFindSummaryOverlay() {
+    return document.querySelector('.nd-summary-overlay');
+}
+
+// Inline shell styles so the summary modal stays full-screen even when
+// plugin.css fails to load in the v3/feed[dB]ack host (observed: position
+// static / z-index auto with overlay appended to document.body).
+const _ND_SUMMARY_OVERLAY_Z_INDEX = '1200';
+
+function _applyNdSummaryOverlayShellStyles(overlay) {
+    if (!overlay || !overlay.style) return;
+    const s = overlay.style;
+    s.position = 'fixed';
+    s.top = '0';
+    s.right = '0';
+    s.bottom = '0';
+    s.left = '0';
+    s.zIndex = _ND_SUMMARY_OVERLAY_Z_INDEX;
+    s.display = 'flex';
+    s.alignItems = 'center';
+    s.justifyContent = 'center';
+    s.background = 'rgba(0, 0, 0, 0.62)';
+    s.backdropFilter = 'blur(5px)';
+    s.webkitBackdropFilter = 'blur(5px)';
+    s.padding = '1rem';
+    s.boxSizing = 'border-box';
+    s.pointerEvents = 'auto';
+}
+
+function _hideNdSummaryOverlayShell(overlay) {
+    if (!overlay || !overlay.style) return;
+    overlay.style.display = 'none';
+}
+
+function _revealNdSummaryOverlayShell(overlay) {
+    if (!overlay || !overlay.style) return;
+    overlay.style.display = 'flex';
+}
+
+function _ndAssignInlineStyles(el, styles) {
+    if (!el || !el.style || !styles) return;
+    for (const key of Object.keys(styles)) el.style[key] = styles[key];
+}
+
+function _ndSummaryQueryAll(root, sel) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    const list = root.querySelectorAll(sel);
+    if (!list) return [];
+    return Array.from(list);
+}
+
+// Inline card/content styles when plugin.css is absent in the v3 host.
+function _applyNdSummaryContentFallbackStyles(overlay) {
+    if (!overlay || typeof overlay.querySelector !== 'function') return;
+
+    const shell = overlay.querySelector('.nd-sum-shell');
+    _ndAssignInlineStyles(shell, {
+        position: 'relative',
+        width: 'min(92vw, 820px)',
+        maxWidth: '820px',
+    });
+
+    const panel = overlay.querySelector('.nd-sum-panel');
+    _ndAssignInlineStyles(panel, {
+        width: '100%',
+        maxWidth: '820px',
+        maxHeight: '86vh',
+        overflowY: 'auto',
+        background: 'rgba(15, 23, 42, 0.96)',
+        border: '1px solid rgba(148, 163, 184, 0.25)',
+        borderRadius: '18px',
+        boxShadow: '0 24px 70px rgba(0, 0, 0, 0.45)',
+        padding: '1.5rem',
+        color: '#e5edf5',
+        lineHeight: '1.35',
+        boxSizing: 'border-box',
+        fontFamily: 'inherit',
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-header'), {
+        textAlign: 'center',
+        fontSize: '1.3rem',
+        fontWeight: '700',
+        marginBottom: '1rem',
+        letterSpacing: '0.04em',
+        textTransform: 'none',
+        color: '#e5edf5',
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-grade-wrap'), {
+        textAlign: 'center',
+        marginBottom: '0.75rem',
+        minHeight: '4.5rem',
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-grade').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            display: 'inline-block',
+            fontSize: '3rem',
+            fontWeight: '700',
+            lineHeight: '1',
+            opacity: '1',
+            transform: 'none',
+            margin: '0.25rem 0',
+            color: '#38bdf8',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-fc').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            marginTop: '0.35rem',
+            fontSize: '0.75rem',
+            letterSpacing: '0.18em',
+            textTransform: 'uppercase',
+            color: '#4ade80',
+            opacity: '1',
+        });
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-headline'), {
+        display: 'flex',
+        justifyContent: 'center',
+        gap: '2rem',
+        margin: '0.75rem 0 1rem',
+        textAlign: 'center',
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-acc').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '1.75rem',
+            fontWeight: '700',
+            fontVariantNumeric: 'tabular-nums',
+        });
+    });
+    _ndSummaryQueryAll(overlay, '.nd-sum-score').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '1.75rem',
+            fontWeight: '700',
+            fontVariantNumeric: 'tabular-nums',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-label').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            display: 'block',
+            marginTop: '0.25rem',
+            fontSize: '0.65rem',
+            letterSpacing: '0.14em',
+            textTransform: 'uppercase',
+            color: '#94a3b8',
+        });
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-stats'), {
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: '0.75rem',
+        margin: '1rem 0',
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-stat').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            gap: '0.75rem',
+            padding: '0.55rem 0.75rem',
+            background: 'rgba(255, 255, 255, 0.05)',
+            border: '1px solid rgba(148, 163, 184, 0.15)',
+            borderRadius: '10px',
+            opacity: '1',
+            transform: 'none',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-stat-label').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.75rem',
+            textTransform: 'uppercase',
+            letterSpacing: '0.06em',
+            color: '#94a3b8',
+            marginRight: '0.5rem',
+            flexShrink: '0',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-stat-val').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '1rem',
+            fontWeight: '700',
+            marginLeft: 'auto',
+            fontVariantNumeric: 'tabular-nums',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-val-good').forEach((el) => { el.style.color = '#4ade80'; });
+    _ndSummaryQueryAll(overlay, '.nd-val-bad').forEach((el) => { el.style.color = '#f87171'; });
+    _ndSummaryQueryAll(overlay, '.nd-val-accent').forEach((el) => { el.style.color = '#38bdf8'; });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-sections').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            marginTop: '1rem',
+            paddingTop: '0.75rem',
+            borderTop: '1px solid rgba(148, 163, 184, 0.2)',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-subhead').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            margin: '0 0 0.6rem',
+            fontSize: '0.75rem',
+            fontWeight: '700',
+            letterSpacing: '0.12em',
+            textTransform: 'uppercase',
+            color: '#94a3b8',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-bar-row').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: '0.75rem',
+            marginBottom: '0.4rem',
+            fontSize: '0.85rem',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-bar-label').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            flex: '1 1 auto',
+            minWidth: '0',
+            color: '#e5edf5',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-bar-val').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            flexShrink: '0',
+            fontWeight: '600',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-note').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            margin: '0.35rem 0 0.75rem',
+            fontSize: '0.8rem',
+            lineHeight: '1.45',
+            color: '#94a3b8',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            marginTop: '1rem',
+            paddingTop: '0.75rem',
+            borderTop: '1px solid rgba(148, 163, 184, 0.2)',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-head').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.8rem',
+            fontWeight: '700',
+            marginBottom: '0.5rem',
+            color: '#e5edf5',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-summary').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.8rem',
+            lineHeight: '1.45',
+            marginBottom: '0.45rem',
+            color: '#94a3b8',
+        });
+    });
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-line').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.8rem',
+            lineHeight: '1.45',
+            marginBottom: '0.45rem',
+            color: '#94a3b8',
+        });
+    });
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-empty').forEach((el) => {
+        _ndAssignInlineStyles(el, {
+            fontSize: '0.8rem',
+            lineHeight: '1.45',
+            marginBottom: '0.45rem',
+            color: '#94a3b8',
+        });
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-cat').forEach((el) => {
+        el.style.color = '#e5edf5';
+        el.style.fontWeight = '600';
+    });
+
+    _ndSummaryQueryAll(overlay, '.nd-sum-miss-cause-next').forEach((el) => {
+        el.style.color = '#64748b';
+    });
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-actions'), {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '0.75rem',
+        justifyContent: 'center',
+        marginTop: '1.25rem',
+    });
+
+    const _btnBase = {
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '0.65rem 1.15rem',
+        borderRadius: '999px',
+        border: '1px solid rgba(148, 163, 184, 0.35)',
+        background: 'rgba(255, 255, 255, 0.08)',
+        color: '#e5edf5',
+        fontSize: '0.85rem',
+        fontWeight: '600',
+        cursor: 'pointer',
+        lineHeight: '1.2',
+        minWidth: '6rem',
+    };
+    for (const sel of ['.nd-summary-return-prev', '.nd-summary-close', '.nd-summary-download', '.nd-btn']) {
+        _ndSummaryQueryAll(overlay, sel).forEach((btn) => {
+            _ndAssignInlineStyles(btn, _btnBase);
+        });
+    }
+
+    const _btnPrimary = {
+        background: 'linear-gradient(180deg, #38bdf8, #0ea5e9)',
+        border: '1px solid rgba(56, 189, 248, 0.6)',
+        color: '#0f172a',
+    };
+    for (const sel of ['.nd-summary-return-prev', '.nd-btn-primary']) {
+        _ndSummaryQueryAll(overlay, sel).forEach((btn) => {
+            _ndAssignInlineStyles(btn, _btnPrimary);
+        });
+    }
+
+    _ndAssignInlineStyles(overlay.querySelector('.nd-sum-frame'), { display: 'none' });
+}
+
+// Read-only diagnostic rows for the end-of-song summary panel (nd-sum-* classes
+// so layout works without Tailwind inside the modal).
+function _buildDiagnosticBasicGuitarPlayHtml(report, profile, missCauseHtml) {
+    if (!report || !report.categories || !profile) return '';
+    const cats = report.categories;
+    let rows = '';
+
+    for (const id of (profile.singleHitMissCategories || [])) {
+        const c = cats[id];
+        if (!c || !c.attempts) continue;
+        rows += '<div class="nd-sum-bar-row">'
+            + `<span class="nd-sum-bar-label">${_ndEscapeHtml(c.label)}</span>`
+            + `<span class="nd-sum-bar-val ${c.hits > 0 ? 'nd-val-good' : 'nd-val-bad'}">`
+            + `${c.hits > 0 ? 'Hit' : 'Miss'}</span>`
+            + '</div>';
+    }
+
+    const pwr = cats[profile.powerChordCategoryId || 'powerChords'];
+    if (pwr && pwr.attempts) {
+        rows += '<div class="nd-sum-bar-row">'
+            + `<span class="nd-sum-bar-label">${_ndEscapeHtml(pwr.label)}</span>`
+            + `<span class="nd-sum-bar-val nd-val-bad">${pwr.hits}/${pwr.attempts} hit</span>`
+            + '</div>';
+        if (pwr.avgStringsHeard != null) {
+            rows += `<div class="nd-sum-note">${pwr.chordHits}/${pwr.attempts} hit`
+                + ` · avg heard ${pwr.avgStringsHeard.toFixed(1)} of ${pwr.expectedStrings} strings</div>`;
+        } else {
+            rows += `<div class="nd-sum-note">${pwr.hits}/${pwr.attempts} hit</div>`;
+        }
+        const partialLines = (pwr.perAttempt || [])
+            .filter((a) => a.heardTxt && (!a.hit || a.heardTxt.indexOf('heard 2 of 2') === -1))
+            .map((a) => {
+                const prefix = Number.isFinite(a.t) ? `${a.t}s: ` : '';
+                return `${prefix}${a.heardTxt}`;
+            });
+        if (partialLines.length) {
+            rows += `<div class="nd-sum-note">${partialLines.join('<br>')}</div>`;
+        }
+    }
+
+    const rep = cats.repeatCheck;
+    if (rep && rep.attempts) {
+        rows += '<div class="nd-sum-bar-row">'
+            + `<span class="nd-sum-bar-label">${_ndEscapeHtml(rep.label)}</span>`
+            + `<span class="nd-sum-bar-val nd-val-bad">${rep.hits}/${rep.attempts} hit</span>`
+            + '</div>';
+    }
+
+    if (!rows) return '';
+
+    const notes = '<p class="nd-sum-note">'
+        + 'This diagnostic report did not change gameplay settings.'
+        + '</p>';
+
+    return '<div class="nd-sum-sections">'
+        + '<div class="nd-sum-subhead">Diagnostic Results</div>'
+        + rows
+        + (missCauseHtml || '')
+        + notes
+        + '</div>';
+}
+
+const _DIAG_ZERO_INPUT_MISS_CAUSE_SUMMARY =
+    'No input was detected during the diagnostic. Check the selected audio input device, channel, cable, gain, and whether your guitar/Spark is plugged in.';
+
+// Read-only fallback when the diagnostic finished with zero matched play
+// events (e.g. AudioEngine never delivered verdicts). Synthesizes category
+// rows from the static profile without touching gameplay score/verifier state.
+function _synthesizeZeroInputDiagnosticPlayReport(profile, reportProfileId, liveStats) {
+    liveStats = liveStats || {};
+    const chartEvents = profile.events || [];
+    const categoryMeta = profile.categories || {};
+    const powerChordCategoryId = profile.powerChordCategoryId || 'powerChords';
+    const expectedChordStrings = profile.expectedChordStrings != null
+        ? profile.expectedChordStrings
+        : 2;
+    const categories = {};
+
+    for (const catId of Object.keys(categoryMeta)) {
+        const specs = chartEvents.filter((s) => s.category === catId);
+        if (!specs.length) continue;
+        const chordAttempts = [];
+        for (const spec of specs) {
+            if (spec.chord) {
+                chordAttempts.push({ t: spec.t, hit: false, hs: null, tt: expectedChordStrings });
+            }
+        }
+        const cat = {
+            id: catId,
+            label: categoryMeta[catId].label,
+            attempts: specs.length,
+            hits: 0,
+            misses: specs.length,
+            accuracy: 0,
+            timingMedianMs: null,
+        };
+        if (catId === powerChordCategoryId && chordAttempts.length) {
+            cat.chordHits = 0;
+            cat.chordMisses = chordAttempts.length;
+            cat.avgStringsHeard = null;
+            cat.expectedStrings = expectedChordStrings;
+            cat.perAttempt = chordAttempts.map((c) => ({
+                t: c.t,
+                hit: false,
+                heardTxt: 'strings heard unknown',
+            }));
+        }
+        categories[catId] = cat;
+    }
+
+    const liveHits = liveStats.hits || 0;
+    const liveMisses = liveStats.misses || 0;
+    const playTotal = liveHits + liveMisses;
+    const synthMisses = chartEvents.length;
+    const overall = playTotal > 0
+        ? {
+            hits: liveHits,
+            misses: liveMisses,
+            accuracy: Math.round((liveHits / playTotal) * 100),
+            bestStreak: liveStats.bestStreak || 0,
+        }
+        : {
+            hits: 0,
+            misses: synthMisses,
+            accuracy: 0,
+            bestStreak: 0,
+        };
+
+    return {
+        reportProfile: reportProfileId,
+        overall,
+        categories,
+        matchedCount: 0,
+        synthesizedZeroInput: true,
+        hasPartialPowerChords: false,
+        sections: liveStats.sections || [],
+    };
+}
+
+function _diagFindRejectNear(rejects, t, toleranceS) {
+    const tol = toleranceS != null ? toleranceS : 0.075;
+    if (!rejects || !Number.isFinite(t)) return null;
+    let best = null;
+    let bestDt = Infinity;
+    for (const r of rejects) {
+        if (!r || !Number.isFinite(r.noteTime)) continue;
+        const dt = Math.abs(r.noteTime - t);
+        if (dt > tol) continue;
+        if (dt < bestDt) { bestDt = dt; best = r; }
+    }
+    return best;
+}
+
+function _diagLookupConstituentJudgments(noteResults, t, voicing, toleranceS) {
+    const tol = toleranceS != null ? toleranceS : 0.075;
+    if (!voicing || !voicing.length || !Number.isFinite(t)) return [];
+    let entries = [];
+    if (noteResults instanceof Map) {
+        entries = [...noteResults.values()];
+    } else if (Array.isArray(noteResults)) {
+        entries = noteResults;
+    } else if (noteResults && typeof noteResults === 'object') {
+        entries = Object.values(noteResults);
+    }
+    return voicing.map((roleEntry) => {
+        const { s, f, role } = roleEntry;
+        let best = null;
+        let bestDt = Infinity;
+        for (const j of entries) {
+            if (!j) continue;
+            const cn = j.chartNote || j.note;
+            if (!cn || cn.s !== s || cn.f !== f) continue;
+            const nt = j.noteTime;
+            if (!Number.isFinite(nt)) continue;
+            const dt = Math.abs(nt - t);
+            if (dt > tol) continue;
+            if (dt < bestDt) { bestDt = dt; best = j; }
+        }
+        return { role, s, f, judgment: best, hit: !!(best && best.hit) };
+    });
+}
+
+function _diagMissCauseNextStep(type) {
+    const steps = {
+        timing_early: 'Calibration Wizard → timing step',
+        timing_late: 'Calibration Wizard → timing step',
+        pitch_sharp: 'Check tuning or Calibration Wizard',
+        pitch_flat: 'Check tuning or Calibration Wizard',
+        silence_or_gate: 'Check input device, channel, and gain',
+        power_chord_root_heard_fifth_weak: 'Advanced Signal Check → power chord root/fifth',
+        power_chord_fifth_heard_root_weak: 'Advanced Signal Check → power chord root/fifth',
+        power_chord_partial_one_of_two: 'Advanced Signal Check → power chord root/fifth',
+        power_chord_not_clear: 'Check input gain or play louder',
+        input_channel_or_tone_suspected: 'Try mono input or a cleaner tone',
+        repeat_inconsistency: 'Replay the repeat section with steadier timing',
+        unknown: null,
+    };
+    return steps[type] || null;
+}
+
+function _formatDiagnosticCauseForMusician(cause) {
+    if (!cause || !cause.type) return 'Not enough detail to say why';
+    const labels = {
+        timing_early: 'Likely played too early',
+        timing_late: 'Likely played too late',
+        pitch_sharp: 'Pitch may have been sharp',
+        pitch_flat: 'Pitch may have been flat',
+        silence_or_gate: 'Slopsmith did not hear enough signal',
+        power_chord_root_heard_fifth_weak: 'Likely root heard; fifth string may be weak or masked',
+        power_chord_fifth_heard_root_weak: 'Likely upper string heard; low string may be weak',
+        power_chord_partial_one_of_two: 'Slopsmith heard 1 of 2 strings',
+        power_chord_not_clear: 'Power chord was not heard clearly',
+        input_channel_or_tone_suspected: 'Several misses may be input channel or tone related',
+        repeat_inconsistency: 'Same note worked earlier but missed on repeat',
+        unknown: 'Not enough detail to say why',
+    };
+    const base = labels[cause.type] || labels.unknown;
+    if (cause.detail) return `${base} (${cause.detail})`;
+    return base;
+}
+
+function _diagPickPrimaryCause(causes) {
+    if (!causes || !causes.length) return { type: 'unknown' };
+    for (const p of _DIAG_CAUSE_PRIORITY) {
+        const found = causes.find((c) => c.type === p);
+        if (found) return found;
+    }
+    return causes[0];
+}
+
+function _diagMissCauseFromSingleEvent(ev, reject) {
+    if (!ev || ev.hit) return null;
+    const rejectSilence = reject && (
+        reject.reason === 'SILENCE_GATE'
+        || reject.reason === 'NO_VERDICT'
+        || reject.reason === 'RETIRE_NO_MATCH'
+    );
+    if (rejectSilence || (ev.dx == null && ev.ts == null && ev.ps == null)) {
+        let detail = null;
+        const peak = reject && Number.isFinite(reject.strikePeakPct)
+            ? reject.strikePeakPct
+            : (reject && Number.isFinite(reject.inputPeakPct) ? reject.inputPeakPct : null);
+        if (Number.isFinite(peak) && peak < 8) {
+            detail = `signal at strike ${Math.round(peak)}%`;
+        }
+        return { type: 'silence_or_gate', detail };
+    }
+    if (ev.ts === 'EARLY' || (Number.isFinite(ev.te) && ev.te < -15)) {
+        const ms = Number.isFinite(ev.te) ? Math.abs(Math.round(ev.te)) : null;
+        return { type: 'timing_early', detail: ms != null ? `about ${ms} ms early` : null };
+    }
+    if (ev.ts === 'LATE' || (Number.isFinite(ev.te) && ev.te > 15)) {
+        const ms = Number.isFinite(ev.te) ? Math.round(ev.te) : null;
+        return { type: 'timing_late', detail: ms != null ? `about ${ms} ms late` : null };
+    }
+    if (ev.ps === 'SHARP' || (Number.isFinite(ev.pe) && ev.pe > 15)) {
+        const cents = Number.isFinite(ev.pe) ? Math.round(ev.pe) : null;
+        return { type: 'pitch_sharp', detail: cents != null ? `about ${cents} cents sharp` : null };
+    }
+    if (ev.ps === 'FLAT' || (Number.isFinite(ev.pe) && ev.pe < -15)) {
+        const cents = Number.isFinite(ev.pe) ? Math.abs(Math.round(ev.pe)) : null;
+        return { type: 'pitch_flat', detail: cents != null ? `about ${cents} cents flat` : null };
+    }
+    return { type: 'unknown' };
+}
+
+function _analyzePowerChordAttempt(chordEvent, constituents, rejects, voicing, toleranceS) {
+    if (!chordEvent) return null;
+    const hs = Number.isFinite(chordEvent.hs) ? chordEvent.hs : null;
+    const tt = Number.isFinite(chordEvent.tt) ? chordEvent.tt : 2;
+    if (chordEvent.hit && hs != null && hs >= tt) return null;
+
+    const t = chordEvent.t;
+    const reject = _diagFindRejectNear(rejects, t, toleranceS);
+    const rows = (constituents && constituents.length)
+        ? constituents
+        : _diagLookupConstituentJudgments(null, t, voicing, toleranceS);
+
+    if (rows.length >= 2) {
+        const root = rows.find((c) => c.role === 'root');
+        const fifth = rows.find((c) => c.role === 'fifth');
+        if (root && fifth && (root.judgment || fifth.judgment)) {
+            if (root.hit && !fifth.hit) {
+                return { type: 'power_chord_root_heard_fifth_weak' };
+            }
+            if (!root.hit && fifth.hit) {
+                return { type: 'power_chord_fifth_heard_root_weak' };
+            }
+            if (!root.hit && !fifth.hit) {
+                return _diagMissCauseFromSingleEvent(
+                    { ...chordEvent, hit: false, dx: null },
+                    reject,
+                ) || { type: 'power_chord_not_clear' };
+            }
+        }
+    }
+
+    if (hs === 1 && tt >= 2) {
+        return { type: 'power_chord_partial_one_of_two' };
+    }
+    if (hs === 0 || hs == null) {
+        if (reject && reject.reason === 'SILENCE_GATE') {
+            return { type: 'silence_or_gate' };
+        }
+        return { type: 'power_chord_not_clear' };
+    }
+    if (!chordEvent.hit) {
+        if (chordEvent.ts === 'EARLY' || chordEvent.ts === 'LATE') {
+            const ms = Number.isFinite(chordEvent.te) ? Math.abs(Math.round(chordEvent.te)) : null;
+            return {
+                type: chordEvent.ts === 'EARLY' ? 'timing_early' : 'timing_late',
+                detail: ms != null ? `about ${ms} ms` : null,
+            };
+        }
+        return { type: 'power_chord_not_clear' };
+    }
+    if (hs != null && hs < tt) {
+        return { type: 'power_chord_partial_one_of_two' };
+    }
+    return { type: 'unknown' };
+}
+
+function _summarizeDiagnosticCategoryCause(categoryId, categoryReport, specs, events, diagnosticPayload, opts) {
+    if (!categoryReport || categoryReport.misses === 0 || !specs || !specs.length) {
+        return null;
+    }
+    opts = opts || {};
+    const matchTolS = opts.matchTolS != null ? opts.matchTolS : 0.075;
+    const rejects = opts.verifierRejects || [];
+    const noteResults = opts.noteResults || null;
+    const voicing = opts.chordVoicing || [];
+    const profile = opts.profile || {};
+    const powerChordCategoryId = profile.powerChordCategoryId || 'powerChords';
+    const causes = [];
+
+    if (categoryId === powerChordCategoryId) {
+        for (const spec of specs) {
+            const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+            if (!ev || ev.hit) continue;
+            const constituents = _diagLookupConstituentJudgments(
+                noteResults, spec.t, voicing, matchTolS,
+            );
+            const cause = _analyzePowerChordAttempt(
+                ev, constituents, rejects, voicing, matchTolS,
+            );
+            if (cause) causes.push(cause);
+        }
+    } else if (categoryId === 'repeatCheck') {
+        const baselineHits = opts.baselineHits || {};
+        const pwrBaseline = opts.powerChordBaseline || null;
+        for (const spec of specs) {
+            const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+            if (!ev || ev.hit) continue;
+            if (!spec.chord && Number.isInteger(spec.s) && Number.isInteger(spec.f)) {
+                const base = baselineHits[`${spec.s}_${spec.f}`];
+                if (base && base.hit) {
+                    causes.push({
+                        type: 'repeat_inconsistency',
+                        detail: `${base.label || 'earlier note'} was hit before`,
+                    });
+                    continue;
+                }
+            }
+            if (spec.chord && pwrBaseline && pwrBaseline.hadHits) {
+                const constituents = _diagLookupConstituentJudgments(
+                    noteResults, spec.t, voicing, matchTolS,
+                );
+                const cause = _analyzePowerChordAttempt(
+                    ev, constituents, rejects, voicing, matchTolS,
+                );
+                if (cause) {
+                    causes.push({
+                        type: 'repeat_inconsistency',
+                        detail: 'power chords worked earlier in the song',
+                    });
+                    continue;
+                }
+            }
+            if (spec.chord) {
+                const constituents = _diagLookupConstituentJudgments(
+                    noteResults, spec.t, voicing, matchTolS,
+                );
+                const cause = _analyzePowerChordAttempt(
+                    ev, constituents, rejects, voicing, matchTolS,
+                );
+                if (cause) causes.push(cause);
+            } else {
+                const reject = _diagFindRejectNear(rejects, spec.t, matchTolS);
+                const cause = _diagMissCauseFromSingleEvent(ev, reject);
+                if (cause) causes.push(cause);
+            }
+        }
+    } else {
+        for (const spec of specs) {
+            const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+            if (!ev || ev.hit) continue;
+            const reject = _diagFindRejectNear(rejects, spec.t, matchTolS);
+            const cause = _diagMissCauseFromSingleEvent(ev, reject);
+            if (cause) causes.push(cause);
+        }
+    }
+
+    const primary = _diagPickPrimaryCause(causes);
+    return {
+        label: categoryReport.label,
+        cause: primary,
+        line: _formatDiagnosticCauseForMusician(primary),
+        nextStep: _diagMissCauseNextStep(primary.type),
+    };
+}
+
+function _buildDiagnosticMissCauseAnalysis(report, diagnosticPayload, opts) {
+    opts = opts || {};
+    const profile = opts.profile;
+    if (!report || !report.categories || !profile) {
+        return { summary: null, categories: {}, hasIssues: false };
+    }
+
+    if (report.synthesizedZeroInput) {
+        return {
+            summary: _DIAG_ZERO_INPUT_MISS_CAUSE_SUMMARY,
+            categories: {},
+            hasIssues: true,
+        };
+    }
+
+    const events = opts.events || (diagnosticPayload && diagnosticPayload.events) || [];
+    const matchTolS = profile.matchTolS != null ? profile.matchTolS : 0.075;
+    const chartEvents = profile.events || [];
+    const categories = {};
+    const typeCounts = {};
+    let hasIssues = false;
+
+    const baselineHits = {};
+    for (const spec of chartEvents) {
+        if (spec.category === 'repeatCheck') continue;
+        const ev = _diagMatchProfileEvent(events, spec, matchTolS);
+        if (ev && ev.hit && !spec.chord) {
+            const catMeta = (profile.categories || {})[spec.category];
+            baselineHits[`${spec.s}_${spec.f}`] = {
+                hit: true,
+                label: (catMeta && catMeta.label) || spec.label,
+            };
+        }
+    }
+    const pwrId = profile.powerChordCategoryId || 'powerChords';
+    const pwrReport = report.categories[pwrId];
+    const powerChordBaseline = {
+        hadHits: !!(pwrReport && pwrReport.hits > 0),
+    };
+
+    const sharedOpts = {
+        matchTolS,
+        verifierRejects: opts.verifierRejects || [],
+        noteResults: opts.noteResults || null,
+        chordVoicing: profile.chordVoicing || [],
+        profile,
+        baselineHits,
+        powerChordBaseline,
+    };
+
+    for (const catId of Object.keys(report.categories)) {
+        const catReport = report.categories[catId];
+        if (!catReport || catReport.misses === 0) continue;
+        hasIssues = true;
+        const specs = chartEvents.filter((s) => s.category === catId);
+        const summary = _summarizeDiagnosticCategoryCause(
+            catId, catReport, specs, events, diagnosticPayload, sharedOpts,
+        );
+        if (summary) {
+            categories[catId] = summary;
+            const t = summary.cause && summary.cause.type;
+            if (t) typeCounts[t] = (typeCounts[t] || 0) + 1;
+        }
+    }
+
+    const bk = diagnosticPayload && diagnosticPayload.miss_breakdown;
+    const totalMisses = (report.overall && report.overall.misses) || 0;
+    const pureFrac = bk && totalMisses > 0 ? (bk.pure || 0) / totalMisses : 0;
+    const partialCount = (bk && bk.chordPartial) || 0;
+
+    let summary = null;
+    if (!hasIssues) {
+        summary = 'No major miss pattern found';
+    } else if (pureFrac >= 0.4 && totalMisses >= 2) {
+        summary = 'Several misses looked like silence or gate rejects — check input device, channel, and gain.';
+    } else if (partialCount >= 2 && partialCount >= totalMisses / 2) {
+        summary = 'Power chord partials may be tone or channel related — try a cleaner tone or mono input.';
+    } else {
+        let bestType = null;
+        let bestN = 0;
+        for (const [k, n] of Object.entries(typeCounts)) {
+            if (n > bestN) { bestN = n; bestType = k; }
+        }
+        if (bestType) {
+            summary = `Most likely: ${_formatDiagnosticCauseForMusician({ type: bestType }).toLowerCase()}`;
+        } else {
+            summary = 'Review the category notes below';
+        }
+    }
+
+    return { summary, categories, hasIssues };
+}
+
+function _renderDiagnosticMissCauseHtml(analysis) {
+    if (!analysis) return '';
+    const { summary, categories, hasIssues } = analysis;
+    if (!hasIssues) {
+        return '<div class="nd-sum-miss-cause nd-sum-miss-cause-empty">'
+            + 'Why notes may have missed: No major miss pattern found.'
+            + '</div>';
+    }
+    let html = '<div class="nd-sum-miss-cause">'
+        + '<div class="nd-sum-miss-cause-head">Why notes may have missed</div>';
+    if (summary) {
+        html += `<div class="nd-sum-miss-cause-summary">${summary}</div>`;
+    }
+    for (const catId of Object.keys(categories)) {
+        const c = categories[catId];
+        if (!c) continue;
+        html += '<div class="nd-sum-miss-cause-line">'
+            + `<span class="nd-sum-miss-cause-cat">${c.label}:</span> ${c.line}`;
+        if (c.nextStep) {
+            html += `<span class="nd-sum-miss-cause-next"> · Next: ${c.nextStep}</span>`;
+        }
+        html += '</div>';
+    }
+    html += '</div>';
+    return html;
 }
 
 function _ndMidiToStringFret(midiNote, arrangement, stringCount, offsets, capo) {
@@ -11520,7 +12531,11 @@ function createNoteDetector(options = {}) {
     // wrapper silent-disables on song-switch regardless.
     function _endOfSongOnEnded() {
         if (!isDefault) return;
-        if (!enabled) return;
+        const diagnosticTrack = _getDiagnosticTrackForSession();
+        const diagnosticReturn = _ndShared && _ndShared.diagnosticReturn;
+        const isDiagnosticSession = !!diagnosticTrack
+            || !!(diagnosticReturn && diagnosticReturn.active);
+        if (_shouldSkipEndSummaryWhenDisabled(enabled, isDiagnosticSession)) return;
         // showSummary() has its own `total < 5` guard, so a song that
         // ended before the user played anything meaningful is silently
         // skipped. When a training take is armed, _recOnEnded opens the
@@ -11611,7 +12626,7 @@ function createNoteDetector(options = {}) {
     // visible. No overlay at all (closed already) → quietly do nothing.
     function _fillSummaryXpRow(res) {
         if (!res || !res.ok) return;
-        const overlay = instanceRoot.querySelector('.nd-summary-overlay');
+        const overlay = _ndFindSummaryOverlay();
         if (!overlay) return;
         let row = overlay.querySelector('.nd-sum-xp');
         if (!row) {
@@ -11635,9 +12650,9 @@ function createNoteDetector(options = {}) {
         if (!_summaryDeferred) return;
         _summaryDeferred = false;
         if (!isDefault) return;
-        const overlay = instanceRoot.querySelector('.nd-summary-overlay');
+        const overlay = _ndFindSummaryOverlay();
         if (overlay) {
-            overlay.style.display = '';
+            _revealNdSummaryOverlayShell(overlay);
             // Play the reveal sequence now that the overlay is actually
             // visible, using the stats captured at build time (the live
             // counters may already belong to the next song).
@@ -11649,7 +12664,9 @@ function createNoteDetector(options = {}) {
         if (endOfSongSubscribed) return;
         if (!window.slopsmith
             || typeof window.slopsmith.on !== 'function'
-            || typeof window.slopsmith.off !== 'function') return;
+            || typeof window.slopsmith.off !== 'function') {
+            return;
+        }
         const fn = _endOfSongOnEnded;
         try {
             window.slopsmith.on('song:ended', fn);
@@ -13601,24 +14618,6 @@ function createNoteDetector(options = {}) {
         _liveSessionId = null;
     }
 
-    // ── Diagnostic track catalog — post-play report (read-only) ───────
-    // Catalog + report profiles let multiple diagnostic sloppaks share one
-    // detection/report path. Does NOT change scoring, thresholds, or settings.
-    const _DIAGNOSTIC_TRACK_CATALOG = [
-        {
-            id: 'basic-guitar-6',
-            title: 'Slopsmith Diagnostic — Basic Guitar',
-            artist: 'Slopsmith',
-            arrangement: 'Diagnostic Guitar',
-            filenameIncludes: 'slopsmith-diagnostic-basic-guitar.sloppak',
-            dlcRelativePath: 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak',
-            instrument: 'guitar',
-            stringCount: 6,
-            reportProfile: 'basic-guitar-v1',
-            description: 'Checks timing, open strings, fretted notes, and power chords.',
-        },
-    ];
-
     function _ndSetDiagnosticLaunchStatus(panel, message) {
         if (!panel) return;
         const el = panel.querySelector('.nd-health-diag-launch-status');
@@ -13798,6 +14797,10 @@ function createNoteDetector(options = {}) {
             matchTolS: 0.075,
             powerChordCategoryId: 'powerChords',
             expectedChordStrings: 2,
+            chordVoicing: [
+                { s: 0, f: 0, role: 'root' },
+                { s: 1, f: 2, role: 'fifth' },
+            ],
             displayOrder: ['openLow', 'openNext', 'fretted', 'powerChords', 'repeatCheck'],
             singleHitMissCategories: ['openLow', 'openNext', 'fretted'],
             events: [
@@ -13825,36 +14828,9 @@ function createNoteDetector(options = {}) {
     };
 
     function _getDiagnosticTrackForSession() {
-        const fn = (_ndShared.currentFilename || '').toLowerCase();
         const currentHw = resolveHw();
         const info = (currentHw && currentHw.getSongInfo) ? currentHw.getSongInfo() : {};
-        for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
-            if (track.filenameIncludes
-                && fn.includes(String(track.filenameIncludes).toLowerCase())) {
-                return track;
-            }
-        }
-        for (const track of _DIAGNOSTIC_TRACK_CATALOG) {
-            if (info.title === track.title
-                && info.artist === track.artist
-                && info.arrangement === track.arrangement) {
-                return track;
-            }
-        }
-        return null;
-    }
-
-    function _diagMatchProfileEvent(events, spec, matchTolS) {
-        for (const ev of events) {
-            if (!ev || !Number.isFinite(ev.t)) continue;
-            if (Math.abs(ev.t - spec.t) > matchTolS) continue;
-            if (!!ev.chord !== !!spec.chord) continue;
-            if (!spec.chord) {
-                if (ev.s !== spec.s || ev.f !== spec.f) continue;
-            }
-            return ev;
-        }
-        return null;
+        return _getDiagnosticTrackForSessionFromState(_ndShared.currentFilename, info);
     }
 
     function _buildDiagnosticPlayReportFromProfile(profile, reportProfileId) {
@@ -13865,7 +14841,21 @@ function createNoteDetector(options = {}) {
         for (const spec of chartEvents) {
             if (_diagMatchProfileEvent(events, spec, matchTolS)) matchedCount++;
         }
-        if (matchedCount === 0) return null;
+        if (matchedCount === 0) {
+            return _synthesizeZeroInputDiagnosticPlayReport(profile, reportProfileId, {
+                hits,
+                misses,
+                bestStreak,
+                sections: sectionStats.map((s) => ({
+                    name: s.name,
+                    hits: s.hits,
+                    misses: s.misses,
+                    accuracy: (s.hits + s.misses) > 0
+                        ? Math.round((s.hits / (s.hits + s.misses)) * 100)
+                        : 0,
+                })),
+            });
+        }
 
         const playTotal = hits + misses;
         const overall = {
@@ -13968,12 +14958,6 @@ function createNoteDetector(options = {}) {
         return null;
     }
 
-    function _diagPlayReportHitMissHtml(hit) {
-        return hit
-            ? '<span class="text-green-400">Hit</span>'
-            : '<span class="text-red-400">Miss</span>';
-    }
-
     function _renderDiagnosticPlayHtml(report, reportProfileId) {
         if (!report || !report.categories) return '';
         if (reportProfileId === 'basic-guitar-v1') {
@@ -13985,87 +14969,52 @@ function createNoteDetector(options = {}) {
     function _renderDiagnosticBasicGuitarPlayHtml(report) {
         const profile = _DIAGNOSTIC_REPORT_PROFILES['basic-guitar-v1'];
         if (!report || !report.categories || !profile) return '';
-        const cats = report.categories;
-        let rows = '';
 
-        for (const id of (profile.singleHitMissCategories || [])) {
-            const c = cats[id];
-            if (!c || !c.attempts) continue;
-            rows += `<div class="flex justify-between gap-2 mb-1">`
-                + `<span class="text-gray-300">${c.label}</span>`
-                + _diagPlayReportHitMissHtml(c.hits > 0)
-                + `</div>`;
-        }
+        let missCauseHtml = '';
+        try {
+            const diagnosticPayload = _buildDiagnosticPayload();
+            const analysis = _buildDiagnosticMissCauseAnalysis(report, diagnosticPayload, {
+                profile,
+                events: _diagEvents.slice(),
+                noteResults,
+                verifierRejects: _ndVerifierRejects.slice(),
+            });
+            missCauseHtml = _renderDiagnosticMissCauseHtml(analysis);
+        } catch (_) { /* read-only report */ }
 
-        const pwr = cats[profile.powerChordCategoryId || 'powerChords'];
-        if (pwr && pwr.attempts) {
-            let pwrDetail = '';
-            if (pwr.avgStringsHeard != null) {
-                pwrDetail += `<div class="text-[10px] text-gray-500">`
-                    + `${pwr.chordHits}/${pwr.attempts} hit`
-                    + ` · avg heard ${pwr.avgStringsHeard.toFixed(1)} of ${pwr.expectedStrings} strings`
-                    + `</div>`;
-            } else {
-                pwrDetail += `<div class="text-[10px] text-gray-500">${pwr.hits}/${pwr.attempts} hit</div>`;
-            }
-            const partialLines = (pwr.perAttempt || [])
-                .filter((a) => a.heardTxt && (!a.hit || a.heardTxt.indexOf('heard 2 of 2') === -1))
-                .map((a) => {
-                    const prefix = Number.isFinite(a.t) ? `${a.t}s: ` : '';
-                    return `${prefix}${a.heardTxt}`;
-                });
-            if (partialLines.length) {
-                pwrDetail += `<div class="text-[10px] text-gray-500 mt-0.5">`
-                    + partialLines.join('<br>')
-                    + `</div>`;
-            }
-            rows += `<div class="mb-1">`
-                + `<div class="flex justify-between gap-2">`
-                + `<span class="text-gray-300">${pwr.label}</span>`
-                + `<span class="text-gray-400">${pwr.hits}/${pwr.attempts} hit</span>`
-                + `</div>${pwrDetail}</div>`;
-        }
-
-        const rep = cats.repeatCheck;
-        if (rep && rep.attempts) {
-            rows += `<div class="flex justify-between gap-2 mb-1">`
-                + `<span class="text-gray-300">${rep.label}</span>`
-                + `<span class="text-gray-400">${rep.hits}/${rep.attempts} hit</span>`
-                + `</div>`;
-        }
-
-        if (!rows) return '';
-
-        let notes = '<p class="text-[10px] text-gray-500 mt-2">'
-            + 'This diagnostic report did not change gameplay settings.'
-            + '</p>';
-        if (report.hasPartialPowerChords) {
-            notes += '<p class="text-[10px] text-gray-500 mt-1">'
-                + 'Power chords were partly heard. Try a cleaner/drier channel or run '
-                + 'Technique Assessment for root/fifth detail.'
-                + '</p>';
-        }
-
-        return `<div class="mt-3 text-xs border-t border-gray-600 pt-3">`
-            + `<div class="text-gray-200 text-xs font-semibold mb-2">Diagnostic Results</div>`
-            + rows
-            + notes
-            + `</div>`;
+        return _buildDiagnosticBasicGuitarPlayHtml(report, profile, missCauseHtml);
     }
 
     // Returns true if a summary overlay was created, false if it bailed
     // (fewer than 5 judgments) — callers deferring the summary use this
     // to know whether there is actually an overlay to reveal later.
     function showSummary(opts) {
+        const diagnosticTrack = _getDiagnosticTrackForSession();
+        const isDiagnosticSession = !!diagnosticTrack;
         const total = hits + misses;
-        if (total < 5) return false;
+        if (_shouldBailShowSummaryForLowJudgments(isDiagnosticSession, total)) {
+            return false;
+        }
 
-        const existing = instanceRoot.querySelector('.nd-summary-overlay');
+        const diagnosticReport = diagnosticTrack
+            ? _buildDiagnosticPlayReport(diagnosticTrack)
+            : null;
+
+        const existing = _ndFindSummaryOverlay();
         if (existing) existing.remove();
 
-        const accuracy = Math.round((hits / total) * 100);
+        const useDiagOverall = !!(isDiagnosticSession && diagnosticReport
+            && diagnosticReport.overall && total === 0);
+        const displayHits = useDiagOverall ? diagnosticReport.overall.hits : hits;
+        const displayMisses = useDiagOverall ? diagnosticReport.overall.misses : misses;
+        const displayBestStreak = useDiagOverall ? diagnosticReport.overall.bestStreak : bestStreak;
+        const displayTotal = displayHits + displayMisses;
+        const accuracy = displayTotal > 0
+            ? Math.round((displayHits / displayTotal) * 100)
+            : 0;
         const grade = _ndGradeFor(accuracy);
-        const fullCombo = misses === 0;
+        const fullCombo = displayMisses === 0 && displayTotal > 0;
+        const summaryHeader = isDiagnosticSession ? 'Diagnostic Complete' : 'Song Complete';
 
         let sectionHtml = '';
         if (sectionStats.length > 0) {
@@ -14132,10 +15081,6 @@ function createNoteDetector(options = {}) {
         }
 
         let diagnosticPlayHtml = '';
-        const diagnosticTrack = _getDiagnosticTrackForSession();
-        const diagnosticReport = diagnosticTrack
-            ? _buildDiagnosticPlayReport(diagnosticTrack)
-            : null;
         if (diagnosticReport) {
             diagnosticPlayHtml = _renderDiagnosticPlayHtml(
                 diagnosticReport,
@@ -14154,7 +15099,6 @@ function createNoteDetector(options = {}) {
         // Skin attribute mirrors the instance root's so the overlay (a
         // separate top-level nd root in the CSS) themes identically.
         try { overlay.setAttribute('data-nd-skin', _ndLoadSkin()); } catch (e) {}
-        overlay.style.pointerEvents = 'auto';
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
         // .nd-sum-shell wraps the (scrollable) panel so the hand-drawn frame
         // overlay (.nd-sum-frame) can sit absolutely over the panel's edges
@@ -14162,7 +15106,7 @@ function createNoteDetector(options = {}) {
         overlay.innerHTML = `
             <div class="nd-sum-shell">
             <div class="nd-sum-panel">
-                <div class="nd-sum-header">Song Complete</div>
+                <div class="nd-sum-header">${summaryHeader}</div>
                 <div class="nd-sum-grade-wrap">
                     <canvas class="nd-sum-confetti"></canvas>
                     <div class="nd-sum-grade" data-grade="${grade}">${grade}</div>
@@ -14173,9 +15117,9 @@ function createNoteDetector(options = {}) {
                     <div class="nd-sum-score"><span class="nd-sum-score-n">0</span><div class="nd-sum-label">Score</div></div>
                 </div>
                 <div class="nd-sum-stats">
-                    <div class="nd-sum-stat" style="--row-i:0"><span class="nd-sum-stat-label">Hits</span><span class="nd-sum-stat-val nd-val-good">${hits}</span></div>
-                    <div class="nd-sum-stat" style="--row-i:1"><span class="nd-sum-stat-label">Misses</span><span class="nd-sum-stat-val nd-val-bad">${misses}</span></div>
-                    <div class="nd-sum-stat" style="--row-i:2"><span class="nd-sum-stat-label">Best Streak</span><span class="nd-sum-stat-val nd-val-accent">${bestStreak}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:0"><span class="nd-sum-stat-label">Hits</span><span class="nd-sum-stat-val nd-val-good">${displayHits}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:1"><span class="nd-sum-stat-label">Misses</span><span class="nd-sum-stat-val nd-val-bad">${displayMisses}</span></div>
+                    <div class="nd-sum-stat" style="--row-i:2"><span class="nd-sum-stat-label">Best Streak</span><span class="nd-sum-stat-val nd-val-accent">${displayBestStreak}</span></div>
                     <div class="nd-sum-stat" style="--row-i:3"><span class="nd-sum-stat-label">Max Multiplier</span><span class="nd-sum-stat-val nd-val-accent">×${maxMultiplier}</span></div>
                 </div>
                 <div class="nd-sum-xp hidden"></div>
@@ -14213,6 +15157,7 @@ function createNoteDetector(options = {}) {
         }
         const dlBtn = overlay.querySelector('.nd-summary-download');
         if (dlBtn) dlBtn.onclick = () => _downloadDiagnostic();
+        _applyNdSummaryContentFallbackStyles(overlay);
         // Capture the reveal-animation targets at BUILD time: a deferred
         // (startHidden) summary is revealed after a new song's playSong hook
         // may have reset the live counters, so _runDeferredSummary() must
@@ -14221,8 +15166,9 @@ function createNoteDetector(options = {}) {
         // startHidden: built now (so the stats are this song's) but kept
         // out of view until _runDeferredSummary() reveals it — used when
         // a training consent modal is taking the screen on song:ended.
-        if (opts && opts.startHidden) overlay.style.display = 'none';
-        instanceRoot.appendChild(overlay);
+        _applyNdSummaryOverlayShellStyles(overlay);
+        if (opts && opts.startHidden) _hideNdSummaryOverlayShell(overlay);
+        _ndSummaryOverlayMountNode().appendChild(overlay);
         if (!(opts && opts.startHidden)) _animateSummary(overlay, overlay._ndReveal);
 
         publishToJournal(accuracy);

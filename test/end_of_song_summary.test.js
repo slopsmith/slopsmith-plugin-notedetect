@@ -58,10 +58,8 @@ test('destroy() unbinds both drill and end-of-song listeners', () => {
 
 test('song:ended on a disabled instance does not throw', () => {
     // Detection disabled = no in-flight session. The handler is
-    // expected to bail early on `if (!enabled) return;` rather than
-    // try to render a summary against zeroed counters. Tests against
-    // a regression where the guard was removed and showSummary tried
-    // to DOM-write into the (stubbed) sandbox elements, which throws.
+    // expected to bail early on the enabled guard for normal songs
+    // rather than try to render a summary against zeroed counters.
     const core = loadDetectionCore();
     const det = core.createNoteDetector();
     det._bindEndOfSongEvents();
@@ -71,6 +69,39 @@ test('song:ended on a disabled instance does not throw', () => {
     assert.doesNotThrow(() => {
         core.slopsmith._fire('song:ended', {});
     });
+    det.destroy();
+});
+
+test('song:ended on disabled default instance without diagnostic does not publish summary', () => {
+    const events = [];
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sb) => { sb.dispatchEvent = (ev) => events.push(ev); },
+    });
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindEndOfSongEvents();
+    assert.equal(det.isEnabled(), false);
+    core.slopsmith._fire('song:ended', {});
+    assert.equal(events.find((e) => e.type === 'notedetect:session'), undefined);
+    det.destroy();
+});
+
+test('song:ended on disabled default instance with active diagnostic still publishes summary', () => {
+    const events = [];
+    const core = loadDetectionCore({
+        sandboxBeforeRun: (sb) => { sb.dispatchEvent = (ev) => events.push(ev); },
+    });
+    core.ndShared.currentFilename = 'diagnostics-builtin/slopsmith-diagnostic-basic-guitar.sloppak';
+    core.ndShared.diagnosticReturn.active = true;
+    core.ndShared.diagnosticReturn.previousFilename = 'previous-song.sloppak';
+    core.ndShared.diagnosticReturn.launchedTrackId = 'basic-guitar-v1';
+    const det = core.createNoteDetector({ isDefault: true });
+    det._bindEndOfSongEvents();
+    assert.equal(det.isEnabled(), false);
+    core.slopsmith._fire('song:ended', {});
+    assert.ok(
+        events.find((e) => e.type === 'notedetect:session'),
+        'diagnostic end handler should call showSummary even when host pre-disabled detection',
+    );
     det.destroy();
 });
 
@@ -134,4 +165,129 @@ test('a clean take publishes fullCombo: true', () => {
     assert.equal(session.detail.fullCombo, true);
     assert.equal(session.detail.maxMultiplier, 2);
     det.destroy();
+});
+
+test('_applyNdSummaryOverlayShellStyles sets fixed full-screen modal shell', () => {
+    const core = loadDetectionCore();
+    const overlay = { style: {}, className: 'nd-summary-overlay' };
+    core.applyNdSummaryOverlayShellStyles(overlay);
+    assert.equal(overlay.style.position, 'fixed');
+    assert.equal(overlay.style.display, 'flex');
+    assert.equal(overlay.style.zIndex, '1200');
+    assert.equal(overlay.style.top, '0');
+    assert.equal(overlay.style.left, '0');
+    assert.equal(overlay.style.pointerEvents, 'auto');
+});
+
+test('summary overlay shell hides and reveals for deferred startHidden flow', () => {
+    const core = loadDetectionCore();
+    const overlay = { style: {}, className: 'nd-summary-overlay' };
+    core.applyNdSummaryOverlayShellStyles(overlay);
+    core.hideNdSummaryOverlayShell(overlay);
+    assert.equal(overlay.style.display, 'none');
+    core.revealNdSummaryOverlayShell(overlay);
+    assert.equal(overlay.style.display, 'flex');
+});
+
+function _makeSummaryOverlayDom() {
+    const overlay = {
+        style: {},
+        className: 'nd-summary-overlay',
+        children: [],
+        querySelector(sel) {
+            const walk = (node) => {
+                if (node.matches && node.matches(sel)) return node;
+                for (const child of (node.children || [])) {
+                    const hit = walk(child);
+                    if (hit) return hit;
+                }
+                return null;
+            };
+            return walk(this);
+        },
+        querySelectorAll(sel) {
+            const out = [];
+            const walk = (node) => {
+                if (node !== this && node.matches && node.matches(sel)) out.push(node);
+                for (const child of (node.children || [])) walk(child);
+            };
+            walk(this);
+            return out;
+        },
+    };
+    overlay.matches = (sel) => sel === '.nd-summary-overlay';
+    const mk = (tag, cls, html) => {
+        const el = {
+            tagName: tag.toUpperCase(),
+            className: cls || '',
+            style: {},
+            children: [],
+            matches(sel) {
+                if (sel.startsWith('.')) return this.className.split(/\s+/).includes(sel.slice(1));
+                return false;
+            },
+        };
+        if (html && html.includes('stat')) {
+            const label = mk('span', 'nd-sum-stat-label', null);
+            label.textContent = 'Hits';
+            const val = mk('span', 'nd-sum-stat-val nd-val-good', null);
+            val.textContent = '0';
+            el.children.push(label, val);
+        }
+        if (html && html.includes('actions')) {
+            el.children.push(mk('button', 'nd-summary-return-prev nd-btn', null));
+            el.children.push(mk('button', 'nd-summary-close nd-btn', null));
+        }
+        return el;
+    };
+    const shell = mk('div', 'nd-sum-shell', null);
+    const panel = mk('div', 'nd-sum-panel', null);
+    const stats = mk('div', 'nd-sum-stats', null);
+    stats.children.push(mk('div', 'nd-sum-stat', 'stat'));
+    const actions = mk('div', 'nd-sum-actions', 'actions');
+    panel.children.push(
+        mk('div', 'nd-sum-header', null),
+        stats,
+        actions,
+        mk('div', 'nd-sum-frame', null),
+    );
+    shell.children.push(panel);
+    overlay.children.push(shell);
+    return overlay;
+}
+
+test('_applyNdSummaryContentFallbackStyles styles card panel and stat rows', () => {
+    const core = loadDetectionCore();
+    const overlay = _makeSummaryOverlayDom();
+    core.applyNdSummaryContentFallbackStyles(overlay);
+    const panel = overlay.querySelector('.nd-sum-panel');
+    assert.equal(panel.style.maxWidth, '820px');
+    assert.equal(panel.style.borderRadius, '18px');
+    assert.match(panel.style.background, /rgba\(15,\s*23,\s*42/);
+    const stat = overlay.querySelector('.nd-sum-stat');
+    assert.equal(stat.style.display, 'flex');
+    assert.equal(stat.style.justifyContent, 'space-between');
+    const label = overlay.querySelector('.nd-sum-stat-label');
+    const val = overlay.querySelector('.nd-sum-stat-val');
+    assert.ok(label);
+    assert.ok(val);
+    assert.equal(label.textContent, 'Hits');
+    assert.equal(val.textContent, '0');
+    assert.equal(label.style.marginRight, '0.5rem');
+    assert.equal(val.style.marginLeft, 'auto');
+});
+
+test('_applyNdSummaryContentFallbackStyles styles separated action buttons', () => {
+    const core = loadDetectionCore();
+    const overlay = _makeSummaryOverlayDom();
+    core.applyNdSummaryContentFallbackStyles(overlay);
+    const actions = overlay.querySelector('.nd-sum-actions');
+    assert.equal(actions.style.display, 'flex');
+    assert.equal(actions.style.gap, '0.75rem');
+    const returnBtn = overlay.querySelector('.nd-summary-return-prev');
+    const closeBtn = overlay.querySelector('.nd-summary-close');
+    assert.ok(returnBtn);
+    assert.ok(closeBtn);
+    assert.equal(returnBtn.style.borderRadius, '999px');
+    assert.equal(closeBtn.style.cursor, 'pointer');
 });
