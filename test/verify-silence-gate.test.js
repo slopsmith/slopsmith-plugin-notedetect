@@ -145,10 +145,12 @@ test('verify silence gate: real signal still scores and emits notedetect:verify'
     const scBefore = env.calls.scoreChord;
     await pumpAll(env);
 
-    assert.ok(env.calls.scoreChord > scBefore,
-        'real signal → the verify target drives scoreChord');
-    assert.ok(env.verifyEvents.length >= 1,
-        'real signal → notedetect:verify fires on the hit');
+    // pumpAll runs each interval callback exactly once, so the verify scorer
+    // runs once → exactly one scoreChord and one notedetect:verify.
+    assert.equal(env.calls.scoreChord, scBefore + 1,
+        'real signal → the verify target drives scoreChord exactly once');
+    assert.equal(env.verifyEvents.length, 1,
+        'real signal → notedetect:verify fires exactly once on the hit');
 
     det.destroy();
     await flushPendingAsync();
@@ -170,10 +172,10 @@ test('verify silence gate: fails OPEN when the engine exposes no getLevels', asy
     const scBefore = env.calls.scoreChord;
     await pumpAll(env);
 
-    assert.ok(env.calls.scoreChord > scBefore,
-        'no telemetry → fail open: the verify target still scores');
-    assert.ok(env.verifyEvents.length >= 1,
-        'no telemetry → fail open: notedetect:verify still fires');
+    assert.equal(env.calls.scoreChord, scBefore + 1,
+        'no telemetry → fail open: the verify target still scores exactly once');
+    assert.equal(env.verifyEvents.length, 1,
+        'no telemetry → fail open: notedetect:verify still fires exactly once');
 
     det.destroy();
     await flushPendingAsync();
