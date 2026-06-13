@@ -280,7 +280,7 @@ const _ND_AUTO_ENABLE_RETRY_MS = 1500;
 // exact build that produced it. The script tag has no `import`/`fetch`
 // hook to read package.json at load time, so this is the single
 // hand-maintained constant the diagnostic path keys off of.
-const _ND_VERSION = '1.15.2';
+const _ND_VERSION = '1.15.3';
 
 // Audio processing constants
 const _ND_MIN_YIN_SAMPLES = 4096;  // enough for low E at 48kHz (need tau=585, halfLen=2048)
@@ -4222,6 +4222,21 @@ function createNoteDetector(options = {}) {
             _verifyTargetCtx = null;
             return;
         }
+        // Silence gate — the same protection the live highway path gets from
+        // the _ndLevelSamples gate (see _ndStrikeLevelContext and the engine
+        // verdict's SILENCE_GATE override). This frozen-playhead verify scorer
+        // runs EVERY frame regardless of input, and the harmonic-comb verify
+        // window has no absolute level floor for guitar — harmonicSnr is a
+        // scale-invariant ratio and _ND_VERIFY_PRESENCE_RATIO is 0 for guitar
+        // (legacy ever-present). So induced/ambient noise with the guitar OFF
+        // can cross the verify threshold on a stray frame and emit a phantom
+        // notedetect:verify, auto-advancing Step Mode with nothing played.
+        // Require real signal *now* before scoring/emitting. Fail OPEN when we
+        // have no level telemetry (length 0 — an engine build without
+        // getLevels, startup, or a post-seek reset cleared the buffer), exactly
+        // as the highway gate does, so verify still works where the input level
+        // is unavailable rather than going permanently dead.
+        if (_ndLevelSamples.length > 0 && (inputLevel || 0) < _ND_SILENCE_THRESHOLD) return;
         // Tuning context the target is scored under: the caller's override
         // when one was registered (contained playback verifying against the
         // player's real instrument), else the host song's live state.
